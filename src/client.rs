@@ -24,6 +24,8 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Cached identity public key (hex) — populated on first call.
     identity_key: OnceCell<String>,
     /// Ensures assert_initialized runs the full init path at most once.
+    /// Phase 5 will populate this — kept now to avoid a breaking struct change later.
+    #[allow(dead_code)]
     init_once: OnceCell<()>,
 }
 

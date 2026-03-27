@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 05-overlay-device-registration 05-01-PLAN.md
-last_updated: "2026-03-27T17:43:08.369Z"
+stopped_at: Completed 05-overlay-device-registration 05-02-PLAN.md
+last_updated: "2026-03-27T17:51:38.020Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 6
-  completed_phases: 4
+  completed_phases: 5
   total_plans: 10
-  completed_plans: 9
+  completed_plans: 10
   percent: 50
 ---
 
@@ -59,6 +59,7 @@ Progress: [█████░░░░░] 50%
 | Phase 04-websocket-live-messaging P04-01 | 4 | 2 tasks | 6 files |
 | Phase 04-websocket-live-messaging P04-02 | 1 | 2 tasks | 2 files |
 | Phase 05-overlay-device-registration P01 | 43 | 2 tasks | 9 files |
+| Phase 05-overlay-device-registration P02 | 5 | 3 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -94,6 +95,8 @@ Recent decisions affecting current work:
 - [Phase 05-overlay-device-registration]: query_advertisements returns Ok(vec![]) on ANY error including overlay unreachability — matches TS try/catch pattern exactly
 - [Phase 05-overlay-device-registration]: MessageBoxClient::new() now requires a Network parameter (4th arg); new_mainnet() convenience constructor added
 - [Phase 05-overlay-device-registration]: revoke_host_advertisement uses sighash_preimage() + wallet.create_signature(data=preimage) to avoid exposing private key while producing valid PushDrop unlock
+- [Phase 05-overlay-device-registration]: send_message splits into public send_message (overlay host resolution) + pub(crate) send_message_to_host (explicit host) — preserves public API while enabling adapter host_override passthrough
+- [Phase 05-overlay-device-registration]: list_messages deduplicates via dedup_messages(HashMap) across concurrent join_all per-host results — single-host path skips dedup overhead
 
 ### Pending Todos
 
@@ -107,6 +110,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-27T17:43:08.367Z
-Stopped at: Completed 05-overlay-device-registration 05-01-PLAN.md
+Last session: 2026-03-27T17:51:38.018Z
+Stopped at: Completed 05-overlay-device-registration 05-02-PLAN.md
 Resume file: None

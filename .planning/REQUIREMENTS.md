@@ -76,13 +76,13 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 - [x] **HOST-03**: `query_advertisements` queries overlay for host advertisement tokens
 - [x] **HOST-04**: `anoint_host` broadcasts PushDrop overlay transaction advertising host
 - [x] **HOST-05**: `revoke_host_advertisement` spends existing advertisement to remove it
-- [ ] **HOST-06**: `init` auto-initializes on first use (query existing advertisements, anoint if needed)
-- [ ] **HOST-07**: Multi-host querying with message deduplication by message ID
+- [x] **HOST-06**: `init` auto-initializes on first use (query existing advertisements, anoint if needed)
+- [x] **HOST-07**: Multi-host querying with message deduplication by message ID
 
 ### Device Registration
 
-- [ ] **DEV-01**: `register_device` registers device for FCM push notifications
-- [ ] **DEV-02**: `list_registered_devices` lists registered devices
+- [x] **DEV-01**: `register_device` registers device for FCM push notifications
+- [x] **DEV-02**: `list_registered_devices` lists registered devices
 
 ### Parity Verification
 
@@ -167,10 +167,10 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 | HOST-03 | Phase 5 | Complete |
 | HOST-04 | Phase 5 | Complete |
 | HOST-05 | Phase 5 | Complete |
-| HOST-06 | Phase 5 | Pending |
-| HOST-07 | Phase 5 | Pending |
-| DEV-01 | Phase 5 | Pending |
-| DEV-02 | Phase 5 | Pending |
+| HOST-06 | Phase 5 | Complete |
+| HOST-07 | Phase 5 | Complete |
+| DEV-01 | Phase 5 | Complete |
+| DEV-02 | Phase 5 | Complete |
 | TEST-01 | Phase 1 | Complete |
 | TEST-02 | Phase 1 | Complete |
 | TEST-03 | Phase 1 | Complete |

@@ -10,7 +10,7 @@ Six phases translate the TypeScript `@bsv/message-box-client` v1.3.0 into a prod
 - [ ] **Phase 2: CommsLayer Adapter + Permissions** - `RemittanceAdapter` implementing `CommsLayer` trait, permission management, notification convenience methods
 - [ ] **Phase 3: PeerPay** - Payment token create/send/accept/reject/list and `list_messages` with auto-internalization
 - [x] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener (completed 2026-03-27)
-- [ ] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration
+- [x] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration (completed 2026-03-27)
 - [ ] **Phase 6: Parity Verification** - Cross-language integration testing, API surface audit, smoke testing of every public method against TS client
 
 ## Phase Details
@@ -85,7 +85,7 @@ Plans:
   3. `anoint_host` broadcasts a valid PushDrop transaction the overlay accepts; `revoke_host_advertisement` spends it cleanly
   4. `list_messages` across two advertised hosts returns a deduplicated message set — a message present on both hosts appears exactly once
   5. `register_device` and `list_registered_devices` complete against `go-messagebox-server` without errors
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 05-01-PLAN.md — Overlay types, PushDrop helper, query_advertisements, resolve_host_for_recipient, anoint_host, revoke_host_advertisement
 - [ ] 05-02-PLAN.md — init-once wiring, multi-host list_messages deduplication, register_device, list_registered_devices
@@ -113,5 +113,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. CommsLayer Adapter + Permissions | 2/2 | Complete | 2026-03-26 |
 | 3. PeerPay | 1/2 | In Progress|  |
 | 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
-| 5. Overlay + Device Registration | 1/2 | In Progress|  |
+| 5. Overlay + Device Registration | 2/2 | Complete   | 2026-03-27 |
 | 6. Parity Verification | 0/TBD | Not started | - |

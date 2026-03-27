@@ -3,6 +3,7 @@ pub mod client;
 pub mod encryption;
 pub mod error;
 pub mod http_ops;
+pub mod permissions;
 pub mod types;
 
 pub use adapter::RemittanceAdapter;

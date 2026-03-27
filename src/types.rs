@@ -131,6 +131,30 @@ pub struct SendMessageResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4 — WebSocket live messaging wire types
+// ---------------------------------------------------------------------------
+
+/// Payload for the sendMessage WebSocket event.
+///
+/// Serialized as JSON and passed to socket.emit("sendMessage", ...).
+/// Wire format: {"roomId": "recipient-inbox", "message": {"messageId": "...", ...}}
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSendMessageData {
+    pub room_id: String,
+    pub message: WsSendMessagePayload,
+}
+
+/// The message object inside a sendMessage event.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WsSendMessagePayload {
+    pub message_id: String,
+    pub recipient: String,
+    pub body: String,
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3 — PeerPay payment types
 // ---------------------------------------------------------------------------
 

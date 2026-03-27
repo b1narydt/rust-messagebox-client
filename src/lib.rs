@@ -6,6 +6,7 @@ pub mod http_ops;
 pub mod peer_pay;
 pub mod permissions;
 pub mod types;
+pub mod websocket;
 
 pub use adapter::RemittanceAdapter;
 pub use client::MessageBoxClient;

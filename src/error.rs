@@ -20,4 +20,6 @@ pub enum MessageBoxError {
     MissingHeader(String),
     #[error("not initialized")]
     NotInitialized,
+    #[error("websocket error: {0}")]
+    WebSocket(String),
 }

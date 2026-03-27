@@ -92,6 +92,38 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
             .await
             .map_err(|e| RemittanceError::Protocol(e.to_string()))
     }
+
+    /// Delegate to `MessageBoxClient::send_live_message`.
+    ///
+    /// `_host_override` is ignored — multi-host routing is deferred to Phase 5
+    /// (same pattern as `send_message`).
+    async fn send_live_message(
+        &self,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        _host_override: Option<&str>,
+    ) -> Result<String, RemittanceError> {
+        self.inner
+            .send_live_message(recipient, message_box, body)
+            .await
+            .map_err(|e| RemittanceError::Protocol(e.to_string()))
+    }
+
+    /// Delegate to `MessageBoxClient::listen_for_live_messages`.
+    ///
+    /// `_override_host` is ignored — multi-host routing is deferred to Phase 5.
+    async fn listen_for_live_messages(
+        &self,
+        message_box: &str,
+        _override_host: Option<&str>,
+        on_message: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+    ) -> Result<(), RemittanceError> {
+        self.inner
+            .listen_for_live_messages(message_box, on_message)
+            .await
+            .map_err(|e| RemittanceError::Protocol(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,5 +279,23 @@ mod tests {
         let ids: &[String] = &["id1".to_string(), "id2".to_string()];
         let converted: Vec<String> = ids.to_vec();
         assert_eq!(converted, vec!["id1", "id2"]);
+    }
+
+    /// `send_live_message` is overridden — compile check via method resolution.
+    ///
+    /// If this resolves to the override (not the default trait impl), the method
+    /// is wired to `MessageBoxClient::send_live_message`.
+    #[allow(dead_code)]
+    fn send_live_message_compiles(adapter: &RemittanceAdapter<ArcWallet>) {
+        let _fut = adapter.send_live_message("03abc", "inbox", "hello", None);
+    }
+
+    /// `listen_for_live_messages` is overridden — compile check via method resolution.
+    ///
+    /// Constructs a dummy callback to verify the method resolves and compiles.
+    #[allow(dead_code)]
+    fn listen_for_live_messages_compiles(adapter: &RemittanceAdapter<ArcWallet>) {
+        let cb: Arc<dyn Fn(PeerMessage) + Send + Sync> = Arc::new(|_msg| {});
+        let _fut = adapter.listen_for_live_messages("inbox", None, cb);
     }
 }

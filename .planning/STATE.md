@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 03-peerpay 03-02-PLAN.md
-last_updated: "2026-03-27T02:42:11.667Z"
+stopped_at: Completed 04-websocket-live-messaging 04-01-PLAN.md
+last_updated: "2026-03-27T12:00:08.370Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 6
   completed_phases: 3
-  total_plans: 6
-  completed_plans: 6
+  total_plans: 8
+  completed_plans: 7
   percent: 50
 ---
 
@@ -56,6 +56,7 @@ Progress: [█████░░░░░] 50%
 | Phase 02-commslayer-adapter-permissions P02 | 5min | 2 tasks | 3 files |
 | Phase 03-peerpay P01 | 3min | 2 tasks | 3 files |
 | Phase 03-peerpay P02 | 8min | 2 tasks | 2 files |
+| Phase 04-websocket-live-messaging P04-01 | 4 | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -83,6 +84,9 @@ Recent decisions affecting current work:
 - [Phase 03-peerpay]: reject_payment threshold at 2000 satoshis with double-ack pattern for TS parity
 - [Phase 03-peerpay]: Server delivery-fee internalization is best-effort — errors silently ignored matching TS try/catch behavior
 - [Phase 03-peerpay]: ServerPaymentOutput fields are all Option to handle partial/malformed server delivery-fee data gracefully
+- [Phase 04-websocket-live-messaging]: Decryption in on_any callback (not tokio::spawn) preserves message ordering via rust_socketio internal mutex serialization
+- [Phase 04-websocket-live-messaging]: split_room_id uses 66-char hex key boundary — compressed pubkeys are always 66 hex chars, unambiguous even with hyphens in mb names
+- [Phase 04-websocket-live-messaging]: auth_tx wrapped in Arc<Mutex<Option>> — on_any is FnMut not FnOnce, oneshot::Sender is non-Clone, take() ensures exactly-once delivery
 
 ### Pending Todos
 
@@ -96,6 +100,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-27T02:42:11.664Z
-Stopped at: Completed 03-peerpay 03-02-PLAN.md
+Last session: 2026-03-27T12:00:08.367Z
+Stopped at: Completed 04-websocket-live-messaging 04-01-PLAN.md
 Resume file: None

@@ -63,11 +63,11 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 
 ### WebSocket Live Messaging
 
-- [ ] **WS-01**: `listen_for_live_messages` subscribes to WebSocket room with auto-decryption callback
-- [ ] **WS-02**: `send_live_message` sends via WebSocket with 10-second timeout, falls back to HTTP
-- [ ] **WS-03**: `join_room` / `leave_room` manage WebSocket room subscriptions
-- [ ] **WS-04**: `disconnect_web_socket` closes WebSocket connection cleanly
-- [ ] **WS-05**: Uses SDK's `WebSocketTransport` with reconnect and exponential backoff
+- [x] **WS-01**: `listen_for_live_messages` subscribes to WebSocket room with auto-decryption callback
+- [x] **WS-02**: `send_live_message` sends via WebSocket with 10-second timeout, falls back to HTTP
+- [x] **WS-03**: `join_room` / `leave_room` manage WebSocket room subscriptions
+- [x] **WS-04**: `disconnect_web_socket` closes WebSocket connection cleanly
+- [x] **WS-05**: Uses SDK's `WebSocketTransport` with reconnect and exponential backoff
 
 ### Host Resolution & Overlay
 
@@ -157,11 +157,11 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 | PAY-05 | Phase 3 | Complete |
 | PAY-06 | Phase 3 | Complete |
 | PAY-07 | Phase 4 | Pending |
-| WS-01 | Phase 4 | Pending |
-| WS-02 | Phase 4 | Pending |
-| WS-03 | Phase 4 | Pending |
-| WS-04 | Phase 4 | Pending |
-| WS-05 | Phase 4 | Pending |
+| WS-01 | Phase 4 | Complete |
+| WS-02 | Phase 4 | Complete |
+| WS-03 | Phase 4 | Complete |
+| WS-04 | Phase 4 | Complete |
+| WS-05 | Phase 4 | Complete |
 | HOST-01 | Phase 5 | Pending |
 | HOST-02 | Phase 5 | Pending |
 | HOST-03 | Phase 5 | Pending |

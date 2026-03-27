@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-websocket-live-messaging 04-02-PLAN.md
-last_updated: "2026-03-27T12:04:08.504Z"
+stopped_at: Completed 05-overlay-device-registration 05-01-PLAN.md
+last_updated: "2026-03-27T17:43:08.369Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 6
   completed_phases: 4
-  total_plans: 8
-  completed_plans: 8
+  total_plans: 10
+  completed_plans: 9
   percent: 50
 ---
 
@@ -58,6 +58,7 @@ Progress: [█████░░░░░] 50%
 | Phase 03-peerpay P02 | 8min | 2 tasks | 2 files |
 | Phase 04-websocket-live-messaging P04-01 | 4 | 2 tasks | 6 files |
 | Phase 04-websocket-live-messaging P04-02 | 1 | 2 tasks | 2 files |
+| Phase 05-overlay-device-registration P01 | 43 | 2 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -90,6 +91,9 @@ Recent decisions affecting current work:
 - [Phase 04-websocket-live-messaging]: auth_tx wrapped in Arc<Mutex<Option>> — on_any is FnMut not FnOnce, oneshot::Sender is non-Clone, take() ensures exactly-once delivery
 - [Phase 04-websocket-live-messaging]: send_live_message and listen_for_live_messages ignore host_override in RemittanceAdapter — multi-host deferred to Phase 5
 - [Phase 04-websocket-live-messaging]: listen_for_live_payments wraps PeerMessage callback with PaymentToken JSON parsing; silently skips non-payment messages matching TS safeParse behavior
+- [Phase 05-overlay-device-registration]: query_advertisements returns Ok(vec![]) on ANY error including overlay unreachability — matches TS try/catch pattern exactly
+- [Phase 05-overlay-device-registration]: MessageBoxClient::new() now requires a Network parameter (4th arg); new_mainnet() convenience constructor added
+- [Phase 05-overlay-device-registration]: revoke_host_advertisement uses sighash_preimage() + wallet.create_signature(data=preimage) to avoid exposing private key while producing valid PushDrop unlock
 
 ### Pending Todos
 
@@ -103,6 +107,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-27T12:04:08.502Z
-Stopped at: Completed 04-websocket-live-messaging 04-02-PLAN.md
+Last session: 2026-03-27T17:43:08.367Z
+Stopped at: Completed 05-overlay-device-registration 05-01-PLAN.md
 Resume file: None

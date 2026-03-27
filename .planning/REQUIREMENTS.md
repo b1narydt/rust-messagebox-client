@@ -71,11 +71,11 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 
 ### Host Resolution & Overlay
 
-- [ ] **HOST-01**: `get_identity_key` returns authenticated user's identity public key
-- [ ] **HOST-02**: `resolve_host_for_recipient` looks up recipient's MessageBox host via overlay
-- [ ] **HOST-03**: `query_advertisements` queries overlay for host advertisement tokens
-- [ ] **HOST-04**: `anoint_host` broadcasts PushDrop overlay transaction advertising host
-- [ ] **HOST-05**: `revoke_host_advertisement` spends existing advertisement to remove it
+- [x] **HOST-01**: `get_identity_key` returns authenticated user's identity public key
+- [x] **HOST-02**: `resolve_host_for_recipient` looks up recipient's MessageBox host via overlay
+- [x] **HOST-03**: `query_advertisements` queries overlay for host advertisement tokens
+- [x] **HOST-04**: `anoint_host` broadcasts PushDrop overlay transaction advertising host
+- [x] **HOST-05**: `revoke_host_advertisement` spends existing advertisement to remove it
 - [ ] **HOST-06**: `init` auto-initializes on first use (query existing advertisements, anoint if needed)
 - [ ] **HOST-07**: Multi-host querying with message deduplication by message ID
 
@@ -162,11 +162,11 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 | WS-03 | Phase 4 | Complete |
 | WS-04 | Phase 4 | Complete |
 | WS-05 | Phase 4 | Complete |
-| HOST-01 | Phase 5 | Pending |
-| HOST-02 | Phase 5 | Pending |
-| HOST-03 | Phase 5 | Pending |
-| HOST-04 | Phase 5 | Pending |
-| HOST-05 | Phase 5 | Pending |
+| HOST-01 | Phase 5 | Complete |
+| HOST-02 | Phase 5 | Complete |
+| HOST-03 | Phase 5 | Complete |
+| HOST-04 | Phase 5 | Complete |
+| HOST-05 | Phase 5 | Complete |
 | HOST-06 | Phase 5 | Pending |
 | HOST-07 | Phase 5 | Pending |
 | DEV-01 | Phase 5 | Pending |

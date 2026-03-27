@@ -80,6 +80,7 @@ fn make_adapter() -> (RemittanceAdapter<ArcWallet>, ArcWallet) {
         "https://example.com".to_string(),
         wallet.clone(),
         None,
+        bsv::services::overlay_tools::Network::Mainnet,
     ));
     (RemittanceAdapter::new(client), wallet)
 }
@@ -129,6 +130,7 @@ async fn test_send_list_ack_cycle() {
         "https://example.com".to_string(),
         wallet.clone(),
         None,
+        bsv::services::overlay_tools::Network::Mainnet,
     ));
 
     // Get the wallet's identity key — this is what PeerMessage.recipient
@@ -195,6 +197,7 @@ async fn test_list_messages_recipient_populated_from_identity_key() {
         "https://example.com".to_string(),
         wallet.clone(),
         None,
+        bsv::services::overlay_tools::Network::Mainnet,
     ));
 
     let identity_key = client.get_identity_key().await.expect("identity key");

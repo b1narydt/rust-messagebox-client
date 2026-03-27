@@ -240,9 +240,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Send a notification body to `recipient`'s `"notifications"` inbox.
     ///
-    /// Delegates to `send_message` with `message_box = "notifications"`.
-    /// Host resolution is handled by `send_message` internally via overlay
-    /// (`resolveHostForRecipient`) — TS parity achieved.
+    /// Delegates to `send_message` with `message_box = "notifications"` and
+    /// `check_permissions = true` — matching TS which passes `checkPermissions: true`
+    /// so that fee quotes are fetched and payments created if required.
     pub async fn send_notification(
         &self,
         recipient: &str,
@@ -250,8 +250,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
         match override_host {
-            Some(host) => self.send_message_to_host(host, recipient, "notifications", body, false, false, None, None).await,
-            None => self.send_message(recipient, "notifications", body, false, false, None, None).await,
+            Some(host) => self.send_message_to_host(host, recipient, "notifications", body, false, true, None, None).await,
+            None => self.send_message(recipient, "notifications", body, false, true, None, None).await,
         }
     }
 

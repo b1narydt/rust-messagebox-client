@@ -12,19 +12,22 @@ use crate::client::check_status_error;
 use crate::types::{AcknowledgeMessageParams, FailedRecipient, ListMessagesParams, ListMessagesResponse, MessagePayment, MessagePaymentOutput, SendListParams, SendListResult, SentRecipient, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
 
-/// Deduplicate messages from multiple hosts by `message_id`.
+/// Deduplicate messages from multiple hosts by `message_id`, preserving order.
 ///
 /// First occurrence wins — matches TS `Promise.allSettled` + Map-based dedup semantics.
-/// All results from all hosts are flattened and deduplicated into a single Vec.
+/// Server returns messages newest-first; this preserves that ordering by using a
+/// HashSet for seen-tracking and a Vec for ordered output (TS parity: sorted newest-first).
 pub(crate) fn dedup_messages(results: Vec<Vec<PeerMessage>>) -> Vec<PeerMessage> {
-    let mut seen: HashMap<String, PeerMessage> = HashMap::new();
-    // Process in order so first-seen always wins
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
     for host_messages in results {
         for msg in host_messages {
-            seen.entry(msg.message_id.clone()).or_insert(msg);
+            if seen.insert(msg.message_id.clone()) {
+                out.push(msg);
+            }
         }
     }
-    seen.into_values().collect()
+    out
 }
 
 /// Intermediate type for server's wrapped message body format.

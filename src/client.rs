@@ -332,11 +332,23 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
     /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
     /// `override_host`: when Some, the HTTP fallback path sends to that host directly.
+    /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
+    ///
+    /// Mirrors TS `sendLiveMessage(params, overrideHost?)` which accepts the full
+    /// `SendMessageParams` including `skipEncryption`, `checkPermissions`, and `messageId`.
+    ///
+    /// - `skip_encryption`: when true, sends body as-is without BRC-78 encryption.
+    /// - `check_permissions`: when true, the HTTP fallback path fetches quotes and pays fees.
+    /// - `message_id`: when Some, uses caller-supplied ID instead of HMAC-derived ID.
+    /// - `override_host`: when Some, the HTTP fallback sends to that host directly.
     pub async fn send_live_message(
         &self,
         recipient: &str,
         message_box: &str,
         body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
         // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
@@ -344,8 +356,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         if self.ensure_ws_connected().await.is_err() {
             // HTTP fallback: use override_host if provided, otherwise overlay resolution
             return match override_host {
-                Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
-                None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
+                None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
             };
         }
 
@@ -360,34 +372,42 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 if ws.join_room(&my_room).await.is_err() {
                     drop(guard);
                     return match override_host {
-                        Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
-                        None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                        Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
+                        None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
                     };
                 }
             } else {
                 drop(guard);
                 return match override_host {
-                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
-                    None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
+                    None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
                 };
             }
         }
 
-        // Encrypt and generate message ID for the WebSocket path
-        let encrypted = crate::encryption::encrypt_body(
-            self.wallet(),
-            body,
-            recipient,
-            self.originator(),
-        )
-        .await?;
-        let message_id = crate::encryption::generate_message_id(
-            self.wallet(),
-            body,
-            recipient,
-            self.originator(),
-        )
-        .await?;
+        // Encrypt (unless skip_encryption) and resolve message ID for the WebSocket path
+        let encrypted = if skip_encryption {
+            body.to_string()
+        } else {
+            crate::encryption::encrypt_body(
+                self.wallet(),
+                body,
+                recipient,
+                self.originator(),
+            )
+            .await?
+        };
+        let message_id = if let Some(id) = message_id {
+            id.to_string()
+        } else {
+            crate::encryption::generate_message_id(
+                self.wallet(),
+                body,
+                recipient,
+                self.originator(),
+            )
+            .await?
+        };
 
         let room_id = format!("{recipient}-{message_box}");
         let ack_key = format!("sendMessageAck-{room_id}");
@@ -421,10 +441,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     ws.remove_pending_ack(&ack_key).await;
                 }
                 drop(guard);
-                // Fall back to HTTP — use override_host if provided
+                // Fall back to HTTP — pass through all feature params
                 match override_host {
-                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
-                    None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, None, None).await,
+                    None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, None, None).await,
                 }
             }
         }

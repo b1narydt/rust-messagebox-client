@@ -11,7 +11,7 @@ Six phases translate the TypeScript `@bsv/message-box-client` v1.3.0 into a prod
 - [ ] **Phase 3: PeerPay** - Payment token create/send/accept/reject/list and `list_messages` with auto-internalization
 - [x] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener (completed 2026-03-27)
 - [x] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration (completed 2026-03-27)
-- [ ] **Phase 6: Parity Verification** - Close all API surface gaps, add missing methods/params, then verify full parity via audit and tests
+- [x] **Phase 6: Parity Verification** - Close all API surface gaps, add missing methods/params, then verify full parity via audit and tests (completed 2026-03-27)
 
 ## Phase Details
 
@@ -100,7 +100,7 @@ Plans:
   3. Cross-language payment test: Rust `create_payment_token` → TS `acceptPayment` succeeds (and vice versa)
   4. Smoke test exercises every public method against a live server — all return expected results with no panics or unhandled errors
   5. Wire format comparison: JSON request/response bodies from Rust client match TS client byte-for-byte for identical operations (captured via server logs or proxy)
-**Plans:** 2/3 plans executed
+**Plans:** 3/3 plans complete
 Plans:
 - [ ] 06-01-PLAN.md — Missing types, override_host on 18 methods, localhost filter, joined_rooms tracking, WS accessors
 - [ ] 06-02-PLAN.md — send_message feature params, acknowledge_message multi-host, missing methods (acknowledge_notification, send_message_to_recipients, multi-recipient quote)
@@ -118,4 +118,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. PeerPay | 1/2 | In Progress|  |
 | 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
 | 5. Overlay + Device Registration | 2/2 | Complete   | 2026-03-27 |
-| 6. Parity Verification | 2/3 | In Progress|  |
+| 6. Parity Verification | 3/3 | Complete   | 2026-03-27 |

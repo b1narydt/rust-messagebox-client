@@ -158,7 +158,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         let token = self.create_payment_token(recipient, amount).await?;
         let token_json = serde_json::to_string(&token)?;
-        self.send_live_message(recipient, "payment_inbox", &token_json, None).await
+        self.send_live_message(recipient, "payment_inbox", &token_json, false, false, None, None).await
     }
 
     /// Subscribe to live payment notifications on the payment_inbox.
@@ -234,33 +234,45 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// - If `amount < 2000`: only acknowledges (refund after fee would be ≤ 0).
     /// - If `amount >= 2000`: accepts (internalizes), sends a refund of `amount - 1000`,
     ///   then double-acknowledges (intentional TS parity — server is idempotent).
+    ///
+    /// TS parity: 401 auth errors are silently swallowed (logged but not propagated).
+    /// All other errors propagate normally.
     pub async fn reject_payment(&self, payment: &IncomingPayment) -> Result<(), MessageBoxError> {
         if payment.token.amount < 2000 {
-            // Amount too small to refund after fee — just acknowledge
             return self.acknowledge_message(vec![payment.message_id.clone()], None).await;
         }
 
-        // Internalize + first ack
         self.accept_payment(payment).await?;
 
-        // Send refund: original amount minus 1000 sat fee
-        self.send_payment(&payment.sender, payment.token.amount - 1000).await?;
+        if let Err(e) = self.send_payment(&payment.sender, payment.token.amount - 1000).await {
+            if Self::is_401_error(&e) { return Ok(()); }
+            return Err(e);
+        }
 
-        // Intentional double-ack — TS does this as a safety net; server is idempotent
-        self.acknowledge_message(vec![payment.message_id.clone()], None).await?;
+        if let Err(e) = self.acknowledge_message(vec![payment.message_id.clone()], None).await {
+            if Self::is_401_error(&e) { return Ok(()); }
+            return Err(e);
+        }
 
         Ok(())
     }
 
+    /// Check if an error is a 401 auth error (TS swallows these in reject_payment).
+    fn is_401_error(e: &MessageBoxError) -> bool {
+        matches!(e, MessageBoxError::Http(401, _))
+            || matches!(e, MessageBoxError::Auth(msg) if msg.contains("401"))
+    }
+
     /// List all incoming payments from the payment_inbox.
     ///
-    /// Calls `list_messages_lite` and attempts to parse each body as a `PaymentToken`.
+    /// Uses the full multi-host `list_messages` path (matching TS `listIncomingPayments`
+    /// which calls `this.listMessages`), so payments on all advertised hosts are returned.
     /// Silently skips messages whose bodies are not valid JSON payment tokens
     /// (mirrors TS `safeParse` behavior).
     pub async fn list_incoming_payments(
         &self,
     ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
-        let messages = self.list_messages_lite("payment_inbox").await?;
+        let messages = self.list_messages("payment_inbox", false).await?;
 
         let payments = messages
             .into_iter()
@@ -278,32 +290,69 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         Ok(payments)
     }
 
-    /// Acknowledge a notification message, internalizing any embedded payment.
+    /// Acknowledge a notification message, internalizing any embedded delivery-fee payment.
     ///
-    /// Composition method matching TS `acknowledgeNotification`:
-    /// 1. Tries to parse `message.body` as a `{ message, payment }` wrapper.
-    /// 2. If a valid PeerPay payment is embedded, calls `accept_payment` (internalizes + acks).
-    ///    Returns `true` to indicate a payment was processed.
-    /// 3. If no payment, calls `acknowledge_message` directly and returns `false`.
+    /// Matches TS `acknowledgeNotification` exactly:
+    /// 1. Acknowledges the message FIRST (removes from server queue).
+    /// 2. Parses body for a `{ message, payment }` delivery-fee wrapper (NOT a PeerPay token).
+    /// 3. If a delivery-fee payment exists with `wallet payment` outputs, internalizes it.
+    /// 4. Returns true if payment was internalized, false otherwise.
     pub async fn acknowledge_notification(
         &self,
         message: &PeerMessage,
     ) -> Result<bool, MessageBoxError> {
-        // Try to parse body as a wrapped envelope: { message: ..., payment: ... }
-        // The payment field here is a PeerPay PaymentToken embedded in the notification.
-        if let Ok(token) = serde_json::from_str::<PaymentToken>(&message.body) {
-            // Body is a PeerPay payment token — internalize it.
-            let incoming = IncomingPayment {
-                token,
-                sender: message.sender.clone(),
-                message_id: message.message_id.clone(),
-            };
-            self.accept_payment(&incoming).await?;
-            return Ok(true);
+        // Step 1: Acknowledge first — matches TS line 1702
+        self.acknowledge_message(vec![message.message_id.clone()], None).await?;
+
+        // Step 2: Parse body for delivery-fee wrapper { message, payment }
+        let parsed = serde_json::from_str::<crate::http_ops::WrappedMessageBody>(&message.body);
+        let payment_data = parsed.ok().and_then(|w| w.payment);
+
+        // Step 3: Internalize delivery-fee payment if present
+        if let Some(payment) = payment_data {
+            if let (Some(tx_bytes), Some(outputs)) = (&payment.tx, &payment.outputs) {
+                let description = payment
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| "MessageBox recipient payment".to_string());
+
+                // Filter to wallet payment outputs (TS: output.protocol === 'wallet payment')
+                let internalize_outputs: Vec<InternalizeOutput> = outputs
+                    .iter()
+                    .filter_map(|o| {
+                        let sender_pk = o.sender_identity_key
+                            .as_deref()
+                            .and_then(|k| bsv::primitives::public_key::PublicKey::from_string(k).ok())?;
+                        Some(InternalizeOutput::WalletPayment {
+                            output_index: o.output_index.unwrap_or(0),
+                            payment: Payment {
+                                derivation_prefix: o.derivation_prefix.clone().unwrap_or_default(),
+                                derivation_suffix: o.derivation_suffix.clone().unwrap_or_default(),
+                                sender_identity_key: sender_pk,
+                            },
+                        })
+                    })
+                    .collect();
+
+                if internalize_outputs.is_empty() {
+                    return Ok(false);
+                }
+
+                let args = InternalizeActionArgs {
+                    tx: tx_bytes.clone(),
+                    description,
+                    labels: vec!["notification-payment".to_string()],
+                    seek_permission: bsv::wallet::types::BooleanDefaultTrue(Some(false)),
+                    outputs: internalize_outputs,
+                };
+
+                match self.wallet().internalize_action(args, self.originator()).await {
+                    Ok(_) => return Ok(true),
+                    Err(_) => return Ok(false),
+                }
+            }
         }
 
-        // No embedded payment — simple ack.
-        self.acknowledge_message(vec![message.message_id.clone()], None).await?;
         Ok(false)
     }
 }

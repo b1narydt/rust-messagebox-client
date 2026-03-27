@@ -87,9 +87,9 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 ### Parity Verification
 
 - [x] **PARITY-01**: API surface audit confirms all 35 TS public methods (28 MessageBoxClient + 7 PeerPayClient) have Rust equivalents
-- [ ] **PARITY-02**: Cross-language encryption test: Rust-encrypted message decryptable by TS client (and vice versa)
-- [ ] **PARITY-03**: Cross-language payment test: Rust `create_payment_token` accepted by TS `acceptPayment` (and vice versa)
-- [ ] **PARITY-04**: Smoke test exercises every public method against live `go-messagebox-server` with no panics
+- [x] **PARITY-02**: Cross-language encryption test: Rust-encrypted message decryptable by TS client (and vice versa)
+- [x] **PARITY-03**: Cross-language payment test: Rust `create_payment_token` accepted by TS `acceptPayment` (and vice versa)
+- [x] **PARITY-04**: Smoke test exercises every public method against live `go-messagebox-server` with no panics
 - [x] **PARITY-05**: Wire format comparison: JSON request/response bodies match TS client for identical operations
 
 ### Testing
@@ -178,9 +178,9 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 | TEST-05 | Phase 2 | Complete |
 | TEST-06 | Phase 3 | Complete |
 | PARITY-01 | Phase 6 | Complete |
-| PARITY-02 | Phase 6 | Pending |
-| PARITY-03 | Phase 6 | Pending |
-| PARITY-04 | Phase 6 | Pending |
+| PARITY-02 | Phase 6 | Complete |
+| PARITY-03 | Phase 6 | Complete |
+| PARITY-04 | Phase 6 | Complete |
 | PARITY-05 | Phase 6 | Complete |
 
 **Coverage:**

@@ -114,7 +114,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
         host_override: Option<&str>,
     ) -> Result<String, RemittanceError> {
         self.inner
-            .send_live_message(recipient, message_box, body, host_override)
+            .send_live_message(recipient, message_box, body, false, false, None, host_override)
             .await
             .map_err(|e| RemittanceError::Protocol(e.to_string()))
     }

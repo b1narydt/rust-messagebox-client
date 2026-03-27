@@ -55,7 +55,7 @@ Plans:
   3. `reject_payment` refunds with the correct 1000-satoshi fee deduction (matching TS behavior)
   4. `list_messages` auto-internalizes embedded payment tokens and returns `Vec<PeerMessage>` with decrypted bodies
   5. Integration tests for the payment create → send → accept flow pass
-**Plans:** 2 plans
+**Plans:** 1/2 plans executed
 Plans:
 - [ ] 03-01-PLAN.md — Payment types, create_payment_token, send_payment, accept_payment, reject_payment, list_incoming_payments
 - [ ] 03-02-PLAN.md — list_messages with auto-internalization, PeerPay integration tests
@@ -105,7 +105,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. HTTP Core + Foundation | 2/2 | Complete   | 2026-03-26 |
 | 2. CommsLayer Adapter + Permissions | 2/2 | Complete | 2026-03-26 |
-| 3. PeerPay | 0/2 | Not started | - |
+| 3. PeerPay | 1/2 | In Progress|  |
 | 4. WebSocket Live Messaging | 0/TBD | Not started | - |
 | 5. Overlay + Device Registration | 0/TBD | Not started | - |
 | 6. Parity Verification | 0/TBD | Not started | - |

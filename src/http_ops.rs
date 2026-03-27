@@ -1,10 +1,43 @@
-use bsv::wallet::interfaces::WalletInterface;
+use bsv::remittance::types::PeerMessage;
+use bsv::wallet::interfaces::{InternalizeActionArgs, InternalizeOutput, Payment, WalletInterface};
+use bsv::wallet::types::BooleanDefaultTrue;
+use bsv::primitives::public_key::PublicKey;
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
 use crate::client::check_status_error;
 use crate::types::{AcknowledgeMessageParams, ListMessagesParams, ListMessagesResponse, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
+
+/// Intermediate type for server's wrapped message body format.
+/// The server MAY wrap message body as { "message": ..., "payment": ... }
+/// where payment contains delivery fee data for internalization.
+#[derive(serde::Deserialize)]
+pub(crate) struct WrappedMessageBody {
+    pub message: Option<serde_json::Value>,
+    pub payment: Option<ServerPayment>,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ServerPayment {
+    pub tx: Option<Vec<u8>>,
+    pub outputs: Option<Vec<ServerPaymentOutput>>,
+    pub description: Option<String>,
+}
+
+/// One output entry from the server's delivery-fee payment.
+/// All fields are optional — internalization is best-effort and errors are ignored.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ServerPaymentOutput {
+    pub output_index: Option<u32>,
+    /// Derivation prefix as byte array.
+    pub derivation_prefix: Option<Vec<u8>>,
+    /// Derivation suffix as byte array.
+    pub derivation_suffix: Option<Vec<u8>>,
+    /// Sender identity key as DER hex.
+    pub sender_identity_key: Option<String>,
+}
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Send an encrypted message to a recipient's inbox.
@@ -102,6 +135,118 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
 
         Ok(list_response.messages)
+    }
+
+    /// Retrieve messages from an inbox with optional server payment internalization.
+    ///
+    /// Unlike `list_messages_lite`, this method:
+    /// - Returns `Vec<PeerMessage>` (not `Vec<ServerPeerMessage>`) with `recipient`
+    ///   populated from `get_identity_key()` and `message_box` from the parameter.
+    /// - Parses the server's `{ message, payment }` wrapper body format.
+    /// - When `accept_payments` is true, internalizes the server delivery-fee payment
+    ///   via `wallet.internalize_action`. Errors are logged/ignored (TS parity).
+    ///
+    /// NOTE: This handles the server delivery-fee payment wrapper, NOT PeerPay
+    /// PaymentTokens (peer-to-peer). PeerPay tokens are handled by `list_incoming_payments`.
+    pub async fn list_messages(
+        &self,
+        message_box: &str,
+        accept_payments: bool,
+    ) -> Result<Vec<PeerMessage>, MessageBoxError> {
+        self.assert_initialized().await?;
+
+        // Cache identity key once — used as recipient in every PeerMessage.
+        let identity_key = self.get_identity_key().await?;
+
+        let params = ListMessagesParams {
+            message_box: message_box.to_string(),
+        };
+        let body_bytes = serde_json::to_vec(&params)?;
+        let url = format!("{}/listMessages", self.host());
+        let response = self.post_json(&url, body_bytes).await?;
+        check_status_error(&response.body)?;
+
+        let list_response: ListMessagesResponse = serde_json::from_slice(&response.body)?;
+
+        let mut result = Vec::with_capacity(list_response.messages.len());
+        for msg in list_response.messages {
+            // Try to parse the body as a server-wrapped { message, payment } envelope.
+            let plain_body: String = if let Ok(wrapped) = serde_json::from_str::<WrappedMessageBody>(&msg.body) {
+                // Attempt to internalize the server delivery-fee payment when accept_payments=true.
+                if accept_payments {
+                    if let Some(payment) = &wrapped.payment {
+                        if let Some(tx_bytes) = &payment.tx {
+                            let description = payment
+                                .description
+                                .clone()
+                                .unwrap_or_else(|| "Server delivery fee".to_string());
+
+                            // Build output list from server payment data.
+                            // Errors are intentionally ignored — matches TS try/catch behavior.
+                            let outputs: Vec<InternalizeOutput> = payment
+                                .outputs
+                                .as_deref()
+                                .unwrap_or(&[])
+                                .iter()
+                                .filter_map(|o| {
+                                    // Try to parse sender key — skip output if invalid.
+                                    let sender_pk = o.sender_identity_key
+                                        .as_deref()
+                                        .and_then(|k| PublicKey::from_string(k).ok())?;
+                                    Some(InternalizeOutput::WalletPayment {
+                                        output_index: o.output_index.unwrap_or(0),
+                                        payment: Payment {
+                                            derivation_prefix: o.derivation_prefix.clone().unwrap_or_default(),
+                                            derivation_suffix: o.derivation_suffix.clone().unwrap_or_default(),
+                                            sender_identity_key: sender_pk,
+                                        },
+                                    })
+                                })
+                                .collect();
+
+                            let args = InternalizeActionArgs {
+                                tx: tx_bytes.clone(),
+                                description,
+                                labels: vec!["server-delivery-fee".to_string()],
+                                seek_permission: BooleanDefaultTrue(Some(false)),
+                                outputs,
+                            };
+                            // Defensive: ignore internalization errors, continue processing.
+                            let _ = self.wallet().internalize_action(args, self.originator()).await;
+                        }
+                    }
+                }
+
+                // Extract the message sub-field from the wrapper regardless of accept_payments.
+                match wrapped.message {
+                    Some(serde_json::Value::String(s)) => s,
+                    Some(v) => v.to_string(),
+                    None => msg.body.clone(),
+                }
+            } else {
+                // Not a wrapped body — pass through as plain text.
+                msg.body.clone()
+            };
+
+            // Decrypt the extracted body.
+            let decrypted = encryption::try_decrypt_message(
+                self.wallet(),
+                &plain_body,
+                &msg.sender,
+                self.originator(),
+            )
+            .await;
+
+            result.push(PeerMessage {
+                message_id: msg.message_id,
+                sender: msg.sender,
+                recipient: identity_key.clone(),
+                message_box: message_box.to_string(),
+                body: decrypted,
+            });
+        }
+
+        Ok(result)
     }
 
     /// Mark messages as acknowledged (read) by their IDs.
@@ -283,6 +428,43 @@ mod tests {
             id.chars().all(|c| !c.is_uppercase()),
             "hex must be lowercase"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_messages body parsing tests (no HTTP needed)
+    // -----------------------------------------------------------------------
+
+    /// Verify wrapped {message, payment} body is unwrapped to the message sub-field.
+    #[test]
+    fn list_messages_parses_wrapped_body() {
+        use super::WrappedMessageBody;
+        let raw = r#"{"message": "hello world", "payment": {"tx": [1,2,3]}}"#;
+        let wrapped: WrappedMessageBody = serde_json::from_str(raw).unwrap();
+        assert!(wrapped.message.is_some(), "message sub-field must be present");
+        assert!(wrapped.payment.is_some(), "payment sub-field must be present");
+        // The message value is a JSON string
+        let msg_val = wrapped.message.unwrap();
+        assert_eq!(msg_val.as_str().unwrap(), "hello world");
+    }
+
+    /// Non-wrapped body must fail to parse as WrappedMessageBody gracefully.
+    #[test]
+    fn list_messages_plain_body_passthrough() {
+        use super::WrappedMessageBody;
+        // A plain string "hello" is NOT valid JSON for WrappedMessageBody
+        let plain = "plain body text";
+        let result = serde_json::from_str::<WrappedMessageBody>(plain);
+        assert!(result.is_err(), "plain text must not parse as wrapped body");
+    }
+
+    /// Wrapped body with payment: null must not crash.
+    #[test]
+    fn list_messages_missing_payment_no_crash() {
+        use super::WrappedMessageBody;
+        let raw = r#"{"message": "the content", "payment": null}"#;
+        let wrapped: WrappedMessageBody = serde_json::from_str(raw).unwrap();
+        assert!(wrapped.message.is_some(), "message present");
+        assert!(wrapped.payment.is_none(), "payment is none when null");
     }
 
     /// HMAC message ID must be deterministic — same inputs produce same output.

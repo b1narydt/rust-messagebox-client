@@ -530,12 +530,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     }
 
     /// Internal helper: create a batch payment from pre-resolved (recipient, delivery_fee, recipient_fee, agent_key) tuples.
+    ///
+    /// TS PARITY (must match `createMessagePaymentBatch` exactly):
+    /// - Protocol: `[2, "3241645161d8"]` for ALL key derivations
+    /// - Nonces: `Random(32)` + base64 encode
+    /// - Delivery fee senderIdentityKey: current user's identity key
+    /// - Recipient fee: derived via `ProtoWallet::anyone()`, senderIdentityKey = anyone wallet's key
     async fn create_message_payment_batch_from_tuples(
         &self,
         tuples: &[(String, i64, i64, String)],
         description: Option<&str>,
     ) -> Result<MessagePayment, MessageBoxError> {
-        use bsv::auth::utils::create_nonce;
         use bsv::wallet::interfaces::{
             CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
         };
@@ -543,19 +548,40 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         use bsv::primitives::public_key::PublicKey;
         use bsv::primitives::utils::from_hex;
         use bsv::script::templates::{P2PKH, ScriptTemplateLock};
+        use bsv::wallet::proto_wallet::ProtoWallet;
+        use base64::Engine;
 
         let desc = description.unwrap_or("MessageBox batch delivery fee");
+        let sender_identity_key = self.get_identity_key().await?;
+        let anyone_wallet = ProtoWallet::anyone();
+        let anyone_id = anyone_wallet
+            .get_public_key(
+                GetPublicKeyArgs {
+                    identity_key: true,
+                    protocol_id: None,
+                    key_id: None,
+                    counterparty: None,
+                    privileged: false,
+                    privileged_reason: None,
+                    for_self: None,
+                    seek_permission: None,
+                },
+                None,
+            )
+            .await
+            .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+        let anyone_id_hex = anyone_id.public_key.to_der_hex();
+
         let mut outputs: Vec<CreateActionOutput> = Vec::new();
         let mut payment_outputs: Vec<MessagePaymentOutput> = Vec::new();
 
         for (recipient, delivery_fee, recipient_fee, agent_key) in tuples {
+            // --- Delivery fee output ---
             if *delivery_fee > 0 && !agent_key.is_empty() {
-                let prefix = create_nonce(self.wallet())
-                    .await
-                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
-                let suffix = create_nonce(self.wallet())
-                    .await
-                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+                let prefix_bytes: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+                let suffix_bytes: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+                let prefix = base64::engine::general_purpose::STANDARD.encode(&prefix_bytes);
+                let suffix = base64::engine::general_purpose::STANDARD.encode(&suffix_bytes);
 
                 let agent_pk = PublicKey::from_string(agent_key)
                     .map_err(|e| MessageBoxError::Wallet(format!("agent key: {e}")))?;
@@ -566,8 +592,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                         GetPublicKeyArgs {
                             identity_key: false,
                             protocol_id: Some(Protocol {
-                                security_level: 1,
-                                protocol: "messagebox".to_string(),
+                                security_level: 2,
+                                protocol: "3241645161d8".to_string(),
                             }),
                             key_id: Some(format!("{prefix} {suffix}")),
                             counterparty: Some(Counterparty {
@@ -606,29 +632,28 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     output_index,
                     derivation_prefix: prefix.as_bytes().to_vec(),
                     derivation_suffix: suffix.as_bytes().to_vec(),
-                    sender_identity_key: agent_key.clone(),
+                    sender_identity_key: sender_identity_key.clone(),
                 });
             }
 
+            // --- Recipient fee output ---
             if *recipient_fee > 0 {
-                let prefix = create_nonce(self.wallet())
-                    .await
-                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
-                let suffix = create_nonce(self.wallet())
-                    .await
-                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+                let prefix_bytes: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+                let suffix_bytes: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
+                let prefix = base64::engine::general_purpose::STANDARD.encode(&prefix_bytes);
+                let suffix = base64::engine::general_purpose::STANDARD.encode(&suffix_bytes);
 
                 let recipient_pk = PublicKey::from_string(recipient)
                     .map_err(|e| MessageBoxError::Wallet(format!("recipient key: {e}")))?;
 
-                let key = self
-                    .wallet()
+                // TS: uses anyoneWallet for recipient fee key derivation
+                let key = anyone_wallet
                     .get_public_key(
                         GetPublicKeyArgs {
                             identity_key: false,
                             protocol_id: Some(Protocol {
-                                security_level: 1,
-                                protocol: "messagebox".to_string(),
+                                security_level: 2,
+                                protocol: "3241645161d8".to_string(),
                             }),
                             key_id: Some(format!("{prefix} {suffix}")),
                             counterparty: Some(Counterparty {
@@ -640,7 +665,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             for_self: None,
                             seek_permission: None,
                         },
-                        self.originator(),
+                        None,
                     )
                     .await
                     .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
@@ -667,7 +692,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     output_index,
                     derivation_prefix: prefix.as_bytes().to_vec(),
                     derivation_suffix: suffix.as_bytes().to_vec(),
-                    sender_identity_key: recipient.clone(),
+                    sender_identity_key: anyone_id_hex.clone(),
                 });
             }
         }

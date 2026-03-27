@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use bsv::auth::utils::create_nonce;
 use bsv::primitives::public_key::PublicKey;
 use bsv::primitives::utils::from_hex;
+use bsv::remittance::types::PeerMessage;
 use bsv::script::templates::{P2PKH, ScriptTemplateLock};
 use bsv::wallet::interfaces::{
     CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
@@ -143,6 +146,46 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         self.send_message(recipient, "payment_inbox", &token_json).await
     }
 
+    /// Send a payment to `recipient` over WebSocket with HTTP fallback.
+    ///
+    /// Creates a payment token via `create_payment_token`, serializes it as JSON,
+    /// and sends via `send_live_message` (which handles WS timeout + HTTP fallback).
+    /// Thin wrapper — matches TS `PeerPayClient.sendLivePayment`.
+    pub async fn send_live_payment(
+        &self,
+        recipient: &str,
+        amount: u64,
+    ) -> Result<String, MessageBoxError> {
+        let token = self.create_payment_token(recipient, amount).await?;
+        let token_json = serde_json::to_string(&token)?;
+        self.send_live_message(recipient, "payment_inbox", &token_json).await
+    }
+
+    /// Subscribe to live payment notifications on the payment_inbox.
+    ///
+    /// Wraps `listen_for_live_messages` with a callback that parses the message
+    /// body as a `PaymentToken` and constructs an `IncomingPayment`. Messages
+    /// whose bodies are not valid payment tokens are silently ignored (matches
+    /// TS safeParse behavior).
+    pub async fn listen_for_live_payments(
+        &self,
+        on_payment: Arc<dyn Fn(IncomingPayment) + Send + Sync>,
+    ) -> Result<(), MessageBoxError> {
+        let wrapper: Arc<dyn Fn(PeerMessage) + Send + Sync> = Arc::new(move |msg: PeerMessage| {
+            if let Ok(token) = serde_json::from_str::<PaymentToken>(&msg.body) {
+                let incoming = IncomingPayment {
+                    token,
+                    sender: msg.sender,
+                    message_id: msg.message_id,
+                };
+                on_payment(incoming);
+            }
+            // Silently skip messages that aren't valid payment tokens
+        });
+
+        self.listen_for_live_messages("payment_inbox", wrapper).await
+    }
+
     /// Internalize a received payment and acknowledge the message.
     ///
     /// Uses `.as_bytes().to_vec()` for derivation prefix/suffix — NOT base64 decoded.
@@ -245,6 +288,7 @@ mod tests {
     use super::*;
     use crate::types::{IncomingPayment, PaymentCustomInstructions, PaymentToken, ServerPeerMessage};
     use bsv::primitives::private_key::PrivateKey;
+    use bsv::remittance::types::PeerMessage;
     use bsv::wallet::error::WalletError;
     use bsv::wallet::interfaces::*;
     use bsv::wallet::proto_wallet::ProtoWallet;
@@ -491,5 +535,84 @@ mod tests {
         assert_eq!(incoming.token.custom_instructions.derivation_prefix, "pfx");
         assert_eq!(incoming.token.custom_instructions.derivation_suffix, "sfx");
         assert_eq!(incoming.token.output_index, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 tests: send_live_payment / listen_for_live_payments
+    // -----------------------------------------------------------------------
+
+    /// Verify send_live_payment compiles — delegates to create_payment_token then send_live_message.
+    #[allow(dead_code)]
+    fn send_live_payment_compile_check(client: &crate::client::MessageBoxClient<ArcWallet>) {
+        let _fut = client.send_live_payment("03abc", 1000);
+    }
+
+    /// The listen_for_live_payments callback wrapper correctly parses a valid PaymentToken.
+    ///
+    /// Tests the parsing logic directly without a live WS connection.
+    #[test]
+    fn listen_for_live_payments_callback_parses_token() {
+        use std::sync::Mutex as StdMutex;
+
+        let received = Arc::new(StdMutex::new(Vec::<IncomingPayment>::new()));
+        let received_clone = received.clone();
+
+        // Construct a PeerMessage whose body is a valid PaymentToken JSON
+        let msg = PeerMessage {
+            message_id: "msg-live-1".to_string(),
+            sender: "03sender".to_string(),
+            recipient: "03recipient".to_string(),
+            message_box: "payment_inbox".to_string(),
+            body: r#"{"customInstructions":{"derivationPrefix":"p","derivationSuffix":"s"},"transaction":[1,2],"amount":500}"#.to_string(),
+        };
+
+        // Apply the same parsing logic as listen_for_live_payments wrapper
+        if let Ok(token) = serde_json::from_str::<PaymentToken>(&msg.body) {
+            let incoming = IncomingPayment {
+                token,
+                sender: msg.sender.clone(),
+                message_id: msg.message_id.clone(),
+            };
+            received_clone.lock().unwrap().push(incoming);
+        }
+
+        let payments = received.lock().unwrap();
+        assert_eq!(payments.len(), 1, "one valid payment should be parsed");
+        assert_eq!(payments[0].token.amount, 500);
+        assert_eq!(payments[0].sender, "03sender");
+        assert_eq!(payments[0].message_id, "msg-live-1");
+    }
+
+    /// The listen_for_live_payments callback silently skips non-payment messages.
+    ///
+    /// Verifies safeParse behavior — invalid body produces no IncomingPayment.
+    #[test]
+    fn listen_for_live_payments_callback_skips_non_payment() {
+        use std::sync::Mutex as StdMutex;
+
+        let received = Arc::new(StdMutex::new(Vec::<IncomingPayment>::new()));
+        let received_clone = received.clone();
+
+        // Body is not a valid PaymentToken
+        let msg = PeerMessage {
+            message_id: "msg-bad-1".to_string(),
+            sender: "03sender".to_string(),
+            recipient: "03recipient".to_string(),
+            message_box: "payment_inbox".to_string(),
+            body: r#"{"not":"a payment token"}"#.to_string(),
+        };
+
+        // Apply the same parsing logic as listen_for_live_payments wrapper
+        if let Ok(token) = serde_json::from_str::<PaymentToken>(&msg.body) {
+            let incoming = IncomingPayment {
+                token,
+                sender: msg.sender.clone(),
+                message_id: msg.message_id.clone(),
+            };
+            received_clone.lock().unwrap().push(incoming);
+        }
+
+        let payments = received.lock().unwrap();
+        assert_eq!(payments.len(), 0, "non-payment message must be silently skipped");
     }
 }

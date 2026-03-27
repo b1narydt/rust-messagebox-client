@@ -33,7 +33,7 @@ use bsv::wallet::types::{
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
-use crate::types::AdvertisementToken;
+use crate::types::{AdvertisementToken, ListDevicesResponse, RegisterDeviceRequest, RegisterDeviceResponse, RegisteredDevice};
 
 // ---------------------------------------------------------------------------
 // Standalone helpers
@@ -348,6 +348,57 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .map_err(|e| MessageBoxError::Overlay(format!("tx.id(): {e}")))?;
 
         Ok(txid)
+    }
+
+    /// Register a device for FCM push notifications.
+    ///
+    /// POSTs `{"fcmToken": ..., "deviceId": ..., "platform": ...}` (camelCase) to
+    /// `{host}/registerDevice`. Returns `RegisterDeviceResponse { status, message, deviceId }`.
+    ///
+    /// TS parity: `registerDevice` returns the full response object including `deviceId`.
+    pub async fn register_device(
+        &self,
+        fcm_token: &str,
+        device_id: Option<&str>,
+        platform: Option<&str>,
+    ) -> Result<RegisterDeviceResponse, MessageBoxError> {
+        self.assert_initialized().await?;
+
+        let request = RegisterDeviceRequest {
+            fcm_token: fcm_token.to_string(),
+            device_id: device_id.map(String::from),
+            platform: platform.map(String::from),
+        };
+
+        let body_bytes = serde_json::to_vec(&request)
+            .map_err(|e| MessageBoxError::Overlay(format!("serialize RegisterDeviceRequest: {e}")))?;
+
+        let url = format!("{}/registerDevice", self.host());
+        let response = self.post_json(&url, body_bytes).await?;
+
+        let resp: RegisterDeviceResponse = serde_json::from_slice(&response.body)
+            .map_err(|e| MessageBoxError::Overlay(format!("deserialize RegisterDeviceResponse: {e}")))?;
+
+        Ok(resp)
+    }
+
+    /// List all registered devices for this identity.
+    ///
+    /// GETs `{host}/devices` and returns `Vec<RegisteredDevice>`.
+    /// All 8 server fields (id, deviceId, fcmToken, platform, active,
+    /// createdAt, updatedAt, lastUsed) are captured.
+    pub async fn list_registered_devices(
+        &self,
+    ) -> Result<Vec<RegisteredDevice>, MessageBoxError> {
+        self.assert_initialized().await?;
+
+        let url = format!("{}/devices", self.host());
+        let response = self.get_json(&url).await?;
+
+        let resp: ListDevicesResponse = serde_json::from_slice(&response.body)
+            .map_err(|e| MessageBoxError::Overlay(format!("deserialize ListDevicesResponse: {e}")))?;
+
+        Ok(resp.devices)
     }
 
     /// Revoke an existing host advertisement by spending its UTXO.
@@ -673,5 +724,82 @@ mod tests {
             outpoint,
             "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab.0"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 — device registration tests
+    // -----------------------------------------------------------------------
+
+    /// `RegisterDeviceRequest` serializes to camelCase JSON with correct field names.
+    #[test]
+    fn test_register_device_request_serializes_camelcase() {
+        use crate::types::RegisterDeviceRequest;
+        let req = RegisterDeviceRequest {
+            fcm_token: "abc".to_string(),
+            device_id: Some("d1".to_string()),
+            platform: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"fcmToken\":\"abc\""), "fcmToken must be camelCase: {json}");
+        assert!(json.contains("\"deviceId\":\"d1\""), "deviceId must be camelCase: {json}");
+        assert!(!json.contains("platform"), "platform absent when None: {json}");
+        assert!(!json.contains("fcm_token"), "no snake_case leakage: {json}");
+        assert!(!json.contains("device_id"), "no snake_case leakage: {json}");
+    }
+
+    /// `ListDevicesResponse` deserializes a full server response including all 8 fields.
+    #[test]
+    fn test_list_devices_response_deserializes() {
+        use crate::types::ListDevicesResponse;
+        let raw = r#"{
+            "status": "success",
+            "devices": [{
+                "id": 1,
+                "deviceId": "d1",
+                "fcmToken": "tok",
+                "platform": "ios",
+                "active": true,
+                "createdAt": "2026-01-01",
+                "updatedAt": "2026-01-01",
+                "lastUsed": "2026-01-01"
+            }]
+        }"#;
+        let resp: ListDevicesResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.devices.len(), 1);
+        let dev = &resp.devices[0];
+        assert_eq!(dev.id, Some(1));
+        assert_eq!(dev.device_id.as_deref(), Some("d1"));
+        assert_eq!(dev.fcm_token, "tok");
+        assert_eq!(dev.platform.as_deref(), Some("ios"));
+        assert_eq!(dev.active, Some(true));
+        assert!(dev.created_at.is_some());
+        assert!(dev.updated_at.is_some());
+        assert!(dev.last_used.is_some());
+    }
+
+    /// `RegisterDeviceResponse` deserializes `{status, message, deviceId}` correctly.
+    #[test]
+    fn test_register_device_response_deserializes() {
+        use crate::types::RegisterDeviceResponse;
+        let raw = r#"{"status":"success","message":"registered","deviceId":42}"#;
+        let resp: RegisterDeviceResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.message.as_deref(), Some("registered"));
+        assert_eq!(resp.device_id, Some(42));
+    }
+
+    /// `register_device` method exists on `MessageBoxClient` — compile check.
+    ///
+    /// Verifies the method signature accepts fcm_token, device_id, platform.
+    #[allow(dead_code)]
+    fn register_device_compiles(client: &MessageBoxClient<ArcWallet>) {
+        let _fut = client.register_device("tok123", Some("dev1"), Some("ios"));
+    }
+
+    /// `list_registered_devices` method exists on `MessageBoxClient` — compile check.
+    #[allow(dead_code)]
+    fn list_registered_devices_compiles(client: &MessageBoxClient<ArcWallet>) {
+        let _fut = client.list_registered_devices();
     }
 }

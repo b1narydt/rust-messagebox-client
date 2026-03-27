@@ -130,6 +130,51 @@ pub struct SendMessageResponse {
     pub message_id: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 — PeerPay payment types
+// ---------------------------------------------------------------------------
+
+/// Custom instructions embedded in a PeerPay transaction output.
+///
+/// Serializes to camelCase JSON for the TS wire format.
+/// `payee` is omitted when None (TS omits it when there's no explicit payee override).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentCustomInstructions {
+    pub derivation_prefix: String,
+    pub derivation_suffix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payee: Option<String>,
+}
+
+/// A PeerPay payment token sent to a recipient's payment_inbox.
+///
+/// Serializes to camelCase JSON matching the TS PaymentToken wire format:
+/// - `transaction` is a number array (Vec<u8>) on the wire
+/// - `outputIndex` is omitted at creation time (None); defaulted to 0 at accept time
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentToken {
+    pub custom_instructions: PaymentCustomInstructions,
+    /// Raw transaction bytes.
+    pub transaction: Vec<u8>,
+    pub amount: u64,
+    /// Only present after being set by the sender; defaults to 0 at accept time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_index: Option<u32>,
+}
+
+/// A parsed incoming payment from the payment_inbox.
+///
+/// Holds the decoded token plus routing metadata needed for accept/reject.
+/// NOT serialized — constructed internally from a ServerPeerMessage.
+#[derive(Clone, Debug)]
+pub struct IncomingPayment {
+    pub token: PaymentToken,
+    pub sender: String,
+    pub message_id: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +267,90 @@ mod tests {
         assert_eq!(quote.delivery_fee, 10);
         assert_eq!(quote.recipient_fee, 50);
         assert_eq!(quote.delivery_agent_identity_key, "03deadbeef");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3 — payment type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn payment_custom_instructions_round_trip() {
+        let ci = PaymentCustomInstructions {
+            derivation_prefix: "pfx123".to_string(),
+            derivation_suffix: "sfx456".to_string(),
+            payee: Some("03abc".to_string()),
+        };
+        let json = serde_json::to_string(&ci).unwrap();
+        let back: PaymentCustomInstructions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.derivation_prefix, "pfx123");
+        assert_eq!(back.derivation_suffix, "sfx456");
+        assert_eq!(back.payee, Some("03abc".to_string()));
+    }
+
+    #[test]
+    fn payment_token_serializes_camel_case() {
+        let token = PaymentToken {
+            custom_instructions: PaymentCustomInstructions {
+                derivation_prefix: "pfx".to_string(),
+                derivation_suffix: "sfx".to_string(),
+                payee: Some("03recipient".to_string()),
+            },
+            transaction: vec![1, 2, 3],
+            amount: 1000,
+            output_index: Some(0),
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        // Verify camelCase field names
+        assert!(json.contains("\"customInstructions\""), "customInstructions field name");
+        assert!(json.contains("\"derivationPrefix\""), "derivationPrefix field name");
+        assert!(json.contains("\"derivationSuffix\""), "derivationSuffix field name");
+        assert!(json.contains("\"payee\""), "payee present when Some");
+        assert!(json.contains("\"outputIndex\""), "outputIndex present when Some");
+        // No snake_case leakage
+        assert!(!json.contains("custom_instructions"), "no snake_case leakage");
+        assert!(!json.contains("derivation_prefix"), "no snake_case leakage");
+        assert!(!json.contains("output_index"), "no snake_case leakage");
+    }
+
+    #[test]
+    fn payment_token_no_output_index_by_default() {
+        let token = PaymentToken {
+            custom_instructions: PaymentCustomInstructions {
+                derivation_prefix: "pfx".to_string(),
+                derivation_suffix: "sfx".to_string(),
+                payee: None,
+            },
+            transaction: vec![0xab, 0xcd],
+            amount: 500,
+            output_index: None,
+        };
+        let json = serde_json::to_string(&token).unwrap();
+        // outputIndex must be absent when None
+        assert!(!json.contains("outputIndex"), "outputIndex absent when None");
+        // payee must be absent when None
+        assert!(!json.contains("payee"), "payee absent when None");
+    }
+
+    #[test]
+    fn incoming_payment_can_be_constructed() {
+        let token = PaymentToken {
+            custom_instructions: PaymentCustomInstructions {
+                derivation_prefix: "p".to_string(),
+                derivation_suffix: "s".to_string(),
+                payee: None,
+            },
+            transaction: vec![0x01],
+            amount: 2000,
+            output_index: None,
+        };
+        let incoming = IncomingPayment {
+            token: token.clone(),
+            sender: "03sender".to_string(),
+            message_id: "msg001".to_string(),
+        };
+        assert_eq!(incoming.sender, "03sender");
+        assert_eq!(incoming.message_id, "msg001");
+        assert_eq!(incoming.token.amount, 2000);
     }
 
     // -----------------------------------------------------------------------

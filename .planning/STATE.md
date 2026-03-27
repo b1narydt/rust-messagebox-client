@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-websocket-live-messaging 04-01-PLAN.md
-last_updated: "2026-03-27T12:00:08.370Z"
+stopped_at: Completed 04-websocket-live-messaging 04-02-PLAN.md
+last_updated: "2026-03-27T12:04:08.504Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 6
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 8
-  completed_plans: 7
+  completed_plans: 8
   percent: 50
 ---
 
@@ -57,6 +57,7 @@ Progress: [█████░░░░░] 50%
 | Phase 03-peerpay P01 | 3min | 2 tasks | 3 files |
 | Phase 03-peerpay P02 | 8min | 2 tasks | 2 files |
 | Phase 04-websocket-live-messaging P04-01 | 4 | 2 tasks | 6 files |
+| Phase 04-websocket-live-messaging P04-02 | 1 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -87,6 +88,8 @@ Recent decisions affecting current work:
 - [Phase 04-websocket-live-messaging]: Decryption in on_any callback (not tokio::spawn) preserves message ordering via rust_socketio internal mutex serialization
 - [Phase 04-websocket-live-messaging]: split_room_id uses 66-char hex key boundary — compressed pubkeys are always 66 hex chars, unambiguous even with hyphens in mb names
 - [Phase 04-websocket-live-messaging]: auth_tx wrapped in Arc<Mutex<Option>> — on_any is FnMut not FnOnce, oneshot::Sender is non-Clone, take() ensures exactly-once delivery
+- [Phase 04-websocket-live-messaging]: send_live_message and listen_for_live_messages ignore host_override in RemittanceAdapter — multi-host deferred to Phase 5
+- [Phase 04-websocket-live-messaging]: listen_for_live_payments wraps PeerMessage callback with PaymentToken JSON parsing; silently skips non-payment messages matching TS safeParse behavior
 
 ### Pending Todos
 
@@ -100,6 +103,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-27T12:00:08.367Z
-Stopped at: Completed 04-websocket-live-messaging 04-01-PLAN.md
+Last session: 2026-03-27T12:04:08.502Z
+Stopped at: Completed 04-websocket-live-messaging 04-02-PLAN.md
 Resume file: None

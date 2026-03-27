@@ -9,7 +9,7 @@ Six phases translate the TypeScript `@bsv/message-box-client` v1.3.0 into a prod
 - [x] **Phase 1: HTTP Core + Foundation** - Crate scaffolding, encryption helpers, and basic authenticated HTTP messaging (send, list lite, acknowledge) (completed 2026-03-26)
 - [ ] **Phase 2: CommsLayer Adapter + Permissions** - `RemittanceAdapter` implementing `CommsLayer` trait, permission management, notification convenience methods
 - [ ] **Phase 3: PeerPay** - Payment token create/send/accept/reject/list and `list_messages` with auto-internalization
-- [ ] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener
+- [x] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener (completed 2026-03-27)
 - [ ] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration
 - [ ] **Phase 6: Parity Verification** - Cross-language integration testing, API surface audit, smoke testing of every public method against TS client
 
@@ -70,7 +70,7 @@ Plans:
   3. `join_room` and `leave_room` correctly subscribe and unsubscribe — a message sent to a room after `leave_room` is not delivered to the unsubscribed callback
   4. `disconnect_web_socket` closes the connection cleanly with no leaked tasks or pending ack channels
   5. `CommsLayer` live messaging methods (previously default impls) are wired to WebSocket operations
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 Plans:
 - [ ] 04-01-PLAN.md — WebSocket core: MessageBoxWebSocket struct, wire types, connect/split, room management, send_live_message with timeout/fallback, listen_for_live_messages with auto-decryption, disconnect
 - [ ] 04-02-PLAN.md — CommsLayer live method overrides in RemittanceAdapter, send_live_payment and listen_for_live_payments in PeerPay
@@ -109,6 +109,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. HTTP Core + Foundation | 2/2 | Complete   | 2026-03-26 |
 | 2. CommsLayer Adapter + Permissions | 2/2 | Complete | 2026-03-26 |
 | 3. PeerPay | 1/2 | In Progress|  |
-| 4. WebSocket Live Messaging | 1/2 | In Progress|  |
+| 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
 | 5. Overlay + Device Registration | 0/TBD | Not started | - |
 | 6. Parity Verification | 0/TBD | Not started | - |

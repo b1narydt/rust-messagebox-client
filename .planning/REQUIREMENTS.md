@@ -49,17 +49,17 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 - [x] **COMM-02**: `send_message` maps to `CommsLayer::send_message` returning server-assigned message ID
 - [x] **COMM-03**: `list_messages` maps to `CommsLayer::list_messages` returning `Vec<PeerMessage>`
 - [x] **COMM-04**: `acknowledge_message` maps to `CommsLayer::acknowledge_message`
-- [ ] **COMM-05**: Live messaging methods use default trait impls until WebSocket phase completes, then wire through
+- [x] **COMM-05**: Live messaging methods use default trait impls until WebSocket phase completes, then wire through
 
 ### PeerPay
 
 - [x] **PAY-01**: `create_payment_token` generates BSV payment via `WalletInterface::create_action`
 - [x] **PAY-02**: `send_payment` sends payment token over HTTP via `send_message`
-- [ ] **PAY-03**: `send_live_payment` sends payment token over WebSocket with HTTP fallback
+- [x] **PAY-03**: `send_live_payment` sends payment token over WebSocket with HTTP fallback
 - [x] **PAY-04**: `accept_payment` internalizes payment transaction via `WalletInterface::internalize_action`
 - [x] **PAY-05**: `reject_payment` refunds payment with fee deduction
 - [x] **PAY-06**: `list_incoming_payments` filters messages from `payment_inbox` box
-- [ ] **PAY-07**: `listen_for_live_payments` wraps live message listener with payment decoding
+- [x] **PAY-07**: `listen_for_live_payments` wraps live message listener with payment decoding
 
 ### WebSocket Live Messaging
 
@@ -149,14 +149,14 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 | COMM-02 | Phase 2 | Complete |
 | COMM-03 | Phase 2 | Complete |
 | COMM-04 | Phase 2 | Complete |
-| COMM-05 | Phase 4 | Pending |
+| COMM-05 | Phase 4 | Complete |
 | PAY-01 | Phase 3 | Complete |
 | PAY-02 | Phase 3 | Complete |
-| PAY-03 | Phase 4 | Pending |
+| PAY-03 | Phase 4 | Complete |
 | PAY-04 | Phase 3 | Complete |
 | PAY-05 | Phase 3 | Complete |
 | PAY-06 | Phase 3 | Complete |
-| PAY-07 | Phase 4 | Pending |
+| PAY-07 | Phase 4 | Complete |
 | WS-01 | Phase 4 | Complete |
 | WS-02 | Phase 4 | Complete |
 | WS-03 | Phase 4 | Complete |

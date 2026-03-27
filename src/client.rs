@@ -156,8 +156,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// Mirrors `post_json` but sends no body and no content-type header.
     /// The caller is responsible for building the full URL including query string.
-    /// Used by permissions.rs (Plan 02-02).
-    #[allow(dead_code)]
     pub(crate) async fn get_json(
         &self,
         url: &str,
@@ -182,16 +180,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 }
 
 // ---------------------------------------------------------------------------
-// Standalone helpers used by permissions.rs
+// Standalone helpers
 // ---------------------------------------------------------------------------
 
 /// Check if a successful (2xx) HTTP response body contains a server-level
 /// error indicator (`{"status": "error", "description": "..."}`).
 ///
-/// All four permission endpoints can return HTTP 200 with a logical error
-/// payload — this helper normalises that into `MessageBoxError::Auth`.
-/// Used by permissions.rs (Plan 02-02).
-#[allow(dead_code)]
+/// The MessageBox server can return HTTP 200 with a logical error payload —
+/// this helper normalises that into `MessageBoxError::Auth`.
 pub(crate) fn check_status_error(body: &[u8]) -> Result<(), MessageBoxError> {
     // Attempt a lightweight parse — ignore failures (malformed JSON is not
     // a server error in this sense).

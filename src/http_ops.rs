@@ -2,7 +2,8 @@ use bsv::wallet::interfaces::WalletInterface;
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
-use crate::types::{AcknowledgeMessageParams, ListMessagesParams, ListMessagesResponse, SendMessageParams, SendMessageRequest, ServerPeerMessage};
+use crate::client::check_status_error;
+use crate::types::{AcknowledgeMessageParams, ListMessagesParams, ListMessagesResponse, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
@@ -53,8 +54,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let body_bytes = serde_json::to_vec(&request)?;
         let url = format!("{}/sendMessage", self.host());
-        self.post_json(&url, body_bytes).await?;
+        let response = self.post_json(&url, body_bytes).await?;
+        check_status_error(&response.body)?;
 
+        // PARITY: TS returns server messageId when present, falls back to HMAC ID
+        if let Ok(resp) = serde_json::from_slice::<SendMessageResponse>(&response.body) {
+            if let Some(server_id) = resp.message_id {
+                return Ok(server_id);
+            }
+        }
         Ok(message_id)
     }
 
@@ -76,6 +84,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{}/listMessages", self.host());
         let response = self.post_json(&url, body_bytes).await?;
+        check_status_error(&response.body)?;
 
         let mut list_response: ListMessagesResponse =
             serde_json::from_slice(&response.body)?;
@@ -107,7 +116,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let params = AcknowledgeMessageParams { message_ids };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{}/acknowledgeMessage", self.host());
-        self.post_json(&url, body_bytes).await?;
+        let response = self.post_json(&url, body_bytes).await?;
+        check_status_error(&response.body)?;
 
         Ok(())
     }

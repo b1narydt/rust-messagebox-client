@@ -85,7 +85,10 @@ Plans:
   3. `anoint_host` broadcasts a valid PushDrop transaction the overlay accepts; `revoke_host_advertisement` spends it cleanly
   4. `list_messages` across two advertised hosts returns a deduplicated message set — a message present on both hosts appears exactly once
   5. `register_device` and `list_registered_devices` complete against `go-messagebox-server` without errors
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 05-01-PLAN.md — Overlay types, PushDrop helper, query_advertisements, resolve_host_for_recipient, anoint_host, revoke_host_advertisement
+- [ ] 05-02-PLAN.md — init-once wiring, multi-host list_messages deduplication, register_device, list_registered_devices
 
 ### Phase 6: Parity Verification
 **Goal**: Every public method in the Rust crate behaves identically to its TypeScript counterpart — confirmed by cross-language integration tests, API surface audit, and comprehensive smoke testing
@@ -110,5 +113,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. CommsLayer Adapter + Permissions | 2/2 | Complete | 2026-03-26 |
 | 3. PeerPay | 1/2 | In Progress|  |
 | 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
-| 5. Overlay + Device Registration | 0/TBD | Not started | - |
+| 5. Overlay + Device Registration | 0/2 | Not started | - |
 | 6. Parity Verification | 0/TBD | Not started | - |

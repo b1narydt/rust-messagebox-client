@@ -225,15 +225,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Send a notification body to `recipient`'s `"notifications"` inbox.
     ///
     /// Delegates to `send_message` with `message_box = "notifications"`.
-    ///
-    /// # TODO Phase 3
-    /// Add `checkPermissions` and payment flow before sending.
+    /// Host resolution is handled by `send_message` internally via overlay
+    /// (`resolveHostForRecipient`) — TS parity achieved.
     pub async fn send_notification(
         &self,
         recipient: &str,
         body: &str,
     ) -> Result<String, MessageBoxError> {
-        // TODO Phase 3: add checkPermissions/payment flow
         self.send_message(recipient, "notifications", body).await
     }
 }

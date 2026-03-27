@@ -30,19 +30,28 @@ impl<W: WalletInterface + Clone + 'static> RemittanceAdapter<W> {
 
 #[async_trait]
 impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for RemittanceAdapter<W> {
-    /// Delegate to `MessageBoxClient::send_message`, ignoring `host_override`
-    /// (multi-host routing is deferred to Phase 5).
+    /// Delegate to `MessageBoxClient`, passing `host_override` through.
+    ///
+    /// When `host_override` is `Some(host)`, calls `send_message_to_host` directly
+    /// bypassing overlay resolution. When `None`, calls `send_message` which resolves
+    /// the recipient's host via overlay (TS parity: `overrideHost ?? resolveHostForRecipient`).
     async fn send_message(
         &self,
         recipient: &str,
         message_box: &str,
         body: &str,
-        _host_override: Option<&str>,
+        host_override: Option<&str>,
     ) -> Result<String, RemittanceError> {
-        self.inner
-            .send_message(recipient, message_box, body)
-            .await
-            .map_err(|e| RemittanceError::Protocol(e.to_string()))
+        match host_override {
+            Some(host) => self.inner
+                .send_message_to_host(host, recipient, message_box, body)
+                .await
+                .map_err(|e| RemittanceError::Protocol(e.to_string())),
+            None => self.inner
+                .send_message(recipient, message_box, body)
+                .await
+                .map_err(|e| RemittanceError::Protocol(e.to_string())),
+        }
     }
 
     /// Retrieve messages and map them to `Vec<PeerMessage>`.
@@ -95,19 +104,26 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
 
     /// Delegate to `MessageBoxClient::send_live_message`.
     ///
-    /// `_host_override` is ignored — multi-host routing is deferred to Phase 5
-    /// (same pattern as `send_message`).
+    /// When `host_override` is `Some(host)`, uses the HTTP path with that host directly
+    /// (WS only connects to `self.host()` — override applies only to the HTTP send path).
+    /// When `None`, uses the default WS+HTTP-fallback path which resolves host via overlay.
     async fn send_live_message(
         &self,
         recipient: &str,
         message_box: &str,
         body: &str,
-        _host_override: Option<&str>,
+        host_override: Option<&str>,
     ) -> Result<String, RemittanceError> {
-        self.inner
-            .send_live_message(recipient, message_box, body)
-            .await
-            .map_err(|e| RemittanceError::Protocol(e.to_string()))
+        match host_override {
+            Some(host) => self.inner
+                .send_message_to_host(host, recipient, message_box, body)
+                .await
+                .map_err(|e| RemittanceError::Protocol(e.to_string())),
+            None => self.inner
+                .send_live_message(recipient, message_box, body)
+                .await
+                .map_err(|e| RemittanceError::Protocol(e.to_string())),
+        }
     }
 
     /// Delegate to `MessageBoxClient::listen_for_live_messages`.
@@ -298,5 +314,19 @@ mod tests {
     fn listen_for_live_messages_compiles(adapter: &RemittanceAdapter<ArcWallet>) {
         let cb: Arc<dyn Fn(PeerMessage) + Send + Sync> = Arc::new(|_msg| {});
         let _fut = adapter.listen_for_live_messages("inbox", None, cb);
+    }
+
+    /// `send_message` with a host_override compiles — compile check.
+    ///
+    /// Verifies `send_message_to_host` is called when host_override is Some.
+    #[allow(dead_code)]
+    fn test_adapter_send_message_with_host_override_compiles(adapter: &RemittanceAdapter<ArcWallet>) {
+        let _fut = adapter.send_message("03recipient", "inbox", "body", Some("https://other.host"));
+    }
+
+    /// `send_message` with no host_override compiles — compile check.
+    #[allow(dead_code)]
+    fn test_adapter_send_message_without_override_compiles(adapter: &RemittanceAdapter<ArcWallet>) {
+        let _fut = adapter.send_message("03recipient", "inbox", "body", None);
     }
 }

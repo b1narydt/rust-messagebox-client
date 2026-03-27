@@ -16,6 +16,9 @@ use crate::encryption;
 use crate::error::MessageBoxError;
 use crate::types::ServerPeerMessage;
 
+/// Subscriber callback: event key → message handler.
+type SubscriptionMap = Arc<Mutex<HashMap<String, Arc<dyn Fn(PeerMessage) + Send + Sync>>>>;
+
 /// WebSocket connection to the MessageBox server using Socket.IO v4 protocol.
 ///
 /// Manages authentication handshake, room-based pub/sub, and event dispatch.
@@ -24,7 +27,7 @@ use crate::types::ServerPeerMessage;
 pub struct MessageBoxWebSocket {
     client: SocketClient,
     /// Map of event key (e.g. "sendMessage-{roomId}") to subscriber callback.
-    subscriptions: Arc<Mutex<HashMap<String, Arc<dyn Fn(PeerMessage) + Send + Sync>>>>,
+    subscriptions: SubscriptionMap,
     /// Pending ack channels keyed by "sendMessageAck-{roomId}".
     pending_acks: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
     /// Rooms currently joined (for idempotency on join_room).
@@ -49,8 +52,7 @@ impl MessageBoxWebSocket {
     where
         W: WalletInterface + Clone + Send + Sync + 'static,
     {
-        let subscriptions: Arc<Mutex<HashMap<String, Arc<dyn Fn(PeerMessage) + Send + Sync>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let subscriptions: SubscriptionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_acks: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let joined_rooms: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -65,28 +67,53 @@ impl MessageBoxWebSocket {
         let acks_clone = pending_acks.clone();
         let conn_clone = connected.clone();
         let auth_tx_clone = auth_tx.clone();
+        let rooms_clone = joined_rooms.clone();
+
+        // Identity key captured for re-authentication on reconnect
+        let identity_key_owned = identity_key.to_string();
 
         // Wallet and originator captured by value for decryption inside on_any
         let wallet_clone = wallet.clone();
         let originator_clone = originator.clone();
 
         let client = ClientBuilder::new(url)
-            .on_any(move |event, payload, _socket| {
+            .on_any(move |event, payload, socket| {
                 let subs = subs_clone.clone();
                 let acks = acks_clone.clone();
                 let conn = conn_clone.clone();
                 let auth_tx = auth_tx_clone.clone();
+                let rooms = rooms_clone.clone();
+                let ident = identity_key_owned.clone();
                 let wallet = wallet_clone.clone();
                 let originator = originator_clone.clone();
 
                 async move {
                     match &event {
+                        // Re-authenticate on (re)connect — mirrors TS AuthSocketClient
+                        // which re-emits `authenticated` each time the transport connects.
+                        // On the initial connect this duplicates the manual emit below,
+                        // but the server handles duplicate auth gracefully.
+                        Event::Connect => {
+                            let _ = socket
+                                .emit("authenticated", json!({"identityKey": ident}))
+                                .await;
+                        }
                         Event::Custom(name) => {
                             if name == "authenticationSuccess" {
                                 conn.store(true, Ordering::SeqCst);
+                                // Signal initial auth waiter (no-op on reconnect —
+                                // auth_tx is already consumed)
                                 let mut guard = auth_tx.lock().await;
                                 if let Some(tx) = guard.take() {
                                     let _ = tx.send(true);
+                                }
+                                // Re-join rooms after reconnect auth succeeds.
+                                // On first connect joined_rooms is empty, so this is a no-op.
+                                let rooms_guard = rooms.lock().await;
+                                for room_id in rooms_guard.iter() {
+                                    let _ = socket
+                                        .emit("joinRoom", json!(room_id))
+                                        .await;
                                 }
                             } else if name == "authenticationFailed" {
                                 let mut guard = auth_tx.lock().await;
@@ -244,14 +271,15 @@ impl MessageBoxWebSocket {
         ack_key: String,
         ack_tx: oneshot::Sender<bool>,
     ) -> Result<(), MessageBoxError> {
-        self.pending_acks.lock().await.insert(ack_key, ack_tx);
-        self.client
-            .emit("sendMessage", payload)
+        self.pending_acks
+            .lock()
             .await
-            .map_err(|e| {
-                // NOTE: we don't remove ack_tx on emit error — caller handles cleanup
-                MessageBoxError::WebSocket(e.to_string())
-            })?;
+            .insert(ack_key.clone(), ack_tx);
+        if let Err(e) = self.client.emit("sendMessage", payload).await {
+            // Clean up the pending ack so it doesn't leak until timeout
+            self.pending_acks.lock().await.remove(&ack_key);
+            return Err(MessageBoxError::WebSocket(e.to_string()));
+        }
         Ok(())
     }
 

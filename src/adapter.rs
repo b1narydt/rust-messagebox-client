@@ -44,11 +44,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
     ) -> Result<String, RemittanceError> {
         match host_override {
             Some(host) => self.inner
-                .send_message_to_host(host, recipient, message_box, body)
+                .send_message_to_host(host, recipient, message_box, body, false, false, None, None)
                 .await
                 .map_err(|e| RemittanceError::Protocol(e.to_string())),
             None => self.inner
-                .send_message(recipient, message_box, body)
+                .send_message(recipient, message_box, body, false, false, None, None)
                 .await
                 .map_err(|e| RemittanceError::Protocol(e.to_string())),
         }
@@ -97,16 +97,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
         message_ids: &[String],
     ) -> Result<(), RemittanceError> {
         self.inner
-            .acknowledge_message(message_ids.to_vec())
+            .acknowledge_message(message_ids.to_vec(), None)
             .await
             .map_err(|e| RemittanceError::Protocol(e.to_string()))
     }
 
     /// Delegate to `MessageBoxClient::send_live_message`.
     ///
-    /// When `host_override` is `Some(host)`, uses the HTTP path with that host directly
-    /// (WS only connects to `self.host()` — override applies only to the HTTP send path).
-    /// When `None`, uses the default WS+HTTP-fallback path which resolves host via overlay.
+    /// Passes `host_override` through to `MessageBoxClient::send_live_message`
+    /// which applies it on the HTTP fallback path.
     async fn send_live_message(
         &self,
         recipient: &str,
@@ -114,29 +113,23 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
         body: &str,
         host_override: Option<&str>,
     ) -> Result<String, RemittanceError> {
-        match host_override {
-            Some(host) => self.inner
-                .send_message_to_host(host, recipient, message_box, body)
-                .await
-                .map_err(|e| RemittanceError::Protocol(e.to_string())),
-            None => self.inner
-                .send_live_message(recipient, message_box, body)
-                .await
-                .map_err(|e| RemittanceError::Protocol(e.to_string())),
-        }
+        self.inner
+            .send_live_message(recipient, message_box, body, host_override)
+            .await
+            .map_err(|e| RemittanceError::Protocol(e.to_string()))
     }
 
     /// Delegate to `MessageBoxClient::listen_for_live_messages`.
     ///
-    /// `_override_host` is ignored — multi-host routing is deferred to Phase 5.
+    /// Passes `override_host` through (currently deferred in WS path).
     async fn listen_for_live_messages(
         &self,
         message_box: &str,
-        _override_host: Option<&str>,
+        override_host: Option<&str>,
         on_message: Arc<dyn Fn(PeerMessage) + Send + Sync>,
     ) -> Result<(), RemittanceError> {
         self.inner
-            .listen_for_live_messages(message_box, on_message)
+            .listen_for_live_messages(message_box, on_message, override_host)
             .await
             .map_err(|e| RemittanceError::Protocol(e.to_string()))
     }

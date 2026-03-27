@@ -1,4 +1,131 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Phase 6 — parity types: sendList, multi-quote, payment metadata
+// ---------------------------------------------------------------------------
+
+/// Parameters for sending a message to multiple recipients in one call.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SendListParams {
+    pub recipients: Vec<String>,
+    pub message_box: String,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_encryption: Option<bool>,
+}
+
+/// A single successfully-delivered recipient entry in a sendList result.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SentRecipient {
+    pub recipient: String,
+    pub message_id: String,
+}
+
+/// A failed recipient entry in a sendList result.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct FailedRecipient {
+    pub recipient: String,
+    pub error: String,
+}
+
+/// Aggregate fee totals returned in a sendList or multi-quote response.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SendListTotals {
+    pub delivery_fees: i64,
+    pub recipient_fees: i64,
+    pub total_for_payable_recipients: i64,
+}
+
+/// Result of a sendList operation.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SendListResult {
+    pub status: String,
+    pub description: String,
+    pub sent: Vec<SentRecipient>,
+    pub blocked: Vec<String>,
+    pub failed: Vec<FailedRecipient>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totals: Option<SendListTotals>,
+}
+
+/// Quote for a single recipient in a multi-recipient quote request.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipientQuote {
+    pub recipient: String,
+    pub message_box: String,
+    pub delivery_fee: i64,
+    pub recipient_fee: i64,
+    pub status: String,
+}
+
+/// Aggregated delivery quotes for multiple recipients.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageBoxMultiQuote {
+    pub quotes_by_recipient: Vec<RecipientQuote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub totals: Option<SendListTotals>,
+    pub blocked_recipients: Vec<String>,
+    pub delivery_agent_identity_key_by_host: HashMap<String, String>,
+}
+
+/// Remittance output describing how a payment was routed to a recipient.
+///
+/// Carries the derivation keys needed to prove the counterparty can redeem.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentRemittanceInfo {
+    pub derivation_prefix: String,
+    pub derivation_suffix: String,
+    pub sender_identity_key: String,
+}
+
+/// Basket insertion remittance — used when the output targets a basket.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertionRemittanceInfo {
+    pub basket: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// A single output within a Payment struct.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentOutput {
+    pub output_index: u32,
+    pub protocol: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_remittance: Option<PaymentRemittanceInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insertion_remittance: Option<InsertionRemittanceInfo>,
+}
+
+/// A payment token for attaching BSV remittance to a sendList call.
+///
+/// Distinct from `PaymentToken` (PeerPay p2p) — this type represents an
+/// on-chain payment submitted alongside a multi-recipient send.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Payment {
+    pub tx: Vec<u8>,
+    pub outputs: Vec<PaymentOutput>,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seek_permission: Option<bool>,
+}
 
 // ---------------------------------------------------------------------------
 // Phase 5 — overlay advertisement and device registration types
@@ -147,11 +274,36 @@ pub struct SendMessageParams {
     pub message_id: String,
 }
 
+/// Payment structure included in a sendMessage request when check_permissions requires a fee.
+///
+/// Serializes the transaction bytes and outputs to wire format matching TS Payment type.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagePayment {
+    /// Raw transaction bytes.
+    pub tx: Vec<u8>,
+    /// Outputs from the payment transaction.
+    pub outputs: Vec<MessagePaymentOutput>,
+}
+
+/// One output entry in a MessagePayment.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagePaymentOutput {
+    pub output_index: u32,
+    pub derivation_prefix: Vec<u8>,
+    pub derivation_suffix: Vec<u8>,
+    pub sender_identity_key: String,
+}
+
 /// Wire format wrapper — serializes as `{"message": <params>}` for the `/sendMessage` endpoint.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SendMessageRequest {
     pub message: SendMessageParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment: Option<MessagePayment>,
 }
+
 
 /// Parameters for listing messages from a specific inbox.
 #[derive(Serialize, Deserialize, Clone, Debug)]

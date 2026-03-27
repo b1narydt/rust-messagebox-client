@@ -198,6 +198,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     Err(_) => continue,
                 };
 
+                // TS parity: filter localhost and non-HTTPS hosts
+                if !host_url.starts_with("https://") || host_url.contains("localhost") {
+                    continue;
+                }
+
                 // tx.id() returns Result<String> with no argument (unlike TS)
                 let txid = match tx.id() {
                     Ok(id) => id,
@@ -361,9 +366,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         fcm_token: &str,
         device_id: Option<&str>,
         platform: Option<&str>,
+        override_host: Option<&str>,
     ) -> Result<RegisterDeviceResponse, MessageBoxError> {
         self.assert_initialized().await?;
 
+        let base = override_host.unwrap_or_else(|| self.host());
         let request = RegisterDeviceRequest {
             fcm_token: fcm_token.to_string(),
             device_id: device_id.map(String::from),
@@ -373,7 +380,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let body_bytes = serde_json::to_vec(&request)
             .map_err(|e| MessageBoxError::Overlay(format!("serialize RegisterDeviceRequest: {e}")))?;
 
-        let url = format!("{}/registerDevice", self.host());
+        let url = format!("{base}/registerDevice");
         let response = self.post_json(&url, body_bytes).await?;
 
         let resp: RegisterDeviceResponse = serde_json::from_slice(&response.body)
@@ -389,10 +396,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// createdAt, updatedAt, lastUsed) are captured.
     pub async fn list_registered_devices(
         &self,
+        override_host: Option<&str>,
     ) -> Result<Vec<RegisteredDevice>, MessageBoxError> {
         self.assert_initialized().await?;
 
-        let url = format!("{}/devices", self.host());
+        let base = override_host.unwrap_or_else(|| self.host());
+        let url = format!("{base}/devices");
         let response = self.get_json(&url).await?;
 
         let resp: ListDevicesResponse = serde_json::from_slice(&response.body)
@@ -794,12 +803,12 @@ mod tests {
     /// Verifies the method signature accepts fcm_token, device_id, platform.
     #[allow(dead_code)]
     fn register_device_compiles(client: &MessageBoxClient<ArcWallet>) {
-        let _fut = client.register_device("tok123", Some("dev1"), Some("ios"));
+        let _fut = client.register_device("tok123", Some("dev1"), Some("ios"), None);
     }
 
     /// `list_registered_devices` method exists on `MessageBoxClient` — compile check.
     #[allow(dead_code)]
     fn list_registered_devices_compiles(client: &MessageBoxClient<ArcWallet>) {
-        let _fut = client.list_registered_devices();
+        let _fut = client.list_registered_devices(None);
     }
 }

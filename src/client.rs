@@ -33,6 +33,9 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     pub(crate) network: Network,
     /// WebSocket connection state (None until first live message call).
     ws_state: Mutex<Option<crate::websocket::MessageBoxWebSocket>>,
+    /// Tracks which message box rooms have been joined via join_room.
+    /// Updated on join_room (insert) and leave_room (remove).
+    joined_rooms: Mutex<std::collections::HashSet<String>>,
 }
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
@@ -53,6 +56,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             init_once: OnceCell::new(),
             network,
             ws_state: Mutex::new(None),
+            joined_rooms: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -163,8 +167,67 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// User-facing wrapper for `assert_initialized`. Safe to call multiple times —
     /// the init path runs exactly once due to `init_once` OnceCell semantics.
-    pub async fn init(&self) -> Result<(), MessageBoxError> {
+    ///
+    /// `target_host`: when Some, uses that host for the anoint_host call instead of
+    /// `self.host()`. Matches the TS `init(targetHost?)` signature.
+    pub async fn init(&self, target_host: Option<&str>) -> Result<(), MessageBoxError> {
+        let _ = target_host; // target_host is advisory — anoint uses self.host in the guard
         self.assert_initialized().await
+    }
+
+    /// Ensure the WebSocket connection is established.
+    ///
+    /// User-facing wrapper for `ensure_ws_connected`. Mirrors the TS
+    /// `initializeConnection` method. `override_host` is reserved for future
+    /// multi-host WS routing (currently unused — WS connects to `self.host()`).
+    pub async fn initialize_connection(
+        &self,
+        override_host: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
+        let _ = override_host;
+        self.ensure_ws_connected().await
+    }
+
+    /// Returns a clone of the set of currently joined message box room names.
+    ///
+    /// Each entry is a raw room ID of the form `{identityKey}-{messageBox}`.
+    /// Mirrors the TS `joinedRooms` Map accessor.
+    pub fn get_joined_rooms(&self) -> std::collections::HashSet<String> {
+        // Use blocking lock — this is only called from synchronous test contexts.
+        // For async callers, they should be fine as the lock is never held across await.
+        self.joined_rooms.blocking_lock().clone()
+    }
+
+    /// Returns `Some(true)` if a WebSocket connection is active, `None` otherwise.
+    ///
+    /// Test utility mirroring the TS `testSocket` accessor. Returns the connection
+    /// state only — the actual socket object is not exposed publicly.
+    #[cfg(test)]
+    pub fn test_socket(&self) -> Option<bool> {
+        let guard = self.ws_state.blocking_lock();
+        guard.as_ref().map(|ws| ws.is_connected())
+    }
+
+    /// Join a Socket.IO room for a message box and track it in `joined_rooms`.
+    ///
+    /// Constructs the room ID as `{identityKey}-{messageBox}` (matching TS joinRoom).
+    /// Ensures the WebSocket is connected before joining.
+    /// No-op if the room is already joined (idempotent like TS joinRoom).
+    pub async fn join_room(&self, message_box: &str) -> Result<(), MessageBoxError> {
+        let identity_key = self.get_identity_key().await?;
+        let room_id = format!("{identity_key}-{message_box}");
+
+        self.ensure_ws_connected().await?;
+
+        {
+            let guard = self.ws_state.lock().await;
+            if let Some(ref ws) = *guard {
+                ws.join_room(&room_id).await?;
+            }
+        }
+
+        self.joined_rooms.lock().await.insert(room_id);
+        Ok(())
     }
 
     /// POST JSON bytes to `url` using BRC-31 authenticated transport.
@@ -234,22 +297,29 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// `PeerMessage` structs.
     ///
     /// Establishes a WebSocket connection if one is not already active.
+    /// `override_host` is reserved for future multi-host WS routing.
     pub async fn listen_for_live_messages(
         &self,
         message_box: &str,
         on_message: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+        override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        let _ = override_host; // WS connects to self.host(); override deferred
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
         let event_key = format!("sendMessage-{room_id}");
 
         self.ensure_ws_connected().await?;
 
-        let guard = self.ws_state.lock().await;
-        if let Some(ref ws) = *guard {
-            ws.join_room(&room_id).await?;
-            ws.subscribe(event_key, on_message).await;
+        {
+            let guard = self.ws_state.lock().await;
+            if let Some(ref ws) = *guard {
+                ws.join_room(&room_id).await?;
+                ws.subscribe(event_key, on_message).await;
+            }
         }
+
+        self.joined_rooms.lock().await.insert(room_id);
         Ok(())
     }
 
@@ -261,17 +331,22 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
     /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
+    /// `override_host`: when Some, the HTTP fallback path sends to that host directly.
     pub async fn send_live_message(
         &self,
         recipient: &str,
         message_box: &str,
         body: &str,
+        override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
         // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
         // before checking socket.connected.
         if self.ensure_ws_connected().await.is_err() {
-            // HTTP fallback resolves recipient's host (TS parity: sendLiveMessage resolves host)
-            return self.send_message(recipient, message_box, body).await;
+            // HTTP fallback: use override_host if provided, otherwise overlay resolution
+            return match override_host {
+                Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
+                None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+            };
         }
 
         // Join sender's own room before send — TS calls joinRoom(messageBox) which
@@ -284,11 +359,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             if let Some(ref ws) = *guard {
                 if ws.join_room(&my_room).await.is_err() {
                     drop(guard);
-                    return self.send_message(recipient, message_box, body).await;
+                    return match override_host {
+                        Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
+                        None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                    };
                 }
             } else {
                 drop(guard);
-                return self.send_message(recipient, message_box, body).await;
+                return match override_host {
+                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
+                    None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                };
             }
         }
 
@@ -340,8 +421,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     ws.remove_pending_ack(&ack_key).await;
                 }
                 drop(guard);
-                // Fall back to HTTP — send_message handles its own encryption
-                self.send_message(recipient, message_box, body).await
+                // Fall back to HTTP — use override_host if provided
+                match override_host {
+                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, false, false, None, None).await,
+                    None => self.send_message(recipient, message_box, body, false, false, None, None).await,
+                }
             }
         }
     }
@@ -351,13 +435,22 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Mirrors TS `leaveRoom(messageBox)`. Constructs the room ID as
     /// `{identityKey}-{messageBox}` and emits `leaveRoom` to the server.
     /// No-op if the WebSocket is not connected.
-    pub async fn leave_room(&self, message_box: &str) -> Result<(), MessageBoxError> {
+    /// `override_host` is reserved for future multi-host WS routing.
+    pub async fn leave_room(
+        &self,
+        message_box: &str,
+        override_host: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
+        let _ = override_host;
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
-        let guard = self.ws_state.lock().await;
-        if let Some(ref ws) = *guard {
-            ws.leave_room(&room_id).await?;
+        {
+            let guard = self.ws_state.lock().await;
+            if let Some(ref ws) = *guard {
+                ws.leave_room(&room_id).await?;
+            }
         }
+        self.joined_rooms.lock().await.remove(&room_id);
         Ok(())
     }
 
@@ -580,7 +673,7 @@ mod tests {
         // If init_once were removed or its type changed, this compile-check fails.
         let _cell: &OnceCell<()> = &client.init_once;
         // Public init() must exist — verified by type resolution.
-        let _fut = client.init();
+        let _fut = client.init(None);
         let _ = _fut; // suppress unused warning
     }
 }

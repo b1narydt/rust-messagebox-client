@@ -9,7 +9,7 @@ use futures_util::future::join_all;
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
 use crate::client::check_status_error;
-use crate::types::{AcknowledgeMessageParams, ListMessagesParams, ListMessagesResponse, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
+use crate::types::{AcknowledgeMessageParams, FailedRecipient, ListMessagesParams, ListMessagesResponse, MessagePayment, MessagePaymentOutput, SendListParams, SendListResult, SentRecipient, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
 
 /// Deduplicate messages from multiple hosts by `message_id`.
@@ -58,11 +58,13 @@ pub(crate) struct ServerPaymentOutput {
 }
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
-    /// Send an encrypted message to a recipient's inbox.
+    /// Send a message to a recipient's inbox.
     ///
     /// CRITICAL TS PARITY: resolves the recipient's MessageBox host via overlay
     /// (`resolveHostForRecipient`) before sending — matching TS line 952:
     /// `const finalHost = overrideHost ?? await this.resolveHostForRecipient(message.recipient)`
+    ///
+    /// When `override_host` is Some, it is used directly without overlay resolution.
     ///
     /// 1. Asserts the client is initialized.
     /// 2. Resolves recipient's host via overlay (falls back to self.host if unreachable).
@@ -72,56 +74,104 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         recipient: &str,
         message_box: &str,
         body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
+        override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
         self.assert_initialized().await?;
-        let host = self.resolve_host_for_recipient(recipient).await?;
-        self.send_message_to_host(&host, recipient, message_box, body).await
+        let host = match override_host {
+            Some(h) => h.to_string(),
+            None => self.resolve_host_for_recipient(recipient).await?,
+        };
+        self.send_message_to_host(
+            &host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+            None,
+        )
+        .await
     }
 
-    /// Send an encrypted message to a recipient's inbox at an explicit host.
+    /// Send a message to a recipient's inbox at an explicit host.
     ///
     /// Lower-level helper used by `send_message` (after host resolution) and by
     /// `RemittanceAdapter` when `host_override` is provided.
     ///
-    /// 1. Encrypts `body` for `recipient` using BRC-78.
-    /// 2. Generates a deterministic HMAC message ID.
-    /// 3. POSTs `{"message": {recipient, messageBox, body, messageId}}` to `{host}/sendMessage`.
-    /// 4. Returns the HMAC-derived message ID (or server ID if present).
+    /// Parameters:
+    /// - `skip_encryption`: when true, sends body as-is without BRC-78 encryption.
+    /// - `check_permissions`: when true, fetches a fee quote and creates a payment if needed.
+    /// - `message_id`: when Some, uses caller-supplied ID instead of HMAC-derived ID.
+    /// - `payment`: pre-created payment (used by batch sends to avoid re-creating the tx).
+    ///
+    /// Returns the HMAC-derived message ID (or server ID if present).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_message_to_host(
         &self,
         host: &str,
         recipient: &str,
         message_box: &str,
         body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
+        payment: Option<MessagePayment>,
     ) -> Result<String, MessageBoxError> {
-        // Encrypt the body for the recipient
-        let encrypted_body = encryption::encrypt_body(
-            self.wallet(),
-            body,
-            recipient,
-            self.originator(),
-        )
-        .await?;
+        // Encrypt body (or use as-is when skipEncryption is true).
+        let wire_body = if skip_encryption {
+            body.to_string()
+        } else {
+            encryption::encrypt_body(
+                self.wallet(),
+                body,
+                recipient,
+                self.originator(),
+            )
+            .await?
+        };
 
-        // Generate deterministic HMAC message ID
+        // Resolve or generate message ID.
         // NOTE: generate_message_id internally calls serde_json::to_string(body) to replicate
         // TS JSON.stringify(message.body) behavior for exact parity (line 917 in MessageBoxClient.ts)
-        let message_id = encryption::generate_message_id(
-            self.wallet(),
-            body,
-            recipient,
-            self.originator(),
-        )
-        .await?;
+        let resolved_message_id = if let Some(id) = message_id {
+            id.to_string()
+        } else {
+            encryption::generate_message_id(
+                self.wallet(),
+                body,
+                recipient,
+                self.originator(),
+            )
+            .await?
+        };
 
-        // Build request wire format: {"message": {...}}
+        // When check_permissions is true and no payment was supplied, obtain a fee quote
+        // and create a message payment if any fees are required.
+        let payment = if check_permissions && payment.is_none() {
+            let quote = self.get_message_box_quote(recipient, message_box, None).await?;
+            if quote.delivery_fee > 0 || quote.recipient_fee > 0 {
+                let p = self.create_message_payment(recipient, &quote, None).await?;
+                Some(p)
+            } else {
+                None
+            }
+        } else {
+            payment
+        };
+
+        // Build request wire format: {"message": {...}, "payment": ...}
         let request = SendMessageRequest {
             message: SendMessageParams {
                 recipient: recipient.to_string(),
                 message_box: message_box.to_string(),
-                body: encrypted_body,
-                message_id: message_id.clone(),
+                body: wire_body,
+                message_id: resolved_message_id.clone(),
             },
+            payment,
         };
 
         let body_bytes = serde_json::to_vec(&request)?;
@@ -135,7 +185,492 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 return Ok(server_id);
             }
         }
-        Ok(message_id)
+        Ok(resolved_message_id)
+    }
+
+    /// Create a message delivery payment for a single recipient.
+    ///
+    /// Called by `send_message_to_host` when `check_permissions` is true and fees are required.
+    /// Uses protocol `[1, "messagebox"]` / keyID `"1"` — NOT the PeerPay protocol.
+    async fn create_message_payment(
+        &self,
+        recipient: &str,
+        quote: &crate::types::MessageBoxQuote,
+        description: Option<&str>,
+    ) -> Result<MessagePayment, MessageBoxError> {
+        use bsv::auth::utils::create_nonce;
+        use bsv::wallet::interfaces::{
+            CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
+        };
+        use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
+        use bsv::primitives::public_key::PublicKey;
+        use bsv::primitives::utils::from_hex;
+        use bsv::script::templates::{P2PKH, ScriptTemplateLock};
+
+        let desc = description.unwrap_or("MessageBox delivery fee");
+
+        // One output to the delivery agent for the delivery fee.
+        let prefix_delivery = create_nonce(self.wallet())
+            .await
+            .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+        let suffix_delivery = create_nonce(self.wallet())
+            .await
+            .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+
+        let agent_pk = PublicKey::from_string(&quote.delivery_agent_identity_key)
+            .map_err(|e| MessageBoxError::Wallet(format!("agent key: {e}")))?;
+
+        let delivery_key = self
+            .wallet()
+            .get_public_key(
+                GetPublicKeyArgs {
+                    identity_key: false,
+                    protocol_id: Some(Protocol {
+                        security_level: 1,
+                        protocol: "messagebox".to_string(),
+                    }),
+                    key_id: Some(format!("{prefix_delivery} {suffix_delivery}")),
+                    counterparty: Some(Counterparty {
+                        counterparty_type: CounterpartyType::Other,
+                        public_key: Some(agent_pk),
+                    }),
+                    privileged: false,
+                    privileged_reason: None,
+                    for_self: None,
+                    seek_permission: None,
+                },
+                self.originator(),
+            )
+            .await
+            .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+        let hash_vec = delivery_key.public_key.to_hash();
+        let mut hash = [0u8; 20];
+        hash.copy_from_slice(&hash_vec);
+        let lock_delivery = P2PKH::from_public_key_hash(hash)
+            .lock()
+            .map_err(|e| MessageBoxError::Wallet(format!("P2PKH lock: {e}")))?;
+        let lock_delivery_bytes = from_hex(&lock_delivery.to_hex())
+            .map_err(|e| MessageBoxError::Wallet(format!("hex decode: {e}")))?;
+
+        let mut outputs = vec![CreateActionOutput {
+            locking_script: Some(lock_delivery_bytes),
+            satoshis: quote.delivery_fee as u64,
+            output_description: "Delivery fee".to_string(),
+            basket: None,
+            custom_instructions: None,
+            tags: vec![],
+        }];
+
+        // Optional recipient fee output.
+        let (prefix_recipient, suffix_recipient) = if quote.recipient_fee > 0 {
+            let pfx = create_nonce(self.wallet())
+                .await
+                .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+            let sfx = create_nonce(self.wallet())
+                .await
+                .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+
+            let recipient_pk = PublicKey::from_string(recipient)
+                .map_err(|e| MessageBoxError::Wallet(format!("recipient key: {e}")))?;
+
+            let recv_key = self
+                .wallet()
+                .get_public_key(
+                    GetPublicKeyArgs {
+                        identity_key: false,
+                        protocol_id: Some(Protocol {
+                            security_level: 1,
+                            protocol: "messagebox".to_string(),
+                        }),
+                        key_id: Some(format!("{pfx} {sfx}")),
+                        counterparty: Some(Counterparty {
+                            counterparty_type: CounterpartyType::Other,
+                            public_key: Some(recipient_pk),
+                        }),
+                        privileged: false,
+                        privileged_reason: None,
+                        for_self: None,
+                        seek_permission: None,
+                    },
+                    self.originator(),
+                )
+                .await
+                .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+            let hash_vec2 = recv_key.public_key.to_hash();
+            let mut hash2 = [0u8; 20];
+            hash2.copy_from_slice(&hash_vec2);
+            let lock_recv = P2PKH::from_public_key_hash(hash2)
+                .lock()
+                .map_err(|e| MessageBoxError::Wallet(format!("P2PKH lock: {e}")))?;
+            let lock_recv_bytes = from_hex(&lock_recv.to_hex())
+                .map_err(|e| MessageBoxError::Wallet(format!("hex decode: {e}")))?;
+
+            outputs.push(CreateActionOutput {
+                locking_script: Some(lock_recv_bytes),
+                satoshis: quote.recipient_fee as u64,
+                output_description: "Recipient fee".to_string(),
+                basket: None,
+                custom_instructions: None,
+                tags: vec![],
+            });
+
+            (pfx, sfx)
+        } else {
+            (String::new(), String::new())
+        };
+
+        let create_result = self
+            .wallet()
+            .create_action(
+                CreateActionArgs {
+                    description: desc.to_string(),
+                    input_beef: None,
+                    inputs: vec![],
+                    outputs,
+                    lock_time: None,
+                    version: None,
+                    labels: vec!["messagebox".to_string()],
+                    options: Some(CreateActionOptions {
+                        randomize_outputs: BooleanDefaultTrue(Some(false)),
+                        ..Default::default()
+                    }),
+                    reference: None,
+                },
+                self.originator(),
+            )
+            .await
+            .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+        let tx = create_result
+            .tx
+            .ok_or_else(|| MessageBoxError::Wallet("create_action returned no tx".to_string()))?;
+
+        let mut payment_outputs = vec![MessagePaymentOutput {
+            output_index: 0,
+            derivation_prefix: prefix_delivery.as_bytes().to_vec(),
+            derivation_suffix: suffix_delivery.as_bytes().to_vec(),
+            sender_identity_key: quote.delivery_agent_identity_key.clone(),
+        }];
+
+        if quote.recipient_fee > 0 {
+            payment_outputs.push(MessagePaymentOutput {
+                output_index: 1,
+                derivation_prefix: prefix_recipient.as_bytes().to_vec(),
+                derivation_suffix: suffix_recipient.as_bytes().to_vec(),
+                sender_identity_key: recipient.to_string(),
+            });
+        }
+
+        Ok(MessagePayment {
+            tx,
+            outputs: payment_outputs,
+        })
+    }
+
+
+    /// Send a message to a list of recipients in a single batch operation.
+    ///
+    /// Matches the TS `sendMesagetoRecepients` behavior (note the TS typo — Rust uses corrected name):
+    /// 1. Gets multi-recipient quote; blocked recipients are separated out.
+    /// 2. Creates a single batch payment transaction covering all payable recipients.
+    /// 3. Loops individual `send_message_to_host` calls sharing the batch payment.
+    pub async fn send_message_to_recipients(
+        &self,
+        params: &SendListParams,
+        override_host: Option<&str>,
+    ) -> Result<SendListResult, MessageBoxError> {
+        self.assert_initialized().await?;
+
+        let skip_enc = params.skip_encryption.unwrap_or(false);
+
+        let recipient_refs: Vec<&str> = params.recipients.iter().map(|s| s.as_str()).collect();
+        let multi_quote = self
+            .get_message_box_quote_multi(&recipient_refs, &params.message_box, override_host)
+            .await?;
+
+        // Separate blocked from sendable based on recipient_fee == -1 (blocked status).
+        let blocked: Vec<String> = multi_quote.blocked_recipients.clone();
+        let sendable: Vec<&crate::types::RecipientQuote> = multi_quote
+            .quotes_by_recipient
+            .iter()
+            .filter(|rq| rq.status != "blocked")
+            .collect();
+
+        // Resolve host per-recipient (or use override).
+        let mut recipient_hosts: HashMap<String, String> = HashMap::new();
+        for rq in &sendable {
+            let host = if let Some(h) = override_host {
+                h.to_string()
+            } else {
+                self.resolve_host_for_recipient(&rq.recipient).await.unwrap_or_else(|_| self.host().to_string())
+            };
+            recipient_hosts.insert(rq.recipient.clone(), host);
+        }
+
+        // Create a single batch payment if any fees exist.
+        let needs_payment = sendable
+            .iter()
+            .any(|rq| rq.delivery_fee > 0 || rq.recipient_fee > 0);
+
+        let batch_payment = if needs_payment {
+            // Build the (recipient, host) tuples for batch payment creation.
+            let pairs_for_payment: Vec<(String, i64, i64, String)> = sendable
+                .iter()
+                .map(|rq| {
+                    let host = recipient_hosts.get(&rq.recipient).cloned().unwrap_or_else(|| self.host().to_string());
+                    let agent_key = multi_quote.delivery_agent_identity_key_by_host.get(&host).cloned().unwrap_or_default();
+                    (rq.recipient.clone(), rq.delivery_fee, rq.recipient_fee, agent_key)
+                })
+                .collect();
+
+            match self.create_message_payment_batch_from_tuples(&pairs_for_payment, None).await {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    // If batch payment creation fails, all sendable recipients fail.
+                    let failed_entries: Vec<FailedRecipient> = sendable
+                        .iter()
+                        .map(|rq| FailedRecipient {
+                            recipient: rq.recipient.clone(),
+                            error: e.to_string(),
+                        })
+                        .collect();
+                    return Ok(SendListResult {
+                        status: "error".to_string(),
+                        description: "Batch payment creation failed".to_string(),
+                        sent: vec![],
+                        blocked,
+                        failed: failed_entries,
+                        totals: None,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+
+        // Send to each recipient individually.
+        let mut sent: Vec<SentRecipient> = Vec::new();
+        let mut failed: Vec<FailedRecipient> = Vec::new();
+
+        for rq in &sendable {
+            let host = recipient_hosts
+                .get(&rq.recipient)
+                .cloned()
+                .unwrap_or_else(|| self.host().to_string());
+
+            match self
+                .send_message_to_host(
+                    &host,
+                    &rq.recipient,
+                    &params.message_box,
+                    &params.body,
+                    skip_enc,
+                    false, // payment already prepared
+                    None,
+                    batch_payment.clone(),
+                )
+                .await
+            {
+                Ok(msg_id) => sent.push(SentRecipient {
+                    recipient: rq.recipient.clone(),
+                    message_id: msg_id,
+                }),
+                Err(e) => failed.push(FailedRecipient {
+                    recipient: rq.recipient.clone(),
+                    error: e.to_string(),
+                }),
+            }
+        }
+
+        Ok(SendListResult {
+            status: "success".to_string(),
+            description: format!("Sent to {} recipients", sent.len()),
+            sent,
+            blocked,
+            failed,
+            totals: None,
+        })
+    }
+
+    /// Internal helper: create a batch payment from pre-resolved (recipient, delivery_fee, recipient_fee, agent_key) tuples.
+    async fn create_message_payment_batch_from_tuples(
+        &self,
+        tuples: &[(String, i64, i64, String)],
+        description: Option<&str>,
+    ) -> Result<MessagePayment, MessageBoxError> {
+        use bsv::auth::utils::create_nonce;
+        use bsv::wallet::interfaces::{
+            CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
+        };
+        use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
+        use bsv::primitives::public_key::PublicKey;
+        use bsv::primitives::utils::from_hex;
+        use bsv::script::templates::{P2PKH, ScriptTemplateLock};
+
+        let desc = description.unwrap_or("MessageBox batch delivery fee");
+        let mut outputs: Vec<CreateActionOutput> = Vec::new();
+        let mut payment_outputs: Vec<MessagePaymentOutput> = Vec::new();
+
+        for (recipient, delivery_fee, recipient_fee, agent_key) in tuples {
+            if *delivery_fee > 0 && !agent_key.is_empty() {
+                let prefix = create_nonce(self.wallet())
+                    .await
+                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+                let suffix = create_nonce(self.wallet())
+                    .await
+                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+
+                let agent_pk = PublicKey::from_string(agent_key)
+                    .map_err(|e| MessageBoxError::Wallet(format!("agent key: {e}")))?;
+
+                let key = self
+                    .wallet()
+                    .get_public_key(
+                        GetPublicKeyArgs {
+                            identity_key: false,
+                            protocol_id: Some(Protocol {
+                                security_level: 1,
+                                protocol: "messagebox".to_string(),
+                            }),
+                            key_id: Some(format!("{prefix} {suffix}")),
+                            counterparty: Some(Counterparty {
+                                counterparty_type: CounterpartyType::Other,
+                                public_key: Some(agent_pk),
+                            }),
+                            privileged: false,
+                            privileged_reason: None,
+                            for_self: None,
+                            seek_permission: None,
+                        },
+                        self.originator(),
+                    )
+                    .await
+                    .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+                let hash_vec = key.public_key.to_hash();
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(&hash_vec);
+                let lock = P2PKH::from_public_key_hash(hash)
+                    .lock()
+                    .map_err(|e| MessageBoxError::Wallet(format!("P2PKH lock: {e}")))?;
+                let lock_bytes = from_hex(&lock.to_hex())
+                    .map_err(|e| MessageBoxError::Wallet(format!("hex decode: {e}")))?;
+
+                let output_index = outputs.len() as u32;
+                outputs.push(CreateActionOutput {
+                    locking_script: Some(lock_bytes),
+                    satoshis: *delivery_fee as u64,
+                    output_description: format!("Delivery fee for {}", recipient),
+                    basket: None,
+                    custom_instructions: None,
+                    tags: vec![],
+                });
+                payment_outputs.push(MessagePaymentOutput {
+                    output_index,
+                    derivation_prefix: prefix.as_bytes().to_vec(),
+                    derivation_suffix: suffix.as_bytes().to_vec(),
+                    sender_identity_key: agent_key.clone(),
+                });
+            }
+
+            if *recipient_fee > 0 {
+                let prefix = create_nonce(self.wallet())
+                    .await
+                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+                let suffix = create_nonce(self.wallet())
+                    .await
+                    .map_err(|e| MessageBoxError::Auth(format!("create_nonce: {e}")))?;
+
+                let recipient_pk = PublicKey::from_string(recipient)
+                    .map_err(|e| MessageBoxError::Wallet(format!("recipient key: {e}")))?;
+
+                let key = self
+                    .wallet()
+                    .get_public_key(
+                        GetPublicKeyArgs {
+                            identity_key: false,
+                            protocol_id: Some(Protocol {
+                                security_level: 1,
+                                protocol: "messagebox".to_string(),
+                            }),
+                            key_id: Some(format!("{prefix} {suffix}")),
+                            counterparty: Some(Counterparty {
+                                counterparty_type: CounterpartyType::Other,
+                                public_key: Some(recipient_pk),
+                            }),
+                            privileged: false,
+                            privileged_reason: None,
+                            for_self: None,
+                            seek_permission: None,
+                        },
+                        self.originator(),
+                    )
+                    .await
+                    .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+                let hash_vec = key.public_key.to_hash();
+                let mut hash = [0u8; 20];
+                hash.copy_from_slice(&hash_vec);
+                let lock = P2PKH::from_public_key_hash(hash)
+                    .lock()
+                    .map_err(|e| MessageBoxError::Wallet(format!("P2PKH lock: {e}")))?;
+                let lock_bytes = from_hex(&lock.to_hex())
+                    .map_err(|e| MessageBoxError::Wallet(format!("hex decode: {e}")))?;
+
+                let output_index = outputs.len() as u32;
+                outputs.push(CreateActionOutput {
+                    locking_script: Some(lock_bytes),
+                    satoshis: *recipient_fee as u64,
+                    output_description: format!("Recipient fee for {}", recipient),
+                    basket: None,
+                    custom_instructions: None,
+                    tags: vec![],
+                });
+                payment_outputs.push(MessagePaymentOutput {
+                    output_index,
+                    derivation_prefix: prefix.as_bytes().to_vec(),
+                    derivation_suffix: suffix.as_bytes().to_vec(),
+                    sender_identity_key: recipient.clone(),
+                });
+            }
+        }
+
+        if outputs.is_empty() {
+            return Ok(MessagePayment { tx: vec![], outputs: vec![] });
+        }
+
+        let create_result = self
+            .wallet()
+            .create_action(
+                CreateActionArgs {
+                    description: desc.to_string(),
+                    input_beef: None,
+                    inputs: vec![],
+                    outputs,
+                    lock_time: None,
+                    version: None,
+                    labels: vec!["messagebox".to_string()],
+                    options: Some(CreateActionOptions {
+                        randomize_outputs: BooleanDefaultTrue(Some(false)),
+                        ..Default::default()
+                    }),
+                    reference: None,
+                },
+                self.originator(),
+            )
+            .await
+            .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+        let tx = create_result
+            .tx
+            .ok_or_else(|| MessageBoxError::Wallet("create_action returned no tx".to_string()))?;
+
+        Ok(MessagePayment {
+            tx,
+            outputs: payment_outputs,
+        })
     }
 
     /// Retrieve messages from an inbox without payment internalization.
@@ -336,19 +871,60 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Mark messages as acknowledged (read) by their IDs.
     ///
-    /// POSTs `{"messageIds": [...]}` to `/acknowledgeMessage`.
+    /// TS PARITY: When `override_host` is None, fans out to ALL advertised hosts in parallel
+    /// (same `join_all` pattern as `list_messages`). Returns Ok if ANY host succeeds.
+    /// When `override_host` is Some, acks on that single host only.
     pub async fn acknowledge_message(
         &self,
         message_ids: Vec<String>,
+        override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
         self.assert_initialized().await?;
 
-        let params = AcknowledgeMessageParams { message_ids };
+        if let Some(host) = override_host {
+            return self.acknowledge_message_on_host(host, &message_ids).await;
+        }
+
+        // Multi-host fan-out: ack on all known hosts concurrently.
+        let identity_key = self.get_identity_key().await?;
+        let ads = self.query_advertisements(Some(&identity_key), None).await.unwrap_or_default();
+
+        let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
+        host_set.insert(self.host().to_string());
+
+        if host_set.len() == 1 {
+            return self.acknowledge_message_on_host(self.host(), &message_ids).await;
+        }
+
+        // Fan out in parallel — return Ok if at least one succeeds.
+        let futures: Vec<_> = host_set
+            .iter()
+            .map(|h| self.acknowledge_message_on_host(h, &message_ids))
+            .collect();
+
+        let outcomes = join_all(futures).await;
+        let any_ok = outcomes.iter().any(|r| r.is_ok());
+
+        if any_ok {
+            Ok(())
+        } else {
+            Err(MessageBoxError::Http(0, format!("acknowledge_message: all {} hosts failed", host_set.len())))
+        }
+    }
+
+    /// Acknowledge messages on a single explicit host.
+    async fn acknowledge_message_on_host(
+        &self,
+        host: &str,
+        message_ids: &[String],
+    ) -> Result<(), MessageBoxError> {
+        let params = AcknowledgeMessageParams {
+            message_ids: message_ids.to_vec(),
+        };
         let body_bytes = serde_json::to_vec(&params)?;
-        let url = format!("{}/acknowledgeMessage", self.host());
+        let url = format!("{host}/acknowledgeMessage");
         let response = self.post_json(&url, body_bytes).await?;
         check_status_error(&response.body)?;
-
         Ok(())
     }
 }
@@ -426,6 +1002,7 @@ mod tests {
                 body: r#"{"encryptedMessage":"abc=="}"#.to_string(),
                 message_id: "deadbeef01234567".to_string(),
             },
+            payment: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         // Must be wrapped as {"message": {...}}

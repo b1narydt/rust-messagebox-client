@@ -44,11 +44,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn set_message_box_permission(
         &self,
         params: SetPermissionParams,
+        override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
         self.assert_initialized().await?;
 
+        let base = override_host.unwrap_or_else(|| self.host());
         let body_bytes = serde_json::to_vec(&params)?;
-        let url = format!("{}/permissions/set", self.host());
+        let url = format!("{base}/permissions/set");
         let response = self.post_json(&url, body_bytes).await?;
         check_status_error(&response.body)?;
 
@@ -65,13 +67,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         recipient: &str,
         message_box: &str,
         sender: Option<&str>,
+        override_host: Option<&str>,
     ) -> Result<Option<MessageBoxPermission>, MessageBoxError> {
         self.assert_initialized().await?;
 
+        let base = override_host.unwrap_or_else(|| self.host());
         // NOTE: query param key is camelCase `messageBox` — not snake_case.
         let mut url = format!(
-            "{}/permissions/get?recipient={}&messageBox={}",
-            self.host(),
+            "{base}/permissions/get?recipient={}&messageBox={}",
             recipient,
             message_box
         );
@@ -96,10 +99,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_box: Option<&str>,
         limit: Option<u32>,
         offset: Option<u32>,
+        override_host: Option<&str>,
     ) -> Result<Vec<MessageBoxPermission>, MessageBoxError> {
         self.assert_initialized().await?;
 
-        let mut url = format!("{}/permissions/list", self.host());
+        let base = override_host.unwrap_or_else(|| self.host());
+        let mut url = format!("{base}/permissions/list");
         let mut params: Vec<String> = Vec::new();
 
         // CRITICAL: key is snake_case `message_box` — NOT `messageBox`.
@@ -134,13 +139,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         recipient: &str,
         message_box: &str,
+        override_host: Option<&str>,
     ) -> Result<MessageBoxQuote, MessageBoxError> {
         self.assert_initialized().await?;
 
+        let base = override_host.unwrap_or_else(|| self.host());
         // NOTE: query param key is camelCase `messageBox` here.
         let url = format!(
-            "{}/permissions/quote?recipient={}&messageBox={}",
-            self.host(),
+            "{base}/permissions/quote?recipient={}&messageBox={}",
             recipient,
             message_box
         );
@@ -177,12 +183,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         sender: &str,
         recipient_fee: i64,
+        override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        self.set_message_box_permission(SetPermissionParams {
-            message_box: "notifications".to_string(),
-            sender: Some(sender.to_string()),
-            recipient_fee,
-        })
+        self.set_message_box_permission(
+            SetPermissionParams {
+                message_box: "notifications".to_string(),
+                sender: Some(sender.to_string()),
+                recipient_fee,
+            },
+            override_host,
+        )
         .await
     }
 
@@ -191,12 +201,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn deny_notifications_from_peer(
         &self,
         sender: &str,
+        override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        self.set_message_box_permission(SetPermissionParams {
-            message_box: "notifications".to_string(),
-            sender: Some(sender.to_string()),
-            recipient_fee: -1,
-        })
+        self.set_message_box_permission(
+            SetPermissionParams {
+                message_box: "notifications".to_string(),
+                sender: Some(sender.to_string()),
+                recipient_fee: -1,
+            },
+            override_host,
+        )
         .await
     }
 
@@ -208,17 +222,19 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn check_peer_notification_status(
         &self,
         peer: &str,
+        override_host: Option<&str>,
     ) -> Result<Option<MessageBoxPermission>, MessageBoxError> {
         let recipient = self.get_identity_key().await?;
-        self.get_message_box_permission(&recipient, "notifications", Some(peer))
+        self.get_message_box_permission(&recipient, "notifications", Some(peer), override_host)
             .await
     }
 
     /// List all permission records in the `"notifications"` message box.
     pub async fn list_peer_notifications(
         &self,
+        override_host: Option<&str>,
     ) -> Result<Vec<MessageBoxPermission>, MessageBoxError> {
-        self.list_message_box_permissions(Some("notifications"), None, None)
+        self.list_message_box_permissions(Some("notifications"), None, None, override_host)
             .await
     }
 
@@ -231,8 +247,144 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         recipient: &str,
         body: &str,
+        override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
-        self.send_message(recipient, "notifications", body).await
+        match override_host {
+            Some(host) => self.send_message_to_host(host, recipient, "notifications", body, false, false, None, None).await,
+            None => self.send_message(recipient, "notifications", body, false, false, None, None).await,
+        }
+    }
+
+    /// Get delivery quotes for multiple recipients in one logical call.
+    ///
+    /// Groups recipients by resolved host, requests quotes from each host,
+    /// then aggregates into a `MessageBoxMultiQuote` with per-recipient breakdown
+    /// and delivery agent identity keys per host.
+    pub async fn get_message_box_quote_multi(
+        &self,
+        recipients: &[&str],
+        message_box: &str,
+        override_host: Option<&str>,
+    ) -> Result<crate::types::MessageBoxMultiQuote, MessageBoxError> {
+        use std::collections::HashMap;
+        use crate::types::{MessageBoxMultiQuote, RecipientQuote};
+
+        let mut quotes_by_recipient: Vec<RecipientQuote> = Vec::new();
+        let mut blocked_recipients: Vec<String> = Vec::new();
+        let mut delivery_agent_identity_key_by_host: HashMap<String, String> = HashMap::new();
+        let mut total_delivery_fee: i64 = 0;
+        let mut total_recipient_fee: i64 = 0;
+
+        for recipient in recipients {
+            // Resolve host per recipient (or use override).
+            let host = if let Some(h) = override_host {
+                h.to_string()
+            } else {
+                self.resolve_host_for_recipient(recipient).await.unwrap_or_else(|_| self.host().to_string())
+            };
+
+            // Build the quote URL — multiple recipient query params per host would be ideal
+            // but the TS client issues one request per recipient; we match that behavior.
+            let url = format!(
+                "{host}/permissions/quote?recipient={}&messageBox={}",
+                recipient,
+                message_box
+            );
+
+            let response = match self.get_json(&url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    // If the quote fails, mark as failed (treat as blocked for safety).
+                    blocked_recipients.push(recipient.to_string());
+                    quotes_by_recipient.push(RecipientQuote {
+                        recipient: recipient.to_string(),
+                        message_box: message_box.to_string(),
+                        delivery_fee: 0,
+                        recipient_fee: 0,
+                        status: format!("error: {e}"),
+                    });
+                    continue;
+                }
+            };
+
+            // Extract delivery agent key from header — record per host.
+            if let Some(key) = response.headers.get("x-bsv-auth-identity-key") {
+                delivery_agent_identity_key_by_host.insert(host.clone(), key.clone());
+            }
+
+            let parsed = match serde_json::from_slice::<QuoteResponse>(&response.body) {
+                Ok(p) => p,
+                Err(_) => {
+                    blocked_recipients.push(recipient.to_string());
+                    quotes_by_recipient.push(RecipientQuote {
+                        recipient: recipient.to_string(),
+                        message_box: message_box.to_string(),
+                        delivery_fee: 0,
+                        recipient_fee: 0,
+                        status: "parse_error".to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            let delivery_fee = parsed.quote.delivery_fee;
+            let recipient_fee = parsed.quote.recipient_fee;
+            let status = if recipient_fee < 0 {
+                "blocked".to_string()
+            } else if recipient_fee == 0 && delivery_fee == 0 {
+                "always_allow".to_string()
+            } else {
+                "payment_required".to_string()
+            };
+
+            if recipient_fee < 0 {
+                blocked_recipients.push(recipient.to_string());
+            } else {
+                total_delivery_fee += delivery_fee;
+                total_recipient_fee += recipient_fee;
+            }
+
+            quotes_by_recipient.push(RecipientQuote {
+                recipient: recipient.to_string(),
+                message_box: message_box.to_string(),
+                delivery_fee,
+                recipient_fee,
+                status,
+            });
+        }
+
+        Ok(MessageBoxMultiQuote {
+            quotes_by_recipient,
+            totals: Some(crate::types::SendListTotals {
+                delivery_fees: total_delivery_fee,
+                recipient_fees: total_recipient_fee,
+                total_for_payable_recipients: total_delivery_fee + total_recipient_fee,
+            }),
+            blocked_recipients,
+            delivery_agent_identity_key_by_host,
+        })
+    }
+
+    /// Send a notification to multiple recipients at once.
+    ///
+    /// Delegates to `send_message_to_recipients` with `message_box = "notifications"`.
+    /// Matches the TS `sendNotification` overload that accepts `PubKeyHex[]`.
+    pub async fn send_notification_to_recipients(
+        &self,
+        recipients: &[&str],
+        body: &str,
+        override_host: Option<&str>,
+    ) -> Result<crate::types::SendListResult, MessageBoxError> {
+        use crate::types::SendListParams;
+
+        let params = SendListParams {
+            recipients: recipients.iter().map(|s| s.to_string()).collect(),
+            message_box: "notifications".to_string(),
+            body: body.to_string(),
+            skip_encryption: Some(false),
+        };
+
+        self.send_message_to_recipients(&params, override_host).await
     }
 }
 

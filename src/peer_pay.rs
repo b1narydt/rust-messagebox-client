@@ -143,7 +143,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         let token = self.create_payment_token(recipient, amount).await?;
         let token_json = serde_json::to_string(&token)?;
-        self.send_message(recipient, "payment_inbox", &token_json).await
+        self.send_message(recipient, "payment_inbox", &token_json, false, false, None, None).await
     }
 
     /// Send a payment to `recipient` over WebSocket with HTTP fallback.
@@ -158,7 +158,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         let token = self.create_payment_token(recipient, amount).await?;
         let token_json = serde_json::to_string(&token)?;
-        self.send_live_message(recipient, "payment_inbox", &token_json).await
+        self.send_live_message(recipient, "payment_inbox", &token_json, None).await
     }
 
     /// Subscribe to live payment notifications on the payment_inbox.
@@ -183,7 +183,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             // Silently skip messages that aren't valid payment tokens
         });
 
-        self.listen_for_live_messages("payment_inbox", wrapper).await
+        self.listen_for_live_messages("payment_inbox", wrapper, None).await
     }
 
     /// Internalize a received payment and acknowledge the message.
@@ -225,7 +225,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
             .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
 
-        self.acknowledge_message(vec![payment.message_id.clone()]).await?;
+        self.acknowledge_message(vec![payment.message_id.clone()], None).await?;
         Ok(())
     }
 
@@ -237,7 +237,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn reject_payment(&self, payment: &IncomingPayment) -> Result<(), MessageBoxError> {
         if payment.token.amount < 2000 {
             // Amount too small to refund after fee — just acknowledge
-            return self.acknowledge_message(vec![payment.message_id.clone()]).await;
+            return self.acknowledge_message(vec![payment.message_id.clone()], None).await;
         }
 
         // Internalize + first ack
@@ -247,7 +247,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         self.send_payment(&payment.sender, payment.token.amount - 1000).await?;
 
         // Intentional double-ack — TS does this as a safety net; server is idempotent
-        self.acknowledge_message(vec![payment.message_id.clone()]).await?;
+        self.acknowledge_message(vec![payment.message_id.clone()], None).await?;
 
         Ok(())
     }
@@ -276,6 +276,35 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .collect();
 
         Ok(payments)
+    }
+
+    /// Acknowledge a notification message, internalizing any embedded payment.
+    ///
+    /// Composition method matching TS `acknowledgeNotification`:
+    /// 1. Tries to parse `message.body` as a `{ message, payment }` wrapper.
+    /// 2. If a valid PeerPay payment is embedded, calls `accept_payment` (internalizes + acks).
+    ///    Returns `true` to indicate a payment was processed.
+    /// 3. If no payment, calls `acknowledge_message` directly and returns `false`.
+    pub async fn acknowledge_notification(
+        &self,
+        message: &PeerMessage,
+    ) -> Result<bool, MessageBoxError> {
+        // Try to parse body as a wrapped envelope: { message: ..., payment: ... }
+        // The payment field here is a PeerPay PaymentToken embedded in the notification.
+        if let Ok(token) = serde_json::from_str::<PaymentToken>(&message.body) {
+            // Body is a PeerPay payment token — internalize it.
+            let incoming = IncomingPayment {
+                token,
+                sender: message.sender.clone(),
+                message_id: message.message_id.clone(),
+            };
+            self.accept_payment(&incoming).await?;
+            return Ok(true);
+        }
+
+        // No embedded payment — simple ack.
+        self.acknowledge_message(vec![message.message_id.clone()], None).await?;
+        Ok(false)
     }
 }
 

@@ -1,6 +1,79 @@
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
+// Phase 5 — overlay advertisement and device registration types
+// ---------------------------------------------------------------------------
+
+/// An advertisement token recovered from an overlay lookup.
+///
+/// Represents a single UTXO that encodes a MessageBox host advertisement via
+/// PushDrop: fields[0] = identity key bytes, fields[1] = host URL bytes.
+#[derive(Clone, Debug)]
+pub struct AdvertisementToken {
+    /// The host URL encoded in the advertisement.
+    pub host: String,
+    /// Transaction ID of the advertising UTXO.
+    pub txid: String,
+    /// Output index within the advertising transaction.
+    pub output_index: u32,
+    /// Hex-encoded locking script of the advertising output.
+    pub locking_script: String,
+    /// Raw BEEF bytes for the advertising transaction (needed for revocation).
+    pub beef: Vec<u8>,
+}
+
+/// Request body for registering an FCM device token.
+///
+/// Serializes to camelCase JSON for POST to `{host}/registerDevice`.
+/// Optional fields are omitted when None per TS wire format.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterDeviceRequest {
+    pub fcm_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+/// A registered device record as returned by the server's `/devices` endpoint.
+///
+/// All fields are `Option` because the server may omit any of them.
+/// Includes ALL known server fields to prevent deserialization failures
+/// against go-messagebox-server.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredDevice {
+    pub id: Option<i64>,
+    pub device_id: Option<String>,
+    pub platform: Option<String>,
+    pub fcm_token: String,
+    pub active: Option<bool>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub last_used: Option<String>,
+}
+
+/// Response from the `/registerDevice` endpoint.
+///
+/// TS returns `{ status, message, deviceId }`.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterDeviceResponse {
+    pub status: String,
+    pub message: Option<String>,
+    pub device_id: Option<i64>,
+}
+
+/// Response from the `/devices` (list registered devices) endpoint.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ListDevicesResponse {
+    pub status: String,
+    pub devices: Vec<RegisteredDevice>,
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2 — permission / quote types
 // ---------------------------------------------------------------------------
 
@@ -375,6 +448,60 @@ mod tests {
         assert_eq!(incoming.sender, "03sender");
         assert_eq!(incoming.message_id, "msg001");
         assert_eq!(incoming.token.amount, 2000);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 5 — overlay/device registration type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn register_device_request_camel_case() {
+        let req = RegisterDeviceRequest {
+            fcm_token: "tok123".to_string(),
+            device_id: Some("dev-abc".to_string()),
+            platform: Some("android".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"fcmToken\""), "fcmToken field name");
+        assert!(json.contains("\"deviceId\""), "deviceId field name");
+        assert!(json.contains("\"platform\""), "platform field name");
+        assert!(!json.contains("fcm_token"), "no snake_case leakage");
+        assert!(!json.contains("device_id"), "no snake_case leakage");
+    }
+
+    #[test]
+    fn register_device_request_omits_optional_fields_when_none() {
+        let req = RegisterDeviceRequest {
+            fcm_token: "tok456".to_string(),
+            device_id: None,
+            platform: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"fcmToken\""), "fcmToken present");
+        assert!(!json.contains("deviceId"), "deviceId absent when None");
+        assert!(!json.contains("platform"), "platform absent when None");
+    }
+
+    #[test]
+    fn registered_device_deserializes_camel_case() {
+        let raw = r#"{
+            "id": 42,
+            "deviceId": "dev-123",
+            "platform": "ios",
+            "fcmToken": "fcm-abc",
+            "active": true,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-02T00:00:00Z",
+            "lastUsed": "2024-01-03T00:00:00Z"
+        }"#;
+        let dev: RegisteredDevice = serde_json::from_str(raw).unwrap();
+        assert_eq!(dev.id, Some(42));
+        assert_eq!(dev.device_id.as_deref(), Some("dev-123"));
+        assert_eq!(dev.platform.as_deref(), Some("ios"));
+        assert_eq!(dev.fcm_token, "fcm-abc");
+        assert_eq!(dev.active, Some(true));
+        assert_eq!(dev.created_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(dev.last_used.as_deref(), Some("2024-01-03T00:00:00Z"));
     }
 
     // -----------------------------------------------------------------------

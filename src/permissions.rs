@@ -299,7 +299,7 @@ mod tests {
     }
 
     fn make_client(host: &str) -> MessageBoxClient<ArcWallet> {
-        MessageBoxClient::new(host.to_string(), ArcWallet::new(), None)
+        MessageBoxClient::new(host.to_string(), ArcWallet::new(), None, bsv::services::overlay_tools::Network::Mainnet)
     }
 
     // -----------------------------------------------------------------------

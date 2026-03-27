@@ -22,4 +22,6 @@ pub enum MessageBoxError {
     NotInitialized,
     #[error("websocket error: {0}")]
     WebSocket(String),
+    #[error("overlay error: {0}")]
+    Overlay(String),
 }

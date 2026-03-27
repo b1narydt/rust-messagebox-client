@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
 use bsv::remittance::types::PeerMessage;
+use bsv::services::overlay_tools::Network;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -29,6 +30,9 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Phase 5 will populate this — kept now to avoid a breaking struct change later.
     #[allow(dead_code)]
     init_once: OnceCell<()>,
+    /// Network preset for overlay tools (LookupResolver, TopicBroadcaster).
+    /// Defaults to Mainnet; pass Network::Local for localhost integration tests.
+    pub(crate) network: Network,
     /// WebSocket connection state (None until first live message call).
     ws_state: Mutex<Option<crate::websocket::MessageBoxWebSocket>>,
 }
@@ -40,7 +44,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///   trimmed so callers do not need to sanitize.
     /// * `wallet` — Any `WalletInterface` implementation.
     /// * `originator` — Optional originator string forwarded to wallet ops.
-    pub fn new(host: String, wallet: W, originator: Option<String>) -> Self {
+    /// * `network` — Network preset for overlay tools (use `Network::Local` for localhost).
+    pub fn new(host: String, wallet: W, originator: Option<String>, network: Network) -> Self {
         MessageBoxClient {
             host: host.trim().to_string(),
             auth_fetch: Mutex::new(AuthFetch::new(wallet.clone())),
@@ -48,8 +53,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             originator,
             identity_key: OnceCell::new(),
             init_once: OnceCell::new(),
+            network,
             ws_state: Mutex::new(None),
         }
+    }
+
+    /// Convenience constructor defaulting to `Network::Mainnet`.
+    pub fn new_mainnet(host: String, wallet: W, originator: Option<String>) -> Self {
+        Self::new(host, wallet, originator, Network::Mainnet)
     }
 
     // -----------------------------------------------------------------------
@@ -69,6 +80,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Return the originator string, if any.
     pub fn originator(&self) -> Option<&str> {
         self.originator.as_deref()
+    }
+
+    /// Return the network preset used for overlay operations.
+    pub fn network(&self) -> &Network {
+        &self.network
     }
 
     // -----------------------------------------------------------------------
@@ -210,24 +226,37 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
     ///
-    /// If no WebSocket connection is active, falls back immediately to HTTP.
-    /// On send or ack timeout/failure, falls back to HTTP.
-    /// HTTP fallback calls `send_message` which handles its own encryption.
+    /// Mirrors TS `sendLiveMessage`: auto-connects if needed, joins the sender's
+    /// own room (required for ack routing), then emits. Falls back to HTTP if the
+    /// connection cannot be established or the ack times out / fails.
     pub async fn send_live_message(
         &self,
         recipient: &str,
         message_box: &str,
         body: &str,
     ) -> Result<String, MessageBoxError> {
-        // Check WS availability without connecting — only use live path when already connected
-        let ws_available = {
-            let guard = self.ws_state.lock().await;
-            guard.as_ref().map(|ws| ws.is_connected()).unwrap_or(false)
-        };
-
-        if !ws_available {
-            // HTTP fallback — send_message handles its own encryption
+        // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
+        // before checking socket.connected.
+        if self.ensure_ws_connected().await.is_err() {
             return self.send_message(recipient, message_box, body).await;
+        }
+
+        // Join sender's own room before send — TS calls joinRoom(messageBox) which
+        // joins `${myIdentityKey}-${messageBox}`. Required so the server can route
+        // the sendMessageAck back to this socket.
+        let identity_key = self.get_identity_key().await?;
+        let my_room = format!("{identity_key}-{message_box}");
+        {
+            let guard = self.ws_state.lock().await;
+            if let Some(ref ws) = *guard {
+                if ws.join_room(&my_room).await.is_err() {
+                    drop(guard);
+                    return self.send_message(recipient, message_box, body).await;
+                }
+            } else {
+                drop(guard);
+                return self.send_message(recipient, message_box, body).await;
+            }
         }
 
         // Encrypt and generate message ID for the WebSocket path
@@ -282,6 +311,21 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 self.send_message(recipient, message_box, body).await
             }
         }
+    }
+
+    /// Leave a Socket.IO room and remove its subscription.
+    ///
+    /// Mirrors TS `leaveRoom(messageBox)`. Constructs the room ID as
+    /// `{identityKey}-{messageBox}` and emits `leaveRoom` to the server.
+    /// No-op if the WebSocket is not connected.
+    pub async fn leave_room(&self, message_box: &str) -> Result<(), MessageBoxError> {
+        let identity_key = self.get_identity_key().await?;
+        let room_id = format!("{identity_key}-{message_box}");
+        let guard = self.ws_state.lock().await;
+        if let Some(ref ws) = *guard {
+            ws.leave_room(&room_id).await?;
+        }
+        Ok(())
     }
 
     /// Disconnect the WebSocket connection and clear its state.
@@ -359,6 +403,7 @@ pub(crate) fn check_status_error(body: &[u8]) -> Result<(), MessageBoxError> {
 mod tests {
     use super::*;
     use bsv::primitives::private_key::PrivateKey;
+    use bsv::services::overlay_tools::Network;
     use bsv::wallet::error::WalletError;
     use bsv::wallet::interfaces::*;
     use bsv::wallet::proto_wallet::ProtoWallet;
@@ -420,6 +465,7 @@ mod tests {
             "https://example.com ".to_string(),
             wallet,
             None,
+            Network::Mainnet,
         );
         assert_eq!(client.host(), "https://example.com");
     }
@@ -432,6 +478,7 @@ mod tests {
             "https://example.com".to_string(),
             wallet,
             None,
+            Network::Mainnet,
         );
         let key = client.get_identity_key().await.expect("get_identity_key");
         assert!(!key.is_empty(), "identity key must be non-empty");
@@ -476,6 +523,7 @@ mod tests {
             "https://example.com".to_string(),
             wallet,
             None,
+            Network::Mainnet,
         );
         let key1 = client.get_identity_key().await.expect("first call");
         let key2 = client.get_identity_key().await.expect("second call");

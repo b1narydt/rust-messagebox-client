@@ -377,6 +377,7 @@ mod tests {
             "https://example.com".to_string(),
             sender,
             None,
+            bsv::services::overlay_tools::Network::Mainnet,
         );
 
         // create_payment_token will call create_nonce twice then get_public_key

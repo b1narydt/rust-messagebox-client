@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod client;
 pub mod encryption;
 pub mod error;
+pub mod host_resolution;
 pub mod http_ops;
 pub mod peer_pay;
 pub mod permissions;

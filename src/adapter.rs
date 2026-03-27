@@ -187,6 +187,7 @@ mod tests {
             "https://example.com".to_string(),
             ArcWallet::new(),
             None,
+            bsv::services::overlay_tools::Network::Mainnet,
         ))
     }
 

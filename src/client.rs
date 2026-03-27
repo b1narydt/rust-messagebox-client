@@ -151,6 +151,57 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         Ok(response)
     }
+
+    /// GET `url` using BRC-31 authenticated transport.
+    ///
+    /// Mirrors `post_json` but sends no body and no content-type header.
+    /// The caller is responsible for building the full URL including query string.
+    pub(crate) async fn get_json(
+        &self,
+        url: &str,
+    ) -> Result<AuthFetchResponse, MessageBoxError> {
+        let response = self
+            .auth_fetch
+            .lock()
+            .await
+            .fetch(url, "GET", None, None)
+            .await
+            .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
+
+        if response.status < 200 || response.status >= 300 {
+            return Err(MessageBoxError::Http(
+                response.status,
+                url.to_string(),
+            ));
+        }
+
+        Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone helpers used by permissions.rs
+// ---------------------------------------------------------------------------
+
+/// Check if a successful (2xx) HTTP response body contains a server-level
+/// error indicator (`{"status": "error", "description": "..."}`).
+///
+/// All four permission endpoints can return HTTP 200 with a logical error
+/// payload — this helper normalises that into `MessageBoxError::Auth`.
+pub(crate) fn check_status_error(body: &[u8]) -> Result<(), MessageBoxError> {
+    // Attempt a lightweight parse — ignore failures (malformed JSON is not
+    // a server error in this sense).
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if v.get("status").and_then(|s| s.as_str()) == Some("error") {
+            let description = v
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("unknown error")
+                .to_string();
+            return Err(MessageBoxError::Auth(description));
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +292,33 @@ mod tests {
             key.chars().all(|c| c.is_ascii_hexdigit()),
             "identity key must be hex"
         );
+    }
+
+    /// `get_json` exists — compile check via type coercion to async fn pointer.
+    ///
+    /// We verify the method resolves without calling it (no live network needed).
+    #[allow(dead_code)]
+    fn get_json_compiles(client: &MessageBoxClient<ArcWallet>) {
+        // If get_json does not exist or has wrong signature, this fn fails to compile.
+        let _fut = client.get_json("https://example.com/test");
+    }
+
+    /// `check_status_error` returns Ok for success body.
+    #[test]
+    fn check_status_error_passes_success_body() {
+        use super::check_status_error;
+        let body = br#"{"status":"success","data":{}}"#;
+        assert!(check_status_error(body).is_ok());
+    }
+
+    /// `check_status_error` returns Err for server error body.
+    #[test]
+    fn check_status_error_returns_err_for_error_body() {
+        use super::check_status_error;
+        let body = br#"{"status":"error","description":"permission denied"}"#;
+        let err = check_status_error(body).unwrap_err();
+        assert!(matches!(err, crate::error::MessageBoxError::Auth(_)));
+        assert_eq!(err.to_string(), "auth error: permission denied");
     }
 
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).

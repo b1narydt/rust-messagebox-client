@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
+use bsv::remittance::types::PeerMessage;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -27,6 +29,8 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Phase 5 will populate this — kept now to avoid a breaking struct change later.
     #[allow(dead_code)]
     init_once: OnceCell<()>,
+    /// WebSocket connection state (None until first live message call).
+    ws_state: Mutex<Option<crate::websocket::MessageBoxWebSocket>>,
 }
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
@@ -44,6 +48,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             originator,
             identity_key: OnceCell::new(),
             init_once: OnceCell::new(),
+            ws_state: Mutex::new(None),
         }
     }
 
@@ -117,10 +122,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Internal HTTP helper
-    // -----------------------------------------------------------------------
-
     /// POST JSON bytes to `url` using BRC-31 authenticated transport.
     ///
     /// The entire `fetch()` call executes while the lock is held.  This is
@@ -151,6 +152,152 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         Ok(response)
     }
+
+    // -----------------------------------------------------------------------
+    // WebSocket live messaging
+    // -----------------------------------------------------------------------
+
+    /// Ensure a WebSocket connection is established and authenticated.
+    ///
+    /// If no connection exists or the existing connection is no longer connected,
+    /// creates a new `MessageBoxWebSocket` with the current identity key.
+    /// `rust_socketio` handles the Socket.IO handshake and HTTP-to-WS upgrade
+    /// internally — we pass the same base URL used for HTTP requests.
+    async fn ensure_ws_connected(&self) -> Result<(), MessageBoxError> {
+        let mut guard = self.ws_state.lock().await;
+        if guard.as_ref().map(|ws| ws.is_connected()).unwrap_or(false) {
+            return Ok(());
+        }
+        let identity_key = self.get_identity_key().await?;
+        let ws_url = self.host().to_string();
+        let ws = crate::websocket::MessageBoxWebSocket::connect(
+            &ws_url,
+            &identity_key,
+            self.wallet.clone(),
+            self.originator.clone(),
+        )
+        .await?;
+        *guard = Some(ws);
+        Ok(())
+    }
+
+    /// Listen for live messages on a message box via WebSocket.
+    ///
+    /// Joins the Socket.IO room `{identity_key}-{message_box}` and registers
+    /// the provided callback. Decryption happens inside the `on_any` callback
+    /// (set up at connect time) — the caller receives already-decrypted
+    /// `PeerMessage` structs.
+    ///
+    /// Establishes a WebSocket connection if one is not already active.
+    pub async fn listen_for_live_messages(
+        &self,
+        message_box: &str,
+        on_message: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+    ) -> Result<(), MessageBoxError> {
+        let identity_key = self.get_identity_key().await?;
+        let room_id = format!("{identity_key}-{message_box}");
+        let event_key = format!("sendMessage-{room_id}");
+
+        self.ensure_ws_connected().await?;
+
+        let guard = self.ws_state.lock().await;
+        if let Some(ref ws) = *guard {
+            ws.join_room(&room_id).await?;
+            ws.subscribe(event_key, on_message).await;
+        }
+        Ok(())
+    }
+
+    /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
+    ///
+    /// If no WebSocket connection is active, falls back immediately to HTTP.
+    /// On send or ack timeout/failure, falls back to HTTP.
+    /// HTTP fallback calls `send_message` which handles its own encryption.
+    pub async fn send_live_message(
+        &self,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+    ) -> Result<String, MessageBoxError> {
+        // Check WS availability without connecting — only use live path when already connected
+        let ws_available = {
+            let guard = self.ws_state.lock().await;
+            guard.as_ref().map(|ws| ws.is_connected()).unwrap_or(false)
+        };
+
+        if !ws_available {
+            // HTTP fallback — send_message handles its own encryption
+            return self.send_message(recipient, message_box, body).await;
+        }
+
+        // Encrypt and generate message ID for the WebSocket path
+        let encrypted = crate::encryption::encrypt_body(
+            self.wallet(),
+            body,
+            recipient,
+            self.originator(),
+        )
+        .await?;
+        let message_id = crate::encryption::generate_message_id(
+            self.wallet(),
+            body,
+            recipient,
+            self.originator(),
+        )
+        .await?;
+
+        let room_id = format!("{recipient}-{message_box}");
+        let ack_key = format!("sendMessageAck-{room_id}");
+
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<bool>();
+
+        let payload = serde_json::json!({
+            "roomId": room_id,
+            "message": {
+                "messageId": message_id,
+                "recipient": recipient,
+                "body": encrypted
+            }
+        });
+
+        // Emit — acquire lock briefly then release before awaiting ack
+        {
+            let guard = self.ws_state.lock().await;
+            if let Some(ref ws) = *guard {
+                ws.emit_send_message(payload, ack_key.clone(), ack_tx).await?;
+            }
+        }
+
+        // Await ack with 10-second timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+            Ok(Ok(true)) => Ok(message_id),
+            _ => {
+                // Clean up the pending ack to prevent channel leaks (Pitfall 7)
+                let guard = self.ws_state.lock().await;
+                if let Some(ref ws) = *guard {
+                    ws.remove_pending_ack(&ack_key).await;
+                }
+                drop(guard);
+                // Fall back to HTTP — send_message handles its own encryption
+                self.send_message(recipient, message_box, body).await
+            }
+        }
+    }
+
+    /// Disconnect the WebSocket connection and clear its state.
+    ///
+    /// Safe to call when no connection is active (no-op).
+    pub async fn disconnect_web_socket(&self) -> Result<(), MessageBoxError> {
+        let mut guard = self.ws_state.lock().await;
+        if let Some(ws) = guard.take() {
+            ws.disconnect().await?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal HTTP helpers
+    // -----------------------------------------------------------------------
 
     /// GET `url` using BRC-31 authenticated transport.
     ///

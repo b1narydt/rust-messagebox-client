@@ -1,13 +1,31 @@
+use std::collections::{HashMap, HashSet};
+
 use bsv::remittance::types::PeerMessage;
 use bsv::wallet::interfaces::{InternalizeActionArgs, InternalizeOutput, Payment, WalletInterface};
 use bsv::wallet::types::BooleanDefaultTrue;
 use bsv::primitives::public_key::PublicKey;
+use futures_util::future::join_all;
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
 use crate::client::check_status_error;
 use crate::types::{AcknowledgeMessageParams, ListMessagesParams, ListMessagesResponse, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
+
+/// Deduplicate messages from multiple hosts by `message_id`.
+///
+/// First occurrence wins — matches TS `Promise.allSettled` + Map-based dedup semantics.
+/// All results from all hosts are flattened and deduplicated into a single Vec.
+pub(crate) fn dedup_messages(results: Vec<Vec<PeerMessage>>) -> Vec<PeerMessage> {
+    let mut seen: HashMap<String, PeerMessage> = HashMap::new();
+    // Process in order so first-seen always wins
+    for host_messages in results {
+        for msg in host_messages {
+            seen.entry(msg.message_id.clone()).or_insert(msg);
+        }
+    }
+    seen.into_values().collect()
+}
 
 /// Intermediate type for server's wrapped message body format.
 /// The server MAY wrap message body as { "message": ..., "payment": ... }
@@ -42,11 +60,13 @@ pub(crate) struct ServerPaymentOutput {
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Send an encrypted message to a recipient's inbox.
     ///
-    /// 1. Asserts the client is initialized (caches identity key).
-    /// 2. Encrypts `body` for `recipient` using BRC-78.
-    /// 3. Generates a deterministic HMAC message ID.
-    /// 4. POSTs `{"message": {recipient, messageBox, body, messageId}}` to `/sendMessage`.
-    /// 5. Returns the HMAC-derived message ID.
+    /// CRITICAL TS PARITY: resolves the recipient's MessageBox host via overlay
+    /// (`resolveHostForRecipient`) before sending — matching TS line 952:
+    /// `const finalHost = overrideHost ?? await this.resolveHostForRecipient(message.recipient)`
+    ///
+    /// 1. Asserts the client is initialized.
+    /// 2. Resolves recipient's host via overlay (falls back to self.host if unreachable).
+    /// 3. Delegates to `send_message_to_host` with the resolved host.
     pub async fn send_message(
         &self,
         recipient: &str,
@@ -54,7 +74,26 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         body: &str,
     ) -> Result<String, MessageBoxError> {
         self.assert_initialized().await?;
+        let host = self.resolve_host_for_recipient(recipient).await?;
+        self.send_message_to_host(&host, recipient, message_box, body).await
+    }
 
+    /// Send an encrypted message to a recipient's inbox at an explicit host.
+    ///
+    /// Lower-level helper used by `send_message` (after host resolution) and by
+    /// `RemittanceAdapter` when `host_override` is provided.
+    ///
+    /// 1. Encrypts `body` for `recipient` using BRC-78.
+    /// 2. Generates a deterministic HMAC message ID.
+    /// 3. POSTs `{"message": {recipient, messageBox, body, messageId}}` to `{host}/sendMessage`.
+    /// 4. Returns the HMAC-derived message ID (or server ID if present).
+    pub(crate) async fn send_message_to_host(
+        &self,
+        host: &str,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+    ) -> Result<String, MessageBoxError> {
         // Encrypt the body for the recipient
         let encrypted_body = encryption::encrypt_body(
             self.wallet(),
@@ -86,7 +125,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
 
         let body_bytes = serde_json::to_vec(&request)?;
-        let url = format!("{}/sendMessage", self.host());
+        let url = format!("{host}/sendMessage");
         let response = self.post_json(&url, body_bytes).await?;
         check_status_error(&response.body)?;
 
@@ -146,6 +185,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// - When `accept_payments` is true, internalizes the server delivery-fee payment
     ///   via `wallet.internalize_action`. Errors are logged/ignored (TS parity).
     ///
+    /// Multi-host: queries all hosts advertised by this identity concurrently and
+    /// deduplicates results by `message_id`. Matches TS `Promise.allSettled` semantics:
+    /// if at least one host succeeds, partial results are returned.
+    ///
     /// NOTE: This handles the server delivery-fee payment wrapper, NOT PeerPay
     /// PaymentTokens (peer-to-peer). PeerPay tokens are handled by `list_incoming_payments`.
     pub async fn list_messages(
@@ -155,6 +198,48 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<Vec<PeerMessage>, MessageBoxError> {
         self.assert_initialized().await?;
 
+        // Discover all known hosts for this identity.
+        let identity_key = self.get_identity_key().await?;
+        let ads = self.query_advertisements(Some(&identity_key), None).await.unwrap_or_default();
+
+        // Build the set of unique host URLs: ads + self.host (always included).
+        let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
+        host_set.insert(self.host().to_string());
+
+        if host_set.len() == 1 {
+            // Single-host path — no need for dedup.
+            return self.list_messages_from_host(self.host(), message_box, accept_payments).await;
+        }
+
+        // Multi-host path: query all concurrently (TS Promise.allSettled semantics).
+        let futures: Vec<_> = host_set
+            .iter()
+            .map(|h| self.list_messages_from_host(h, message_box, accept_payments))
+            .collect();
+
+        let outcomes = join_all(futures).await;
+        let successful: Vec<Vec<PeerMessage>> = outcomes
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if successful.is_empty() {
+            return Err(MessageBoxError::Http(0, format!("list_messages: all {} hosts failed", host_set.len())));
+        }
+
+        Ok(dedup_messages(successful))
+    }
+
+    /// Retrieve messages from a single explicit host.
+    ///
+    /// Core implementation extracted so `list_messages` can call it per-host
+    /// for multi-host deduplication without repeating internalization logic.
+    async fn list_messages_from_host(
+        &self,
+        host: &str,
+        message_box: &str,
+        accept_payments: bool,
+    ) -> Result<Vec<PeerMessage>, MessageBoxError> {
         // Cache identity key once — used as recipient in every PeerMessage.
         let identity_key = self.get_identity_key().await?;
 
@@ -162,7 +247,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             message_box: message_box.to_string(),
         };
         let body_bytes = serde_json::to_vec(&params)?;
-        let url = format!("{}/listMessages", self.host());
+        let url = format!("{host}/listMessages");
         let response = self.post_json(&url, body_bytes).await?;
         check_status_error(&response.body)?;
 
@@ -465,6 +550,44 @@ mod tests {
         let wrapped: WrappedMessageBody = serde_json::from_str(raw).unwrap();
         assert!(wrapped.message.is_some(), "message present");
         assert!(wrapped.payment.is_none(), "payment is none when null");
+    }
+
+    /// `dedup_messages` deduplicates by message_id — first occurrence wins.
+    #[test]
+    fn test_list_messages_dedup_by_id() {
+        use super::dedup_messages;
+        use bsv::remittance::types::PeerMessage;
+
+        let msg_a = PeerMessage {
+            message_id: "id-1".to_string(),
+            sender: "03sender".to_string(),
+            recipient: "03me".to_string(),
+            message_box: "inbox".to_string(),
+            body: "first".to_string(),
+        };
+        let msg_a_dup = PeerMessage {
+            message_id: "id-1".to_string(), // same id — should be deduplicated
+            sender: "03sender".to_string(),
+            recipient: "03me".to_string(),
+            message_box: "inbox".to_string(),
+            body: "duplicate".to_string(), // different body — first-seen wins
+        };
+        let msg_b = PeerMessage {
+            message_id: "id-2".to_string(),
+            sender: "03sender".to_string(),
+            recipient: "03me".to_string(),
+            message_box: "inbox".to_string(),
+            body: "second".to_string(),
+        };
+
+        // Two hosts: host1 has [msg_a, msg_b], host2 has [msg_a_dup]
+        let results = vec![vec![msg_a.clone(), msg_b.clone()], vec![msg_a_dup]];
+        let deduped = dedup_messages(results);
+
+        assert_eq!(deduped.len(), 2, "must deduplicate to 2 unique messages");
+        // First-seen wins: id-1 body must be "first", not "duplicate"
+        let first = deduped.iter().find(|m| m.message_id == "id-1").unwrap();
+        assert_eq!(first.body, "first", "first-seen must win on deduplication");
     }
 
     /// HMAC message ID must be deterministic — same inputs produce same output.

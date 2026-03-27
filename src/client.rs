@@ -27,9 +27,7 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Cached identity public key (hex) — populated on first call.
     identity_key: OnceCell<String>,
     /// Ensures assert_initialized runs the full init path at most once.
-    /// Phase 5 will populate this — kept now to avoid a breaking struct change later.
-    #[allow(dead_code)]
-    init_once: OnceCell<()>,
+    pub(crate) init_once: OnceCell<()>,
     /// Network preset for overlay tools (LookupResolver, TopicBroadcaster).
     /// Defaults to Mainnet; pass Network::Local for localhost integration tests.
     pub(crate) network: Network,
@@ -131,11 +129,42 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Ensure the client is initialized before performing any HTTP operation.
     ///
-    /// Phase 1 implementation: caches the identity key and returns.
-    /// Full overlay init (`anoint_host`, SHIP broadcast) is deferred to Phase 5.
+    /// Uses `init_once.get_or_try_init` so the full init path runs at most once
+    /// even under concurrent callers — matching the TS `initializeConnection`
+    /// pattern which defers work until first use.
+    ///
+    /// Init sequence:
+    /// 1. Cache identity key.
+    /// 2. Query overlay advertisements for this identity + host.
+    /// 3. If no matching ad exists, call `anoint_host`.
+    /// 4. CRITICAL TS PARITY: catch anoint errors and continue — TS logs
+    ///    "Failed to anoint host, continuing with default functionality".
     pub(crate) async fn assert_initialized(&self) -> Result<(), MessageBoxError> {
-        self.get_identity_key().await?;
+        self.init_once.get_or_try_init(|| async {
+            let identity_key = self.get_identity_key().await?;
+            // Query existing advertisements for this identity+host pair.
+            // unwrap_or_default() because query_advertisements never fails (TS parity).
+            let ads = self.query_advertisements(Some(&identity_key), Some(&self.host)).await
+                .unwrap_or_default();
+            if ads.iter().all(|ad| ad.host.trim() != self.host.trim()) {
+                // No matching advertisement — anoint this host.
+                // CRITICAL TS PARITY: catch anoint errors and continue.
+                // TS: "Failed to anoint host, continuing with default functionality"
+                if let Err(e) = self.anoint_host(&self.host).await {
+                    eprintln!("Warning: failed to anoint host: {e}");
+                }
+            }
+            Ok::<(), MessageBoxError>(())
+        }).await?;
         Ok(())
+    }
+
+    /// Initialize the client — ensures overlay advertisement exists.
+    ///
+    /// User-facing wrapper for `assert_initialized`. Safe to call multiple times —
+    /// the init path runs exactly once due to `init_once` OnceCell semantics.
+    pub async fn init(&self) -> Result<(), MessageBoxError> {
+        self.assert_initialized().await
     }
 
     /// POST JSON bytes to `url` using BRC-31 authenticated transport.
@@ -229,6 +258,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Mirrors TS `sendLiveMessage`: auto-connects if needed, joins the sender's
     /// own room (required for ack routing), then emits. Falls back to HTTP if the
     /// connection cannot be established or the ack times out / fails.
+    ///
+    /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
+    /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
     pub async fn send_live_message(
         &self,
         recipient: &str,
@@ -238,6 +270,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
         // before checking socket.connected.
         if self.ensure_ws_connected().await.is_err() {
+            // HTTP fallback resolves recipient's host (TS parity: sendLiveMessage resolves host)
             return self.send_message(recipient, message_box, body).await;
         }
 
@@ -528,5 +561,26 @@ mod tests {
         let key1 = client.get_identity_key().await.expect("first call");
         let key2 = client.get_identity_key().await.expect("second call");
         assert_eq!(key1, key2, "OnceCell must return the same value on re-call");
+    }
+
+    /// `init_once` field is of type `OnceCell<()>` — compile check.
+    ///
+    /// The init_once field must be retained so assert_initialized can be wired
+    /// through it in Phase 5. This test verifies the field type and existence.
+    #[test]
+    fn test_init_compiles() {
+        let wallet = ArcWallet::new();
+        let client = MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            None,
+            Network::Mainnet,
+        );
+        // Verify the init_once field can be referenced and the public init() method exists.
+        // If init_once were removed or its type changed, this compile-check fails.
+        let _cell: &OnceCell<()> = &client.init_once;
+        // Public init() must exist — verified by type resolution.
+        let _fut = client.init();
+        let _ = _fut; // suppress unused warning
     }
 }

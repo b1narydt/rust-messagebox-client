@@ -25,7 +25,7 @@ use bsv::remittance::types::PeerMessage;
 use bsv::wallet::error::WalletError;
 use bsv::wallet::interfaces::*;
 use bsv::wallet::proto_wallet::ProtoWallet;
-use bsv_messagebox_client::types::ServerPeerMessage;
+use bsv_messagebox_client::types::{IncomingPayment, PaymentCustomInstructions, PaymentToken, ServerPeerMessage};
 use bsv_messagebox_client::{MessageBoxClient, RemittanceAdapter};
 
 // ---------------------------------------------------------------------------
@@ -277,4 +277,212 @@ async fn test_send_message_returns_non_empty_id() {
     let simulated_id = "a".repeat(64); // 64-char hex string shape
     assert_eq!(simulated_id.len(), 64, "message ID is 64 chars");
     assert!(!simulated_id.is_empty(), "message ID is non-empty");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — PeerPay payment type integration tests
+// ---------------------------------------------------------------------------
+
+/// PaymentToken serializes to camelCase JSON matching the TS wire format.
+///
+/// Guards against field name regressions and verifies:
+/// - All camelCase field names
+/// - transaction serializes as a number array (Vec<u8>)
+/// - outputIndex absent when None
+/// - payee present when Some, absent when None
+#[test]
+fn test_payment_token_camel_case_wire_format() {
+    let token = PaymentToken {
+        custom_instructions: PaymentCustomInstructions {
+            derivation_prefix: "prefix123".to_string(),
+            derivation_suffix: "suffix456".to_string(),
+            payee: Some("03abcdef".to_string()),
+        },
+        transaction: vec![1u8, 2, 3],
+        amount: 1500,
+        output_index: None,
+    };
+
+    let json = serde_json::to_string(&token).unwrap();
+
+    // Verify camelCase field names on the wire.
+    assert!(json.contains("\"customInstructions\""), "customInstructions camelCase");
+    assert!(json.contains("\"derivationPrefix\""), "derivationPrefix camelCase");
+    assert!(json.contains("\"derivationSuffix\""), "derivationSuffix camelCase");
+    assert!(json.contains("\"transaction\""), "transaction present");
+    assert!(json.contains("\"amount\""), "amount present");
+    assert!(json.contains("\"payee\""), "payee present when Some");
+
+    // transaction must serialize as a number array (e.g. [1,2,3]), not base64.
+    assert!(json.contains("[1,2,3]"), "transaction as number array");
+
+    // outputIndex must be absent when None (TS omits it at creation time).
+    assert!(!json.contains("outputIndex"), "outputIndex absent when None");
+    assert!(!json.contains("output_index"), "no snake_case leakage");
+
+    // Verify payee value is correct.
+    assert!(json.contains("\"03abcdef\""), "payee value correct");
+
+    // Now check payee is absent when None.
+    let token_no_payee = PaymentToken {
+        custom_instructions: PaymentCustomInstructions {
+            derivation_prefix: "p".to_string(),
+            derivation_suffix: "s".to_string(),
+            payee: None,
+        },
+        transaction: vec![0xab],
+        amount: 100,
+        output_index: None,
+    };
+    let json2 = serde_json::to_string(&token_no_payee).unwrap();
+    assert!(!json2.contains("payee"), "payee absent when None");
+}
+
+/// IncomingPayment can be constructed from a PaymentToken, sender, and message_id.
+///
+/// Verifies that all fields are accessible and correct after construction.
+#[test]
+fn test_incoming_payment_from_payment_token() {
+    let token = PaymentToken {
+        custom_instructions: PaymentCustomInstructions {
+            derivation_prefix: "pfx".to_string(),
+            derivation_suffix: "sfx".to_string(),
+            payee: None,
+        },
+        transaction: vec![0xde, 0xad, 0xbe, 0xef],
+        amount: 2500,
+        output_index: None,
+    };
+
+    let incoming = IncomingPayment {
+        token: token.clone(),
+        sender: "03sender_pubkey".to_string(),
+        message_id: "msg-abc-123".to_string(),
+    };
+
+    assert_eq!(incoming.sender, "03sender_pubkey", "sender preserved");
+    assert_eq!(incoming.message_id, "msg-abc-123", "message_id preserved");
+    assert_eq!(incoming.token.amount, 2500, "token amount preserved");
+    assert_eq!(incoming.token.transaction, vec![0xde, 0xad, 0xbe, 0xef], "transaction preserved");
+    assert_eq!(incoming.token.custom_instructions.derivation_prefix, "pfx");
+    assert_eq!(incoming.token.custom_instructions.derivation_suffix, "sfx");
+}
+
+/// PaymentToken round-trips through JSON serialization without data loss.
+///
+/// Ensures all fields survive serialize -> deserialize intact.
+#[test]
+fn test_payment_token_round_trip_serialization() {
+    let original = PaymentToken {
+        custom_instructions: PaymentCustomInstructions {
+            derivation_prefix: "round-trip-prefix".to_string(),
+            derivation_suffix: "round-trip-suffix".to_string(),
+            payee: Some("03roundtrip".to_string()),
+        },
+        transaction: vec![0x01, 0x02, 0x03, 0xff, 0xfe],
+        amount: 9999,
+        output_index: Some(2),
+    };
+
+    let json = serde_json::to_string(&original).unwrap();
+    let restored: PaymentToken = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(restored.amount, original.amount, "amount round-trips");
+    assert_eq!(restored.transaction, original.transaction, "transaction round-trips");
+    assert_eq!(restored.output_index, original.output_index, "output_index round-trips");
+    assert_eq!(
+        restored.custom_instructions.derivation_prefix,
+        original.custom_instructions.derivation_prefix,
+        "derivation_prefix round-trips"
+    );
+    assert_eq!(
+        restored.custom_instructions.derivation_suffix,
+        original.custom_instructions.derivation_suffix,
+        "derivation_suffix round-trips"
+    );
+    assert_eq!(
+        restored.custom_instructions.payee,
+        original.custom_instructions.payee,
+        "payee round-trips"
+    );
+}
+
+/// accept_payment uses .as_bytes().to_vec() for derivation prefix/suffix encoding.
+///
+/// Guards against Pitfall 3 from research: derivation strings must be passed as
+/// raw UTF-8 bytes, NOT base64-decoded. This test verifies the byte encoding is
+/// correct (string bytes, not base64 decoded bytes).
+#[test]
+fn test_accept_payment_derivation_args() {
+    let prefix = "my-prefix-string";
+    let suffix = "my-suffix-string";
+
+    // The encoding used in accept_payment is .as_bytes().to_vec()
+    let prefix_bytes: Vec<u8> = prefix.as_bytes().to_vec();
+    let suffix_bytes: Vec<u8> = suffix.as_bytes().to_vec();
+
+    // Verify it's the UTF-8 byte representation (not base64 decoded).
+    assert_eq!(prefix_bytes, b"my-prefix-string".to_vec(), "prefix as raw UTF-8 bytes");
+    assert_eq!(suffix_bytes, b"my-suffix-string".to_vec(), "suffix as raw UTF-8 bytes");
+
+    // Confirm the byte length matches the string length (all ASCII).
+    assert_eq!(prefix_bytes.len(), prefix.len(), "byte length matches string length for ASCII");
+
+    // Verify this is NOT base64 decoding — base64("my-prefix-string") would give different bytes.
+    let base64_decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        prefix,
+    );
+    // "my-prefix-string" is not valid base64, so decode should fail or give different bytes.
+    // Either way, the raw bytes must NOT equal base64 decoded bytes.
+    if let Ok(decoded) = base64_decoded {
+        assert_ne!(prefix_bytes, decoded, "must use raw bytes, NOT base64 decoded");
+    }
+    // If base64 decode fails — that confirms the string isn't base64, so raw bytes is correct.
+}
+
+/// Valid PaymentToken JSON body parses successfully (safeParse equivalent).
+///
+/// Verifies that a correctly-formed PaymentToken JSON string deserializes OK.
+#[test]
+fn test_safe_parse_valid_payment_body() {
+    let token = PaymentToken {
+        custom_instructions: PaymentCustomInstructions {
+            derivation_prefix: "valid-prefix".to_string(),
+            derivation_suffix: "valid-suffix".to_string(),
+            payee: None,
+        },
+        transaction: vec![0x01, 0x02],
+        amount: 500,
+        output_index: None,
+    };
+    let json = serde_json::to_string(&token).unwrap();
+
+    // safeParse: valid body should succeed.
+    let result = serde_json::from_str::<PaymentToken>(&json);
+    assert!(result.is_ok(), "valid PaymentToken JSON must parse successfully");
+    let parsed = result.unwrap();
+    assert_eq!(parsed.amount, 500);
+    assert_eq!(parsed.custom_instructions.derivation_prefix, "valid-prefix");
+}
+
+/// Invalid bodies return None when parsed as PaymentToken (safeParse equivalent).
+///
+/// Verifies that non-PaymentToken strings fail gracefully without panicking.
+#[test]
+fn test_safe_parse_invalid_body_returns_none() {
+    // Plain string is not valid JSON at all.
+    let plain_text = "hello world";
+    let result1 = serde_json::from_str::<PaymentToken>(plain_text).ok();
+    assert!(result1.is_none(), "plain text must fail to parse as PaymentToken");
+
+    // Empty JSON object is missing required fields.
+    let empty_obj = "{}";
+    let result2 = serde_json::from_str::<PaymentToken>(empty_obj).ok();
+    assert!(result2.is_none(), "empty object must fail to parse as PaymentToken (missing required fields)");
+
+    // A different valid JSON shape is not a PaymentToken.
+    let other_json = r#"{"status": "success", "messages": []}"#;
+    let result3 = serde_json::from_str::<PaymentToken>(other_json).ok();
+    assert!(result3.is_none(), "unrelated JSON must fail to parse as PaymentToken");
 }

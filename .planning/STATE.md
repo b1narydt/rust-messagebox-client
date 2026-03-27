@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06-parity-verification 06-01-PLAN.md
-last_updated: "2026-03-27T18:43:34.652Z"
+stopped_at: Completed 06-parity-verification 06-02-PLAN.md
+last_updated: "2026-03-27T18:44:48.318Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 6
   completed_phases: 5
   total_plans: 13
-  completed_plans: 11
+  completed_plans: 12
   percent: 50
 ---
 
@@ -61,6 +61,7 @@ Progress: [█████░░░░░] 50%
 | Phase 05-overlay-device-registration P01 | 43 | 2 tasks | 9 files |
 | Phase 05-overlay-device-registration P02 | 5 | 3 tasks | 6 files |
 | Phase 06-parity-verification PP01 | 8 | 2 tasks | 7 files |
+| Phase 06-parity-verification P02 | 25 | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -101,6 +102,9 @@ Recent decisions affecting current work:
 - [Phase 06-parity-verification]: get_joined_rooms uses blocking_lock — acceptable for sync test context; lock never held across await
 - [Phase 06-parity-verification]: init(target_host) ignores param currently — assert_initialized always uses self.host for anoint; target_host reserved for future use
 - [Phase 06-parity-verification]: send_live_message override_host applies to HTTP fallback path only — WS always connects to self.host()
+- [Phase 06-parity-verification]: MessagePayment wire type uses [1, messagebox] protocol/keyID — distinct from PeerPay [2, 3241645161d8]
+- [Phase 06-parity-verification]: acknowledge_message requires override_host: Option<&str> second param; None triggers multi-host fan-out via overlay advertisements
+- [Phase 06-parity-verification]: acknowledge_notification composes accept_payment (PeerPay) + acknowledge_message — notification bodies carry PaymentToken not server WrappedMessageBody
 
 ### Pending Todos
 
@@ -114,6 +118,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-27T18:43:34.650Z
-Stopped at: Completed 06-parity-verification 06-01-PLAN.md
+Last session: 2026-03-27T18:44:48.316Z
+Stopped at: Completed 06-parity-verification 06-02-PLAN.md
 Resume file: None

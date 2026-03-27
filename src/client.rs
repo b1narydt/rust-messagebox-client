@@ -171,21 +171,34 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// `target_host`: when Some, uses that host for the anoint_host call instead of
     /// `self.host()`. Matches the TS `init(targetHost?)` signature.
     pub async fn init(&self, target_host: Option<&str>) -> Result<(), MessageBoxError> {
-        let _ = target_host; // target_host is advisory — anoint uses self.host in the guard
-        self.assert_initialized().await
+        match target_host {
+            Some(host) => {
+                // TS parity: if targetHost provided, anoint THAT host directly
+                // instead of going through assert_initialized's self.host logic.
+                self.init_once.get_or_try_init(|| async {
+                    let _identity_key = self.get_identity_key().await?;
+                    // CRITICAL TS PARITY: catch anoint errors and continue.
+                    if let Err(e) = self.anoint_host(host).await {
+                        eprintln!("Warning: failed to anoint host: {e}");
+                    }
+                    Ok::<(), MessageBoxError>(())
+                }).await?;
+                Ok(())
+            }
+            None => self.assert_initialized().await,
+        }
     }
 
     /// Ensure the WebSocket connection is established.
     ///
     /// User-facing wrapper for `ensure_ws_connected`. Mirrors the TS
-    /// `initializeConnection` method. `override_host` is reserved for future
-    /// multi-host WS routing (currently unused — WS connects to `self.host()`).
+    /// `initializeConnection` method. When `override_host` is Some, the WS
+    /// connection uses that host instead of `self.host()`.
     pub async fn initialize_connection(
         &self,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        let _ = override_host;
-        self.ensure_ws_connected().await
+        self.ensure_ws_connected(override_host).await
     }
 
     /// Returns a clone of the set of currently joined message box room names.
@@ -217,7 +230,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
 
-        self.ensure_ws_connected().await?;
+        self.ensure_ws_connected(None).await?;
 
         {
             let guard = self.ws_state.lock().await;
@@ -271,13 +284,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// creates a new `MessageBoxWebSocket` with the current identity key.
     /// `rust_socketio` handles the Socket.IO handshake and HTTP-to-WS upgrade
     /// internally — we pass the same base URL used for HTTP requests.
-    async fn ensure_ws_connected(&self) -> Result<(), MessageBoxError> {
+    async fn ensure_ws_connected(&self, override_host: Option<&str>) -> Result<(), MessageBoxError> {
         let mut guard = self.ws_state.lock().await;
         if guard.as_ref().map(|ws| ws.is_connected()).unwrap_or(false) {
             return Ok(());
         }
         let identity_key = self.get_identity_key().await?;
-        let ws_url = self.host().to_string();
+        let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
         let ws = crate::websocket::MessageBoxWebSocket::connect(
             &ws_url,
             &identity_key,
@@ -304,12 +317,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         on_message: Arc<dyn Fn(PeerMessage) + Send + Sync>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        let _ = override_host; // WS connects to self.host(); override deferred
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
         let event_key = format!("sendMessage-{room_id}");
 
-        self.ensure_ws_connected().await?;
+        self.ensure_ws_connected(override_host).await?;
 
         {
             let guard = self.ws_state.lock().await;
@@ -353,7 +365,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
         // before checking socket.connected.
-        if self.ensure_ws_connected().await.is_err() {
+        if self.ensure_ws_connected(override_host).await.is_err() {
             // HTTP fallback: use override_host if provided, otherwise overlay resolution
             return match override_host {
                 Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,

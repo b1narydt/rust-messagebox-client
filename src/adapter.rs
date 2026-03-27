@@ -73,7 +73,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
 
         let server_msgs = self
             .inner
-            .list_messages_lite(message_box)
+            .list_messages_lite(message_box, _host)
             .await
             .map_err(|e| RemittanceError::Protocol(e.to_string()))?;
 

@@ -119,6 +119,7 @@ dependencies = [
  "bsv-sdk",
  "futures-util",
  "hex",
+ "rand",
  "rust_socketio",
  "serde",
  "serde_json",

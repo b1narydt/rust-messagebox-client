@@ -3,6 +3,11 @@ name = "bsv-messagebox-client"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
+description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
+license = "SEE LICENSE IN LICENSE"
+repository = "https://github.com/b1narydt/rust-messagebox-client"
+keywords = ["bsv", "blockchain", "messaging", "p2p", "bitcoin"]
+categories = ["cryptography", "network-programming"]
 
 [lib]
 name = "bsv_messagebox_client"
@@ -18,6 +23,7 @@ thiserror = "2"
 rust_socketio = { version = "0.6", features = ["async"] }
 futures-util = "0.3"
 hex = "0.4"
+rand = "0.8"
 
 [dev-dependencies]
 wiremock = "0.6"

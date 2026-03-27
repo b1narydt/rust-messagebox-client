@@ -198,10 +198,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     Err(_) => continue,
                 };
 
-                // TS parity: filter localhost and non-HTTPS hosts
-                if !host_url.starts_with("https://") || host_url.contains("localhost") {
-                    continue;
-                }
+                // TS does NOT filter by protocol or hostname — all valid PushDrop
+                // hosts are returned. This allows local dev with http://localhost.
 
                 // tx.id() returns Result<String> with no argument (unlike TS)
                 let txid = match tx.id() {

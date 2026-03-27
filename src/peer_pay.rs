@@ -272,7 +272,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn list_incoming_payments(
         &self,
     ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
-        let messages = self.list_messages("payment_inbox", false).await?;
+        let messages = self.list_messages("payment_inbox", false, None).await?;
 
         let payments = messages
             .into_iter()

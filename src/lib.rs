@@ -6,6 +6,7 @@ pub mod host_resolution;
 pub mod http_ops;
 pub mod peer_pay;
 pub mod permissions;
+pub mod socket_transport;
 pub mod types;
 pub mod websocket;
 

@@ -12,6 +12,7 @@ Six phases translate the TypeScript `@bsv/message-box-client` v1.3.0 into a prod
 - [x] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener (completed 2026-03-27)
 - [x] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration (completed 2026-03-27)
 - [x] **Phase 6: Parity Verification** - Close all API surface gaps, add missing methods/params, then verify full parity via audit and tests (completed 2026-03-27)
+- [ ] **Phase 7: BRC-103 WebSocket Auth Transport** - SocketIOTransport implementing SDK Transport trait, Peer-based mutual auth, signed authMessage envelopes
 
 ## Phase Details
 
@@ -106,10 +107,26 @@ Plans:
 - [ ] 06-02-PLAN.md — send_message feature params, acknowledge_message multi-host, missing methods (acknowledge_notification, send_message_to_recipients, multi-recipient quote)
 - [ ] 06-03-PLAN.md — Parity audit tests: API surface, encryption round-trip, payment token shape, wire format, smoke test
 
+### Phase 7: BRC-103 WebSocket Auth Transport
+**Goal:** All WebSocket communication uses BRC-103 mutual authentication via `Peer<W>` + `SocketIOTransport`, replacing the bare `authenticated` emit pattern with cryptographically signed `authMessage` envelopes — while preserving the existing `MessageBoxWebSocket` public API
+**Depends on:** Phase 6
+**Requirements**: BRC103-01, BRC103-02, BRC103-03, BRC103-04, BRC103-05, BRC103-06
+**Success Criteria** (what must be TRUE):
+  1. `SocketIOTransport` implements the SDK `Transport` trait, correctly serializing/deserializing `AuthMessage` as `authMessage` Socket.IO events
+  2. `MessageBoxWebSocket::connect()` creates a `Peer<W>` with the `SocketIOTransport` and completes the BRC-103 handshake before returning
+  3. Application events (`sendMessage`, `joinRoom`, `leaveRoom`) are sent via `Peer::send_message` as `{eventName, data}` JSON payloads inside `AuthMessage` envelopes
+  4. Incoming general messages from the Peer are decoded and dispatched to existing subscription callbacks transparently
+  5. The public API of `MessageBoxWebSocket` remains unchanged — all existing callers compile without modification
+**Plans:** 2 plans
+
+Plans:
+- [ ] 07-01-PLAN.md — SocketIOTransport struct implementing Transport trait, event encode/decode helpers, unit tests
+- [ ] 07-02-PLAN.md — Wire Peer<W> into MessageBoxWebSocket::connect, replace bare emit with BRC-103 auth, integration test
+
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -119,3 +136,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
 | 5. Overlay + Device Registration | 2/2 | Complete   | 2026-03-27 |
 | 6. Parity Verification | 3/3 | Complete   | 2026-03-27 |
+| 7. BRC-103 WebSocket Auth Transport | 0/2 | Planned | |

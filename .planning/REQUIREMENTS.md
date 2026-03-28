@@ -101,6 +101,15 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 - [x] **TEST-05**: Integration tests against local `go-messagebox-server` (send → list → ack cycle)
 - [x] **TEST-06**: Integration tests for PeerPay payment flow (create → send → accept)
 
+### BRC-103 WebSocket Auth Transport
+
+- [ ] **BRC103-01**: `SocketIOTransport` implements SDK `Transport` trait, bridging `authMessage` Socket.IO events to/from `mpsc` channels
+- [ ] **BRC103-02**: `Transport::send` serializes `AuthMessage` as JSON and emits `authMessage` Socket.IO event
+- [ ] **BRC103-03**: `MessageBoxWebSocket::connect` creates `Peer<W>` with `SocketIOTransport` and completes BRC-103 mutual auth handshake
+- [ ] **BRC103-04**: Application events (`sendMessage`, `joinRoom`, `leaveRoom`) are sent via `Peer::send_message` as encoded `{eventName, data}` payloads inside `AuthMessage` envelopes
+- [ ] **BRC103-05**: Event payload encode/decode (`encode_ws_event` / `decode_ws_event`) matches TS `AuthSocketClient.encodeEventPayload` / `decodeEventPayload` format
+- [ ] **BRC103-06**: `MessageBoxWebSocket` public API surface remains unchanged (connect, join_room, leave_room, subscribe, emit_send_message, disconnect)
+
 ## v2 Requirements
 
 - **V2-01**: Feature flags for optional subsystems (`websocket`, `peerpay`, `overlay`)
@@ -182,12 +191,19 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 | PARITY-03 | Phase 6 | Complete |
 | PARITY-04 | Phase 6 | Complete |
 | PARITY-05 | Phase 6 | Complete |
+| BRC103-01 | Phase 7 | Planned |
+| BRC103-02 | Phase 7 | Planned |
+| BRC103-03 | Phase 7 | Planned |
+| BRC103-04 | Phase 7 | Planned |
+| BRC103-05 | Phase 7 | Planned |
+| BRC103-06 | Phase 7 | Planned |
 
 **Coverage:**
 - v1 requirements: 58 total
-- Mapped to phases: 58
-- Unmapped: 0 ✓
+- v1.1 requirements (BRC-103): 6 total
+- Mapped to phases: 64
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-26*
-*Last updated: 2026-03-26 — added Phase 6 parity verification requirements*
+*Last updated: 2026-03-28 — added Phase 7 BRC-103 WebSocket auth transport requirements*

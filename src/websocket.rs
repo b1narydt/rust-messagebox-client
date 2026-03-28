@@ -116,9 +116,11 @@ impl MessageBoxWebSocket {
                 let key_tx = server_key_tx_clone.clone();
                 async move {
                     if let Some(msg) = parse_auth_message_from_payload(&payload) {
-                        // Capture the server identity key from the InitialRequest so the
-                        // handshake loop can retrieve it after process_next() processes it.
-                        if msg.message_type == MessageType::InitialRequest {
+                        // Capture the server identity key from InitialRequest or InitialResponse
+                        // so we can retrieve it after handshake completes.
+                        if msg.message_type == MessageType::InitialRequest
+                            || msg.message_type == MessageType::InitialResponse
+                        {
                             let _ = key_tx.send(msg.identity_key.clone()).await;
                         }
                         let _ = tx.send(msg).await;
@@ -224,56 +226,35 @@ impl MessageBoxWebSocket {
             .expect("on_general_message take-once: must be called before peer_task spawn");
 
         // -----------------------------------------------------------------------
-        // Handshake: server-initiated BRC-103
+        // Handshake: client-initiated BRC-103
         //
-        // The server sends an InitialRequest as an authMessage Socket.IO event.
-        // The SocketIOTransport pushes it to the transport channel. We must call
-        // process_next() to drive the Peer to handle it (creates session + sends
-        // InitialResponse). After that, the server completes mutual auth.
-        // -----------------------------------------------------------------------
-        let server_identity_key: String = tokio::time::timeout(
-            Duration::from_secs(10),
-            async {
-                loop {
-                    match peer.process_next().await {
-                        Ok(true) => {
-                            // A message was processed — check if we captured the server key
-                            if let Ok(key) = server_key_rx.try_recv() {
-                                // Verify the Peer created an authenticated session for this key
-                                if peer.session_manager().has_session_by_identifier(&key) {
-                                    return Ok::<String, MessageBoxError>(key);
-                                }
-                            }
-                        }
-                        Ok(false) => {
-                            // Channel empty — yield briefly before polling again
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                        Err(e) => {
-                            return Err(MessageBoxError::WebSocket(
-                                format!("BRC-103 handshake error: {e}"),
-                            ));
-                        }
-                    }
-                }
-            },
-        )
-        .await
-        .map_err(|_| {
-            MessageBoxError::WebSocket("BRC-103 handshake timed out after 10 seconds".into())
-        })??;
-
-        // -----------------------------------------------------------------------
-        // Send the application-level `authenticated` event through the Peer.
+        // The client initiates the BRC-103 mutual auth handshake by calling
+        // peer.send_message("", payload). When no session exists for the given
+        // identity key, the Peer calls initiate_handshake() which:
+        //   1. Sends InitialRequest as an authMessage Socket.IO event
+        //   2. Polls the transport for InitialResponse from the server
+        //   3. Verifies the server's signature and completes mutual auth
+        //   4. Updates the session with the real server identity key
+        //   5. Sends the authenticated General message through the session
         //
-        // send_message internally checks session_manager — finds the session created
-        // during handshake above, so no second handshake occurs. Wraps the payload
-        // in a signed BRC-103 General message and emits via SocketIOTransport.
+        // We pass "" as the server identity key since we don't know it yet.
+        // The Peer discovers it from the server's InitialResponse and updates
+        // the session accordingly.
         // -----------------------------------------------------------------------
         let auth_payload = encode_ws_event("authenticated", json!({"identityKey": identity_key}));
-        peer.send_message(&server_identity_key, auth_payload)
+        peer.send_message("", auth_payload)
             .await
-            .map_err(|e| MessageBoxError::WebSocket(format!("BRC-103 send auth event: {e}")))?;
+            .map_err(|e| MessageBoxError::WebSocket(format!("BRC-103 handshake: {e}")))?;
+
+        // Extract the server identity key captured by the on("authMessage") callback
+        // from the server's InitialResponse during the handshake.
+        let server_identity_key = server_key_rx
+            .try_recv()
+            .map_err(|_| {
+                MessageBoxError::WebSocket(
+                    "BRC-103 handshake completed but server identity key not captured".into(),
+                )
+            })?;
 
         // -----------------------------------------------------------------------
         // Spawn peer_task: owns the Peer, runs process_next() continuously + handles commands.

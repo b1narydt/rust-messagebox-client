@@ -859,15 +859,13 @@ async fn test_send_notification_to_self() {
 ///   5. Room join/leave work through the Peer channel
 ///   6. Disconnect cleanly terminates the peer_task
 #[tokio::test]
-#[ignore] // Requires running go-messagebox-server on localhost:5500
+#[ignore]
 async fn test_brc103_websocket_auth() {
     use bsv_messagebox_client::websocket::MessageBoxWebSocket;
 
-    // Create a fresh random wallet and use MessageBoxClient to resolve its identity key
-    // as a hex string (matches how other live tests obtain the key string).
     let wallet = ArcWallet::new();
     let helper_client = Arc::new(MessageBoxClient::new(
-        "http://localhost:5500".to_string(),
+        LIVE_HOST.to_string(),
         wallet.clone(),
         None,
         bsv::services::overlay_tools::Network::Mainnet,
@@ -877,9 +875,9 @@ async fn test_brc103_websocket_auth() {
         .await
         .expect("get_identity_key should succeed");
 
-    // Connect and complete BRC-103 handshake using the same wallet
+    // Connect and complete BRC-103 handshake against live server
     let ws = MessageBoxWebSocket::connect(
-        "http://localhost:5500",
+        LIVE_HOST,
         &identity_key,
         wallet,
         None,
@@ -922,6 +920,101 @@ async fn test_brc103_websocket_auth() {
         "is_connected() must return false after disconnect"
     );
     println!("BRC-103 WebSocket auth test passed");
+}
+
+/// Diagnostic: connect, emit old-style `authenticated`, and log all server responses.
+#[tokio::test]
+#[ignore]
+async fn test_ws_event_probe() {
+    use rust_socketio::asynchronous::ClientBuilder;
+    use futures_util::FutureExt;
+
+    let events: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+
+    let wallet = ArcWallet::new();
+    let helper = Arc::new(MessageBoxClient::new(
+        LIVE_HOST.to_string(), wallet.clone(), None,
+        bsv::services::overlay_tools::Network::Mainnet,
+    ));
+    let identity_key = helper.get_identity_key().await.expect("get key");
+
+    let evs2 = events.clone();
+    let evs3 = events.clone();
+    let evs4 = events.clone();
+    let evs5 = events.clone();
+
+    let client = ClientBuilder::new(LIVE_HOST)
+        .on("authenticationSuccess", move |payload, _socket| {
+            let evs = events_clone.clone();
+            async move {
+                let line = format!("authenticationSuccess: {payload:?}");
+                println!("WS: {line}");
+                evs.lock().await.push(line);
+            }.boxed()
+        })
+        .on("authenticationFailed", move |payload, _socket| {
+            let evs = evs2.clone();
+            async move {
+                let line = format!("authenticationFailed: {payload:?}");
+                println!("WS: {line}");
+                evs.lock().await.push(line);
+            }.boxed()
+        })
+        .on("authMessage", move |payload, _socket| {
+            let evs = evs3.clone();
+            async move {
+                let line = format!("authMessage: {payload:?}");
+                println!("WS: {line}");
+                evs.lock().await.push(line);
+            }.boxed()
+        })
+        .on("message", move |payload, _socket| {
+            let evs = evs4.clone();
+            async move {
+                let line = format!("message: {payload:?}");
+                println!("WS: {line}");
+                evs.lock().await.push(line);
+            }.boxed()
+        })
+        .on("error", move |payload, _socket| {
+            let evs = evs5.clone();
+            async move {
+                let line = format!("error: {payload:?}");
+                println!("WS: {line}");
+                evs.lock().await.push(line);
+            }.boxed()
+        })
+        .connect()
+        .await
+        .expect("Socket.IO connect should succeed");
+
+    // Emit old-style authenticated
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    println!("Emitting 'authenticated' with identityKey={}", &identity_key[..12]);
+    let emit_result = client.emit("authenticated", serde_json::json!({"identityKey": identity_key})).await;
+    println!("emit result: {emit_result:?}");
+
+    // Also try emitting authMessage directly
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let auth_emit = client.emit("authMessage", serde_json::json!({"test": true})).await;
+    println!("authMessage emit result: {auth_emit:?}");
+
+    // Listen for 5 seconds
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Check if socket is still connected
+    println!("Socket connected after wait: not directly checkable, checking emit...");
+    let ping_result = client.emit("ping", serde_json::json!({})).await;
+    println!("ping emit result: {ping_result:?}");
+
+    let captured = events.lock().await;
+    println!("\n=== Captured {} events ===", captured.len());
+    for e in captured.iter() {
+        println!("  {e}");
+    }
+
+    client.disconnect().await.expect("disconnect");
 }
 
 // ===========================================================================

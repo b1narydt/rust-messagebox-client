@@ -117,12 +117,13 @@ impl Transport for SocketIOTransport {
 
     /// Return the `mpsc::Receiver` for incoming `AuthMessage` events.
     ///
-    /// Uses `blocking_lock` because the SDK trait method is `fn subscribe(&self)`
-    /// (non-async). Panics on second call — create a fresh `SocketIOTransport`
-    /// on reconnect rather than reusing the same instance.
+    /// Uses `try_lock` because the SDK trait method is `fn subscribe(&self)`
+    /// (non-async) and `blocking_lock` panics inside a tokio runtime.
+    /// Panics on second call — create a fresh `SocketIOTransport` on reconnect.
     fn subscribe(&self) -> mpsc::Receiver<AuthMessage> {
         self.incoming_rx
-            .blocking_lock()
+            .try_lock()
+            .expect("subscribe() mutex should not be contended")
             .take()
             .expect("subscribe() can only be called once per SocketIOTransport")
     }

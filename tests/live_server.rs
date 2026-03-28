@@ -923,6 +923,91 @@ async fn test_brc103_websocket_auth() {
 }
 
 // ===========================================================================
+// Phase 8: Two-client live WebSocket messaging
+// ===========================================================================
+
+/// E2E test: Client A subscribes to live messages, Client B sends a live message,
+/// Client A receives it via callback. Proves the full BRC-103 WebSocket pipeline
+/// works end-to-end between two independent peers.
+#[tokio::test]
+#[ignore]
+async fn test_two_client_live_messaging() {
+    use tokio::sync::mpsc;
+
+    // Create two independent clients with separate wallets
+    let client_a = make_live_client();
+    let client_b = make_live_client();
+
+    let key_a = client_a.get_identity_key().await.expect("client A identity key");
+    let key_b = client_b.get_identity_key().await.expect("client B identity key");
+    println!("Client A: {}", &key_a[..12]);
+    println!("Client B: {}", &key_b[..12]);
+
+    // Channel to capture messages received by Client A
+    let (msg_tx, mut msg_rx) = mpsc::channel::<bsv::remittance::PeerMessage>(4);
+
+    // Client A: subscribe to live messages on "e2e_test_inbox"
+    let tx = msg_tx.clone();
+    client_a
+        .listen_for_live_messages(
+            "e2e_test_inbox",
+            Arc::new(move |msg| {
+                println!("Client A received: sender={}, body={}", &msg.sender[..12], &msg.body);
+                let _ = tx.blocking_send(msg);
+            }),
+            None,
+        )
+        .await
+        .expect("Client A listen_for_live_messages should succeed");
+
+    // Small delay to let the subscription settle
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Client B: also connect WS and subscribe (needed for ack routing)
+    // Then send a live message to Client A
+    let test_body = format!("hello from B at {}", uuid_like_suffix());
+    println!("Client B sending: {test_body}");
+
+    // First try: skip_encryption=true so body passes through as-is
+    let send_result = client_b
+        .send_live_message(&key_a, "e2e_test_inbox", &test_body, true, false, None, None)
+        .await;
+    println!("Client B send result: {send_result:?}");
+
+    // If WS send returned Ok, that means the server acked it.
+    // If it fell back to HTTP, the message was stored but won't be pushed live.
+    // Either way, let's check.
+    match &send_result {
+        Ok(id) => println!("Message sent OK, id={id}"),
+        Err(e) => println!("Send failed: {e}"),
+    }
+    assert!(send_result.is_ok(), "send_live_message should succeed: {send_result:?}");
+
+    // Wait for Client A to receive the message (up to 10 seconds)
+    let received = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        msg_rx.recv(),
+    )
+    .await;
+
+    match received {
+        Ok(Some(msg)) => {
+            println!("Client A got message: sender={}, body={}", &msg.sender[..12], &msg.body);
+            assert_eq!(msg.sender, key_b, "sender should be Client B's identity key");
+            assert_eq!(msg.body, test_body, "body should match what Client B sent");
+            assert_eq!(msg.message_box, "e2e_test_inbox", "message_box should match");
+            println!("Two-client live messaging test PASSED");
+        }
+        Ok(None) => panic!("Message channel closed without receiving"),
+        Err(_) => panic!("Timed out waiting for live message from Client B — callback never fired"),
+    }
+
+    // Cleanup
+    client_a.disconnect_web_socket().await.ok();
+    client_b.disconnect_web_socket().await.ok();
+}
+
+// ===========================================================================
 // Helpers
 // ===========================================================================
 

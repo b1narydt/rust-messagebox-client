@@ -273,7 +273,8 @@ cargo test --test integration  # Integration tests (12)
 cargo test --test parity       # Parity verification tests (6)
 
 # Run live server tests against messagebox.babbage.systems (31 tests)
-cargo test --test live_server -- --ignored
+# Use --test-threads=1 to avoid server rate limiting under parallel load
+cargo test --test live_server -- --ignored --test-threads=1
 ```
 
 Offline tests use `ProtoWallet` instances — no live server required. Coverage includes:

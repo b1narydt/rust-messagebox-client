@@ -331,7 +331,9 @@ pub struct ServerPeerMessage {
     pub message_id: String,
     pub body: String,
     pub sender: String,
+    #[serde(alias = "createdAt")]
     pub created_at: String,
+    #[serde(alias = "updatedAt")]
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acknowledged: Option<bool>,

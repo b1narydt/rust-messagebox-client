@@ -12,7 +12,7 @@ Six phases translate the TypeScript `@bsv/message-box-client` v1.3.0 into a prod
 - [x] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener (completed 2026-03-27)
 - [x] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration (completed 2026-03-27)
 - [x] **Phase 6: Parity Verification** - Close all API surface gaps, add missing methods/params, then verify full parity via audit and tests (completed 2026-03-27)
-- [ ] **Phase 7: BRC-103 WebSocket Auth Transport** - SocketIOTransport implementing SDK Transport trait, Peer-based mutual auth, signed authMessage envelopes
+- [x] **Phase 7: BRC-103 WebSocket Auth Transport** - SocketIOTransport implementing SDK Transport trait, Peer-based mutual auth, signed authMessage envelopes (completed 2026-03-28)
 
 ## Phase Details
 
@@ -117,7 +117,7 @@ Plans:
   3. Application events (`sendMessage`, `joinRoom`, `leaveRoom`) are sent via `Peer::send_message` as `{eventName, data}` JSON payloads inside `AuthMessage` envelopes
   4. Incoming general messages from the Peer are decoded and dispatched to existing subscription callbacks transparently
   5. The public API of `MessageBoxWebSocket` remains unchanged — all existing callers compile without modification
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 
 Plans:
 - [ ] 07-01-PLAN.md — SocketIOTransport struct implementing Transport trait, event encode/decode helpers, unit tests
@@ -136,4 +136,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
 | 5. Overlay + Device Registration | 2/2 | Complete   | 2026-03-27 |
 | 6. Parity Verification | 3/3 | Complete   | 2026-03-27 |
-| 7. BRC-103 WebSocket Auth Transport | 1/2 | In Progress|  |
+| 7. BRC-103 WebSocket Auth Transport | 2/2 | Complete   | 2026-03-28 |

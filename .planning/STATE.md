@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 07-brc-103-websocket-auth-transport 07-01-PLAN.md
-last_updated: "2026-03-28T01:13:53.991Z"
+stopped_at: Completed 07-brc-103-websocket-auth-transport 07-02-PLAN.md
+last_updated: "2026-03-28T01:20:15.251Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 7
-  completed_phases: 6
+  completed_phases: 7
   total_plans: 15
-  completed_plans: 14
+  completed_plans: 15
   percent: 50
 ---
 
@@ -64,6 +64,7 @@ Progress: [█████░░░░░] 50%
 | Phase 06-parity-verification P02 | 25 | 2 tasks | 5 files |
 | Phase 06-parity-verification P06-03 | 6 | 2 tasks | 1 files |
 | Phase 07-brc-103-websocket-auth-transport P01 | 10 | 1 tasks | 2 files |
+| Phase 07-brc-103-websocket-auth-transport P02 | 4 | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -112,6 +113,9 @@ Recent decisions affecting current work:
 - [Phase 06-parity-verification]: test_socket() cfg(test) gating applies to library unit tests only, not integration test crates
 - [Phase 07-brc-103-websocket-auth-transport]: SocketIOTransport::new takes already-built Client + Receiver — avoids owning ClientBuilder; Sender captured in on('authMessage') callback during ClientBuilder setup in Plan 02
 - [Phase 07-brc-103-websocket-auth-transport]: subscribe() panics via expect() on second call per SDK contract — create fresh SocketIOTransport on reconnect rather than reusing instance
+- [Phase 07-brc-103-websocket-auth-transport]: PeerCommand channel for type erasure: MessageBoxWebSocket has no W generic param; Peer<W> owned by background task, accessed via PeerCommand::SendMessage
+- [Phase 07-brc-103-websocket-auth-transport]: general_msg_dispatcher is primary path for all application events (confirmed by TS source); on_any handlers are defensive fallbacks only
+- [Phase 07-brc-103-websocket-auth-transport]: reconnect(false) in ClientBuilder: BRC-103 requires fresh Peer + Transport on reconnect; transparent reconnect deferred to Phase 8
 
 ### Roadmap Evolution
 
@@ -129,6 +133,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-28T01:13:53.988Z
-Stopped at: Completed 07-brc-103-websocket-auth-transport 07-01-PLAN.md
+Last session: 2026-03-28T01:20:15.249Z
+Stopped at: Completed 07-brc-103-websocket-auth-transport 07-02-PLAN.md
 Resume file: None

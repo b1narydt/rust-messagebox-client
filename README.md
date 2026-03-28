@@ -1,6 +1,6 @@
 # bsv-messagebox-client
 
-A Rust implementation of the BSV MessageBox client — a peer-to-peer messaging and payment toolkit for the BSV blockchain. Full parity with the TypeScript [`@bsv/message-box-client`](https://github.com/bsv-blockchain/message-box-client) v1.4.x.
+A Rust implementation of the BSV MessageBox client — a peer-to-peer messaging and payment toolkit for the BSV blockchain. Full parity with the TypeScript [`@bsv/message-box-client`](https://github.com/bsv-blockchain/message-box-client) v2.0.x.
 
 ## Overview
 
@@ -232,25 +232,27 @@ Implements the BSV SDK `CommsLayer` trait:
 
 ```
 src/
-  lib.rs              # Module exports and public re-exports
-  client.rs           # MessageBoxClient struct, WebSocket integration
-  adapter.rs          # RemittanceAdapter (CommsLayer trait impl)
-  http_ops.rs         # HTTP messaging operations, multi-host logic
-  peer_pay.rs         # PeerPay payment operations
-  permissions.rs      # Permission management and notification wrappers
-  encryption.rs       # BRC-78 encryption/decryption, HMAC message IDs
-  websocket.rs        # Socket.IO WebSocket connection management
-  host_resolution.rs  # Overlay network host discovery (PushDrop)
-  types.rs            # Request/response types with serde serialization
-  error.rs            # Unified error type
+  lib.rs               # Module exports and public re-exports
+  client.rs            # MessageBoxClient struct, WebSocket integration
+  adapter.rs           # RemittanceAdapter (CommsLayer trait impl)
+  http_ops.rs          # HTTP messaging operations, multi-host logic
+  peer_pay.rs          # PeerPay payment operations
+  permissions.rs       # Permission management and notification wrappers
+  encryption.rs        # BRC-78 encryption/decryption, HMAC message IDs
+  websocket.rs         # Socket.IO WebSocket connection with BRC-103 auth
+  socket_transport.rs  # SocketIOTransport (SDK Transport trait over Socket.IO)
+  host_resolution.rs   # Overlay network host discovery (PushDrop)
+  types.rs             # Request/response types with serde serialization
+  error.rs             # Unified error type
 tests/
-  integration.rs      # CommsLayer adapter integration tests
-  parity.rs           # TypeScript parity verification tests
+  integration.rs       # CommsLayer adapter integration tests
+  parity.rs            # TypeScript parity verification tests
+  live_server.rs       # Live server tests against messagebox.babbage.systems
 ```
 
 ## TypeScript Parity
 
-This crate targets full behavioral parity with `@bsv/message-box-client` v1.4.x. Key parity points:
+This crate targets full behavioral parity with `@bsv/message-box-client` v2.0.x. Key parity points:
 
 - **Wire format**: All JSON request/response bodies use camelCase field names matching the TS client exactly
 - **Encryption**: BRC-78 with STANDARD base64 encoding (with padding), `{"encryptedMessage": "<base64>"}` format
@@ -262,22 +264,28 @@ This crate targets full behavioral parity with `@bsv/message-box-client` v1.4.x.
 ## Testing
 
 ```bash
-# Run all tests (100 tests: 82 unit + 12 integration + 6 parity)
+# Run all offline tests (112 tests: 94 unit + 12 integration + 6 parity)
 cargo test
 
 # Run specific test suites
-cargo test --lib           # Unit tests
-cargo test --test integration  # Integration tests
-cargo test --test parity       # Parity verification tests
+cargo test --lib               # Unit tests (94)
+cargo test --test integration  # Integration tests (12)
+cargo test --test parity       # Parity verification tests (6)
+
+# Run live server tests against messagebox.babbage.systems (31 tests)
+cargo test --test live_server -- --ignored
 ```
 
-Tests use offline `ProtoWallet` instances — no live server required. Test coverage includes:
+Offline tests use `ProtoWallet` instances — no live server required. Coverage includes:
 
 - Encryption round-trip (BRC-78, STANDARD base64)
 - Wire format serialization (camelCase JSON for all types)
 - CommsLayer adapter mapping (all 5 PeerMessage fields)
 - Payment token shape and derivation encoding
+- BRC-103 SocketIOTransport encoding/decoding and auth message parsing
 - Critical pitfall guards (snake_case params, header extraction, recipient population)
+
+Live server tests validate 30+ operations against the production Babbage MessageBox service, including messaging, encryption, permissions, payments, overlay queries, host resolution, and device registration.
 
 ## Default Hosts
 

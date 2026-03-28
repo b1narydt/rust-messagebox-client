@@ -8,22 +8,41 @@ use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
 use rust_socketio::{Event, Payload};
 use serde_json::json;
 use tokio::sync::{oneshot, Mutex};
+use tokio::sync::mpsc;
 
+use bsv::auth::peer::Peer;
+use bsv::auth::types::MessageType;
 use bsv::remittance::types::PeerMessage;
 use bsv::wallet::interfaces::WalletInterface;
 
 use crate::encryption;
 use crate::error::MessageBoxError;
+use crate::socket_transport::{
+    decode_ws_event, encode_ws_event, parse_auth_message_from_payload, SocketIOTransport,
+};
 use crate::types::ServerPeerMessage;
 
 /// Subscriber callback: event key → message handler.
 type SubscriptionMap = Arc<Mutex<HashMap<String, Arc<dyn Fn(PeerMessage) + Send + Sync>>>>;
 
-/// WebSocket connection to the MessageBox server using Socket.IO v4 protocol.
+/// Commands sent from public methods to the background peer task.
+enum PeerCommand {
+    SendMessage {
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Shutdown,
+}
+
+/// WebSocket connection to the MessageBox server using Socket.IO v4 protocol
+/// with BRC-103 mutual authentication via `Peer<W>`.
 ///
-/// Manages authentication handshake, room-based pub/sub, and event dispatch.
-/// The wallet and originator are captured at connect time — decryption of
-/// incoming messages happens inside the `on_any` callback to preserve ordering.
+/// All application-level Socket.IO events (sendMessage, joinRoom, leaveRoom, etc.)
+/// are sent through cryptographically signed `authMessage` envelopes. The public API
+/// surface is unchanged from the pre-BRC-103 version.
+///
+/// The wallet type is erased at connection time: `Peer<W>` lives in a background
+/// Tokio task and is accessed exclusively via the `peer_tx` command channel.
 pub struct MessageBoxWebSocket {
     client: SocketClient,
     /// Map of event key (e.g. "sendMessage-{roomId}") to subscriber callback.
@@ -34,15 +53,21 @@ pub struct MessageBoxWebSocket {
     joined_rooms: Arc<Mutex<HashSet<String>>>,
     /// True once the server sends authenticationSuccess.
     connected: Arc<AtomicBool>,
+    /// Channel to the background peer task that owns the BRC-103 Peer.
+    peer_tx: mpsc::Sender<PeerCommand>,
+    /// The server's identity key captured during the BRC-103 handshake.
+    server_identity_key: String,
 }
 
 impl MessageBoxWebSocket {
-    /// Connect to the MessageBox Socket.IO server and authenticate.
+    /// Connect to the MessageBox Socket.IO server and authenticate via BRC-103.
     ///
-    /// The `on_any` callback is set up at build time and captures the wallet
-    /// and originator for inline decryption of incoming messages.
+    /// Performs the full BRC-103 mutual authentication handshake before returning.
+    /// The `Peer<W>` is type-erased into a background task — callers see only the
+    /// unchanged public API surface.
     ///
-    /// Returns an error if authentication does not succeed within 5 seconds.
+    /// Returns an error if the handshake does not complete within 10 seconds, or
+    /// if `authenticationSuccess` is not received within 5 additional seconds.
     pub async fn connect<W>(
         url: &str,
         identity_key: &str,
@@ -58,87 +83,90 @@ impl MessageBoxWebSocket {
         let joined_rooms: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let connected = Arc::new(AtomicBool::new(false));
 
-        let (auth_tx, auth_rx) = oneshot::channel::<bool>();
-        // Wrap in Mutex so we can send exactly once from the closure
-        let auth_tx = Arc::new(Mutex::new(Some(auth_tx)));
+        // Channel for incoming BRC-103 authMessage Socket.IO events → SocketIOTransport → Peer
+        let (auth_msg_tx, auth_msg_rx) = mpsc::channel(64);
 
-        // Clone shared state for the closure
+        // Channel to capture the server's identity key from the InitialRequest message
+        let (server_key_tx, mut server_key_rx) = mpsc::channel::<String>(1);
+
+        // Shared oneshot for authenticationSuccess — fired by whichever path delivers it first
+        // (on_any fallback OR general_msg_dispatcher primary path)
+        let (auth_success_tx, auth_success_rx) = oneshot::channel::<()>();
+        let auth_success_shared: Arc<Mutex<Option<oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(Some(auth_success_tx)));
+
+        // Clone shared state for the on_any callback closure
         let subs_clone = subscriptions.clone();
         let acks_clone = pending_acks.clone();
         let conn_clone = connected.clone();
-        let auth_tx_clone = auth_tx.clone();
-        let rooms_clone = joined_rooms.clone();
+        let auth_success_on_any = auth_success_shared.clone();
 
-        // Identity key captured for re-authentication on reconnect
-        let identity_key_owned = identity_key.to_string();
-
-        // Wallet and originator captured by value for decryption inside on_any
+        // Wallet and originator captured by value — needed in defensive on_any fallback paths
         let wallet_clone = wallet.clone();
         let originator_clone = originator.clone();
 
+        // Move owned copies into the on("authMessage") callback
+        let auth_msg_tx_clone = auth_msg_tx.clone();
+        let server_key_tx_clone = server_key_tx.clone();
+
         let client = ClientBuilder::new(url)
-            .on_any(move |event, payload, socket| {
+            // BRC-103 transport layer: all authMessage events feed into the Peer channel
+            .on("authMessage", move |payload, _socket| {
+                let tx = auth_msg_tx_clone.clone();
+                let key_tx = server_key_tx_clone.clone();
+                async move {
+                    if let Some(msg) = parse_auth_message_from_payload(&payload) {
+                        // Capture the server identity key from the InitialRequest so the
+                        // handshake loop can retrieve it after process_next() processes it.
+                        if msg.message_type == MessageType::InitialRequest {
+                            let _ = key_tx.send(msg.identity_key.clone()).await;
+                        }
+                        let _ = tx.send(msg).await;
+                    }
+                }
+                .boxed()
+            })
+            // Application event layer: defensive fallback for non-BRC-103 paths.
+            //
+            // NOTE (confirmed 2026-03-28): The TS AuthSocketClient wraps ALL application
+            // events (authenticated, authenticationSuccess, sendMessage, sendMessageAck-*)
+            // through BRC-103 envelopes. These on_any handlers will likely NEVER fire
+            // because the server sends everything inside authMessage. The
+            // general_msg_dispatcher is the PRIMARY path for all application events.
+            // These handlers are retained as a defensive fallback only.
+            .on_any(move |event, payload, _socket| {
                 let subs = subs_clone.clone();
                 let acks = acks_clone.clone();
                 let conn = conn_clone.clone();
-                let auth_tx = auth_tx_clone.clone();
-                let rooms = rooms_clone.clone();
-                let ident = identity_key_owned.clone();
+                let auth_success = auth_success_on_any.clone();
                 let wallet = wallet_clone.clone();
                 let originator = originator_clone.clone();
 
                 async move {
                     match &event {
-                        // Re-authenticate on (re)connect — mirrors TS AuthSocketClient
-                        // which re-emits `authenticated` each time the transport connects.
-                        // On the initial connect this duplicates the manual emit below,
-                        // but the server handles duplicate auth gracefully.
-                        Event::Connect => {
-                            let _ = socket
-                                .emit("authenticated", json!({"identityKey": ident}))
-                                .await;
-                        }
+                        // BRC-103 replaces the bare `authenticated` emit on connect.
+                        // Do NOT re-emit here — the Peer handles authentication.
+                        Event::Connect => {}
                         Event::Custom(name) => {
                             if name == "authenticationSuccess" {
                                 conn.store(true, Ordering::SeqCst);
-                                // Signal initial auth waiter (no-op on reconnect —
-                                // auth_tx is already consumed)
-                                let mut guard = auth_tx.lock().await;
+                                // Race with general_msg_dispatcher — first one wins
+                                let mut guard = auth_success.lock().await;
                                 if let Some(tx) = guard.take() {
-                                    let _ = tx.send(true);
-                                }
-                                // Re-join rooms after reconnect auth succeeds.
-                                // On first connect joined_rooms is empty, so this is a no-op.
-                                let rooms_guard = rooms.lock().await;
-                                for room_id in rooms_guard.iter() {
-                                    let _ = socket
-                                        .emit("joinRoom", json!(room_id))
-                                        .await;
-                                }
-                            } else if name == "authenticationFailed" {
-                                let mut guard = auth_tx.lock().await;
-                                if let Some(tx) = guard.take() {
-                                    let _ = tx.send(false);
+                                    let _ = tx.send(());
                                 }
                             } else if name.starts_with("sendMessage-") {
-                                // Event key matches subscription map key
+                                // Defensive fallback — primary path is general_msg_dispatcher
                                 let event_key = name.clone();
-
-                                // Parse the incoming message from the payload
                                 if let Some(server_msg) = extract_server_peer_message(&payload) {
                                     let callback = {
                                         let guard = subs.lock().await;
                                         guard.get(&event_key).cloned()
                                     };
-
                                     if let Some(cb) = callback {
-                                        // room_id is the part after "sendMessage-"
                                         let room_id = name.strip_prefix("sendMessage-")
                                             .unwrap_or("")
                                             .to_string();
-
-                                        // Decrypt inline — preserves message ordering since
-                                        // rust_socketio serializes on_any calls
                                         let decrypted_body = encryption::try_decrypt_message(
                                             &wallet,
                                             &server_msg.body,
@@ -146,18 +174,7 @@ impl MessageBoxWebSocket {
                                             originator.as_deref(),
                                         )
                                         .await;
-
-                                        // Extract recipient and message_box from room_id.
-                                        // room_id format: "{identityKey}-{messageBox}"
-                                        // Identity keys are hex-only (no hyphens), so split at
-                                        // last hyphen to separate key from message box name.
-                                        // HOWEVER: we can't reliably split at last hyphen since
-                                        // identity keys are 66 hex chars (no hyphens).
-                                        // Split at first hyphen after the hex prefix instead.
-                                        // The room_id when listening is set as "{myKey}-{mb}".
-                                        // We parse from room_id since we don't have identity_key in scope here.
                                         let (recipient, message_box) = split_room_id(&room_id);
-
                                         cb(PeerMessage {
                                             message_id: server_msg.message_id,
                                             sender: server_msg.sender,
@@ -168,10 +185,9 @@ impl MessageBoxWebSocket {
                                     }
                                 }
                             } else if name.starts_with("sendMessageAck-") {
-                                // Look up and remove the oneshot sender
+                                // Defensive fallback — primary path is general_msg_dispatcher
                                 let mut guard = acks.lock().await;
                                 if let Some(tx) = guard.remove(name.as_str()) {
-                                    // Parse status from payload — "success" = true
                                     let success = parse_ack_status(&payload);
                                     let _ = tx.send(success);
                                 }
@@ -185,28 +201,209 @@ impl MessageBoxWebSocket {
                 }
                 .boxed()
             })
-            .reconnect(true)
-            .reconnect_on_disconnect(true)
+            // Disable auto-reconnect for v1 — reconnect requires fresh Peer + Transport.
+            // TODO: Phase 8 — implement transparent BRC-103 reconnect
+            .reconnect(false)
             .connect()
             .await
             .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
 
-        // Emit the authentication event
-        client
-            .emit("authenticated", json!({"identityKey": identity_key}))
-            .await
-            .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
+        // Build SocketIOTransport from the connected client + incoming channel receiver.
+        // The Sender lives in the on("authMessage") callback above.
+        let transport_client = client.clone();
+        let transport = SocketIOTransport::new(transport_client, auth_msg_rx);
 
-        // Wait up to 5 seconds for authenticationSuccess
-        match tokio::time::timeout(Duration::from_secs(5), auth_rx).await {
-            Ok(Ok(true)) => {}
-            _ => {
-                let _ = client.disconnect().await;
-                return Err(MessageBoxError::WebSocket(
-                    "authentication failed or timed out".to_string(),
-                ));
+        // Create the Peer — calls transport.subscribe() to get transport_rx, stores it.
+        // Does NOT spawn any background task; we must drive it via process_next().
+        let mut peer = Peer::new(wallet.clone(), Arc::new(transport));
+
+        // Take the general message receiver BEFORE moving peer into the background task.
+        // on_general_message() is take-once — panics on second call.
+        let general_msg_rx = peer
+            .on_general_message()
+            .expect("on_general_message take-once: must be called before peer_task spawn");
+
+        // -----------------------------------------------------------------------
+        // Handshake: server-initiated BRC-103
+        //
+        // The server sends an InitialRequest as an authMessage Socket.IO event.
+        // The SocketIOTransport pushes it to the transport channel. We must call
+        // process_next() to drive the Peer to handle it (creates session + sends
+        // InitialResponse). After that, the server completes mutual auth.
+        // -----------------------------------------------------------------------
+        let server_identity_key: String = tokio::time::timeout(
+            Duration::from_secs(10),
+            async {
+                loop {
+                    match peer.process_next().await {
+                        Ok(true) => {
+                            // A message was processed — check if we captured the server key
+                            if let Ok(key) = server_key_rx.try_recv() {
+                                // Verify the Peer created an authenticated session for this key
+                                if peer.session_manager().has_session_by_identifier(&key) {
+                                    return Ok::<String, MessageBoxError>(key);
+                                }
+                            }
+                        }
+                        Ok(false) => {
+                            // Channel empty — yield briefly before polling again
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => {
+                            return Err(MessageBoxError::WebSocket(
+                                format!("BRC-103 handshake error: {e}"),
+                            ));
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|_| {
+            MessageBoxError::WebSocket("BRC-103 handshake timed out after 10 seconds".into())
+        })??;
+
+        // -----------------------------------------------------------------------
+        // Send the application-level `authenticated` event through the Peer.
+        //
+        // send_message internally checks session_manager — finds the session created
+        // during handshake above, so no second handshake occurs. Wraps the payload
+        // in a signed BRC-103 General message and emits via SocketIOTransport.
+        // -----------------------------------------------------------------------
+        let auth_payload = encode_ws_event("authenticated", json!({"identityKey": identity_key}));
+        peer.send_message(&server_identity_key, auth_payload)
+            .await
+            .map_err(|e| MessageBoxError::WebSocket(format!("BRC-103 send auth event: {e}")))?;
+
+        // -----------------------------------------------------------------------
+        // Spawn peer_task: owns the Peer, runs process_next() continuously + handles commands.
+        //
+        // The tokio::select! loop drains both:
+        //   (a) PeerCommand channel — for send_message calls from public API methods
+        //   (b) process_next() polling — drives incoming message dispatch from transport_rx
+        //
+        // Note: initiate_handshake() (triggered by send_message if no session) blocks on
+        // transport_rx.recv().await — safe here because the Peer is single-owned, and
+        // initiate_handshake re-dispatches non-InitialResponse messages so nothing is lost.
+        // -----------------------------------------------------------------------
+        let (peer_cmd_tx, mut peer_cmd_rx) = mpsc::channel::<PeerCommand>(32);
+        let server_identity_key_for_task = server_identity_key.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    cmd = peer_cmd_rx.recv() => {
+                        match cmd {
+                            Some(PeerCommand::SendMessage { payload, reply }) => {
+                                let result = peer
+                                    .send_message(&server_identity_key_for_task, payload)
+                                    .await
+                                    .map_err(|e| e.to_string());
+                                let _ = reply.send(result);
+                            }
+                            Some(PeerCommand::Shutdown) | None => break,
+                        }
+                    }
+                    _ = async {
+                        // Continuously drain the transport channel and dispatch messages
+                        match peer.process_next().await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                            Err(e) => {
+                                eprintln!("BRC-103 process_next error: {e}");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    } => {}
+                }
             }
-        }
+        });
+
+        // -----------------------------------------------------------------------
+        // Spawn general_msg_dispatcher: reads decoded general messages from the Peer
+        // and routes them to subscriptions / acks / auth-success oneshot.
+        //
+        // This is the PRIMARY path for ALL application events (confirmed via TS source).
+        // The on_any handlers are defensive fallbacks only.
+        // -----------------------------------------------------------------------
+        let auth_success_shared2 = auth_success_shared.clone();
+        let subs_clone2 = subscriptions.clone();
+        let acks_clone2 = pending_acks.clone();
+        let conn_clone2 = connected.clone();
+        let wallet_clone2 = wallet.clone();
+        let originator_clone2 = originator.clone();
+        let mut general_msg_rx = general_msg_rx;
+
+        tokio::spawn(async move {
+            while let Some((_sender_key, payload_bytes)) = general_msg_rx.recv().await {
+                if let Some((event_name, data)) = decode_ws_event(&payload_bytes) {
+                    if event_name == "authenticationSuccess" {
+                        conn_clone2.store(true, Ordering::SeqCst);
+                        // Race to fire the shared oneshot — on_any may also attempt this
+                        let mut guard = auth_success_shared2.lock().await;
+                        if let Some(tx) = guard.take() {
+                            let _ = tx.send(());
+                        }
+                    } else if event_name.starts_with("sendMessage-") {
+                        let event_key = event_name.clone();
+                        if let Ok(server_msg) =
+                            serde_json::from_value::<ServerPeerMessage>(data.clone())
+                        {
+                            let callback = {
+                                let guard = subs_clone2.lock().await;
+                                guard.get(&event_key).cloned()
+                            };
+                            if let Some(cb) = callback {
+                                let room_id = event_name
+                                    .strip_prefix("sendMessage-")
+                                    .unwrap_or("")
+                                    .to_string();
+                                let decrypted_body = encryption::try_decrypt_message(
+                                    &wallet_clone2,
+                                    &server_msg.body,
+                                    &server_msg.sender,
+                                    originator_clone2.as_deref(),
+                                )
+                                .await;
+                                let (recipient, message_box) = split_room_id(&room_id);
+                                cb(PeerMessage {
+                                    message_id: server_msg.message_id,
+                                    sender: server_msg.sender,
+                                    recipient,
+                                    message_box,
+                                    body: decrypted_body,
+                                });
+                            }
+                        }
+                    } else if event_name.starts_with("sendMessageAck-") {
+                        let mut guard = acks_clone2.lock().await;
+                        if let Some(tx) = guard.remove(&event_name) {
+                            let success = data.get("status").and_then(|s| s.as_str())
+                                == Some("success");
+                            let _ = tx.send(success);
+                        }
+                    }
+                }
+            }
+        });
+
+        // -----------------------------------------------------------------------
+        // Wait for authenticationSuccess from whichever path fires first.
+        //
+        // Both on_any (fallback) and general_msg_dispatcher (primary) race to send
+        // on the shared oneshot. The peer_task must be running by now so that
+        // process_next() drains BRC-103 general messages containing authenticationSuccess.
+        // -----------------------------------------------------------------------
+        tokio::time::timeout(Duration::from_secs(5), auth_success_rx)
+            .await
+            .map_err(|_| {
+                MessageBoxError::WebSocket("authenticationSuccess not received within 5s".into())
+            })?
+            .map_err(|_| {
+                MessageBoxError::WebSocket("auth success channel dropped".into())
+            })?;
 
         Ok(Self {
             client,
@@ -214,6 +411,8 @@ impl MessageBoxWebSocket {
             pending_acks,
             joined_rooms,
             connected,
+            peer_tx: peer_cmd_tx,
+            server_identity_key,
         })
     }
 
@@ -222,7 +421,19 @@ impl MessageBoxWebSocket {
         self.connected.load(Ordering::SeqCst)
     }
 
+    /// Return the server's BRC-103 identity key captured during the handshake.
+    ///
+    /// This is a 66-character compressed public key hex string. Useful for
+    /// diagnostics and integration tests to verify the handshake completed
+    /// successfully and the correct server identity was established.
+    pub fn server_identity_key(&self) -> &str {
+        &self.server_identity_key
+    }
+
     /// Join a Socket.IO room (idempotent — no-op if already joined).
+    ///
+    /// The joinRoom event is sent through the BRC-103 Peer channel as a signed
+    /// authMessage envelope.
     pub async fn join_room(&self, room_id: &str) -> Result<(), MessageBoxError> {
         {
             let guard = self.joined_rooms.lock().await;
@@ -230,23 +441,43 @@ impl MessageBoxWebSocket {
                 return Ok(());
             }
         }
-        self.client
-            .emit("joinRoom", json!(room_id))
+        let payload = encode_ws_event("joinRoom", json!(room_id));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.peer_tx
+            .send(PeerCommand::SendMessage {
+                payload,
+                reply: reply_tx,
+            })
             .await
-            .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
+            .map_err(|_| MessageBoxError::WebSocket("peer task closed".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| MessageBoxError::WebSocket("peer reply dropped".into()))?
+            .map_err(|e| MessageBoxError::WebSocket(e))?;
         self.joined_rooms.lock().await.insert(room_id.to_string());
         Ok(())
     }
 
     /// Leave a Socket.IO room and remove its subscription.
+    ///
+    /// The leaveRoom event is sent through the BRC-103 Peer channel.
     pub async fn leave_room(&self, room_id: &str) -> Result<(), MessageBoxError> {
         self.joined_rooms.lock().await.remove(room_id);
         let event_key = format!("sendMessage-{room_id}");
         self.subscriptions.lock().await.remove(&event_key);
-        self.client
-            .emit("leaveRoom", json!(room_id))
+        let payload = encode_ws_event("leaveRoom", json!(room_id));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.peer_tx
+            .send(PeerCommand::SendMessage {
+                payload,
+                reply: reply_tx,
+            })
             .await
-            .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
+            .map_err(|_| MessageBoxError::WebSocket("peer task closed".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| MessageBoxError::WebSocket("peer reply dropped".into()))?
+            .map_err(|e| MessageBoxError::WebSocket(e))?;
         Ok(())
     }
 
@@ -263,22 +494,42 @@ impl MessageBoxWebSocket {
 
     /// Emit a sendMessage event and register an ack channel.
     ///
-    /// The ack channel will be triggered when the server emits
-    /// `sendMessageAck-{ack_key}` with status "success" or an error.
+    /// The sendMessage event is encoded as a BRC-103 payload and sent through
+    /// the Peer command channel. The ack channel is triggered when the server
+    /// emits `sendMessageAck-{ack_key}` (primary: via BRC-103 general message,
+    /// fallback: via raw Socket.IO event).
     pub async fn emit_send_message(
         &self,
         payload: serde_json::Value,
         ack_key: String,
         ack_tx: oneshot::Sender<bool>,
     ) -> Result<(), MessageBoxError> {
+        // Register ack BEFORE sending — avoids race where server acks before we register
         self.pending_acks
             .lock()
             .await
             .insert(ack_key.clone(), ack_tx);
-        if let Err(e) = self.client.emit("sendMessage", payload).await {
+
+        let event_payload = encode_ws_event("sendMessage", payload);
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if let Err(_) = self
+            .peer_tx
+            .send(PeerCommand::SendMessage {
+                payload: event_payload,
+                reply: reply_tx,
+            })
+            .await
+        {
             // Clean up the pending ack so it doesn't leak until timeout
             self.pending_acks.lock().await.remove(&ack_key);
-            return Err(MessageBoxError::WebSocket(e.to_string()));
+            return Err(MessageBoxError::WebSocket("peer task closed".into()));
+        }
+        if let Err(e) = reply_rx
+            .await
+            .map_err(|_| MessageBoxError::WebSocket("peer reply dropped".into()))?
+        {
+            self.pending_acks.lock().await.remove(&ack_key);
+            return Err(MessageBoxError::WebSocket(e));
         }
         Ok(())
     }
@@ -290,9 +541,12 @@ impl MessageBoxWebSocket {
 
     /// Disconnect from the server and clear all state.
     ///
+    /// Signals the peer_task to shut down, then disconnects the Socket.IO client.
     /// Sends false to all remaining pending ack channels before dropping them.
     pub async fn disconnect(&self) -> Result<(), MessageBoxError> {
         self.connected.store(false, Ordering::SeqCst);
+        // Signal the peer_task to terminate (best-effort — channel may already be closed)
+        let _ = self.peer_tx.send(PeerCommand::Shutdown).await;
         // Drain pending acks — send false to signal failure
         {
             let mut guard = self.pending_acks.lock().await;

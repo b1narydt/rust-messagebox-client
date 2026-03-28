@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 06-parity-verification 06-03-PLAN.md
-last_updated: "2026-03-27T18:53:58.696Z"
+stopped_at: Completed 07-brc-103-websocket-auth-transport 07-01-PLAN.md
+last_updated: "2026-03-28T01:13:53.991Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
-  total_phases: 6
+  total_phases: 7
   completed_phases: 6
-  total_plans: 13
-  completed_plans: 13
+  total_plans: 15
+  completed_plans: 14
   percent: 50
 ---
 
@@ -63,6 +63,7 @@ Progress: [█████░░░░░] 50%
 | Phase 06-parity-verification PP01 | 8 | 2 tasks | 7 files |
 | Phase 06-parity-verification P02 | 25 | 2 tasks | 5 files |
 | Phase 06-parity-verification P06-03 | 6 | 2 tasks | 1 files |
+| Phase 07-brc-103-websocket-auth-transport P01 | 10 | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -109,6 +110,12 @@ Recent decisions affecting current work:
 - [Phase 06-parity-verification]: size_of_val pattern for async method compile-checks avoids fn pointer lifetime issues
 - [Phase 06-parity-verification]: get_joined_rooms() uses blocking_lock; must only be called from sync test context, not async #[tokio::test]
 - [Phase 06-parity-verification]: test_socket() cfg(test) gating applies to library unit tests only, not integration test crates
+- [Phase 07-brc-103-websocket-auth-transport]: SocketIOTransport::new takes already-built Client + Receiver — avoids owning ClientBuilder; Sender captured in on('authMessage') callback during ClientBuilder setup in Plan 02
+- [Phase 07-brc-103-websocket-auth-transport]: subscribe() panics via expect() on second call per SDK contract — create fresh SocketIOTransport on reconnect rather than reusing instance
+
+### Roadmap Evolution
+
+- Phase 7 added: BRC-103 WebSocket Auth Transport — build SocketIOTransport implementing SDK Transport trait, wire Peer-based mutual auth into websocket.rs, replace raw event emitting with signed authMessage envelopes
 
 ### Pending Todos
 
@@ -122,6 +129,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-27T18:53:58.693Z
-Stopped at: Completed 06-parity-verification 06-03-PLAN.md
+Last session: 2026-03-28T01:13:53.988Z
+Stopped at: Completed 07-brc-103-websocket-auth-transport 07-01-PLAN.md
 Resume file: None

@@ -103,11 +103,11 @@ Full parity with TypeScript `@bsv/message-box-client` v1.3.0 + `PeerPayClient`.
 
 ### BRC-103 WebSocket Auth Transport
 
-- [ ] **BRC103-01**: `SocketIOTransport` implements SDK `Transport` trait, bridging `authMessage` Socket.IO events to/from `mpsc` channels
-- [ ] **BRC103-02**: `Transport::send` serializes `AuthMessage` as JSON and emits `authMessage` Socket.IO event
+- [x] **BRC103-01**: `SocketIOTransport` implements SDK `Transport` trait, bridging `authMessage` Socket.IO events to/from `mpsc` channels
+- [x] **BRC103-02**: `Transport::send` serializes `AuthMessage` as JSON and emits `authMessage` Socket.IO event
 - [ ] **BRC103-03**: `MessageBoxWebSocket::connect` creates `Peer<W>` with `SocketIOTransport` and completes BRC-103 mutual auth handshake
 - [ ] **BRC103-04**: Application events (`sendMessage`, `joinRoom`, `leaveRoom`) are sent via `Peer::send_message` as encoded `{eventName, data}` payloads inside `AuthMessage` envelopes
-- [ ] **BRC103-05**: Event payload encode/decode (`encode_ws_event` / `decode_ws_event`) matches TS `AuthSocketClient.encodeEventPayload` / `decodeEventPayload` format
+- [x] **BRC103-05**: Event payload encode/decode (`encode_ws_event` / `decode_ws_event`) matches TS `AuthSocketClient.encodeEventPayload` / `decodeEventPayload` format
 - [ ] **BRC103-06**: `MessageBoxWebSocket` public API surface remains unchanged (connect, join_room, leave_room, subscribe, emit_send_message, disconnect)
 
 ## v2 Requirements

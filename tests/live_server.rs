@@ -846,6 +846,85 @@ async fn test_send_notification_to_self() {
 }
 
 // ===========================================================================
+// BRC-103 WebSocket Auth tests
+// ===========================================================================
+
+/// BRC-103 WebSocket mutual auth handshake against a live go-messagebox-server.
+///
+/// Validates the full flow:
+///   1. SocketIOTransport bridges authMessage Socket.IO events to Peer
+///   2. Peer::process_next() drives server-initiated InitialRequest handling
+///   3. Peer::send_message() sends the authenticated event as a BRC-103 General message
+///   4. Server responds with authenticationSuccess (via BRC-103 general message or raw event)
+///   5. Room join/leave work through the Peer channel
+///   6. Disconnect cleanly terminates the peer_task
+#[tokio::test]
+#[ignore] // Requires running go-messagebox-server on localhost:5500
+async fn test_brc103_websocket_auth() {
+    use bsv_messagebox_client::websocket::MessageBoxWebSocket;
+
+    // Create a fresh random wallet and use MessageBoxClient to resolve its identity key
+    // as a hex string (matches how other live tests obtain the key string).
+    let wallet = ArcWallet::new();
+    let helper_client = Arc::new(MessageBoxClient::new(
+        "http://localhost:5500".to_string(),
+        wallet.clone(),
+        None,
+        bsv::services::overlay_tools::Network::Mainnet,
+    ));
+    let identity_key = helper_client
+        .get_identity_key()
+        .await
+        .expect("get_identity_key should succeed");
+
+    // Connect and complete BRC-103 handshake using the same wallet
+    let ws = MessageBoxWebSocket::connect(
+        "http://localhost:5500",
+        &identity_key,
+        wallet,
+        None,
+    )
+    .await
+    .expect("BRC-103 connect should succeed against live server");
+
+    // Verify authenticationSuccess was received
+    assert!(ws.is_connected(), "is_connected() must return true after successful BRC-103 auth");
+
+    // Verify server identity key was captured during handshake
+    let server_key = ws.server_identity_key();
+    assert!(
+        !server_key.is_empty(),
+        "server_identity_key must be non-empty"
+    );
+    assert_eq!(
+        server_key.len(),
+        66,
+        "server identity key must be 66-char hex (compressed pubkey), got len={}",
+        server_key.len()
+    );
+    assert!(
+        server_key.chars().all(|c| c.is_ascii_hexdigit()),
+        "server identity key must be all hex digits"
+    );
+    println!("server identity key: {server_key}");
+
+    // Join a room — sent through BRC-103 Peer channel
+    let room_id = format!("{identity_key}-test_brc103_inbox");
+    ws.join_room(&room_id)
+        .await
+        .expect("join_room should succeed after BRC-103 auth");
+    println!("joined room: {room_id}");
+
+    // Disconnect cleanly — signals peer_task shutdown
+    ws.disconnect().await.expect("disconnect should succeed");
+    assert!(
+        !ws.is_connected(),
+        "is_connected() must return false after disconnect"
+    );
+    println!("BRC-103 WebSocket auth test passed");
+}
+
+// ===========================================================================
 // Helpers
 // ===========================================================================
 

@@ -295,6 +295,42 @@ Live server tests validate 30+ operations against the production Babbage Message
 | Mainnet | `https://messagebox.babbage.systems` |
 | Testnet | `https://staging-messagebox.babbage.systems` |
 
+## Examples
+
+Runnable examples are in the `examples/` directory. All examples connect to the live MessageBox server at `https://messagebox.babbage.systems`.
+
+### Send a message (HTTP)
+
+```bash
+cargo run --example send_message
+```
+
+Demonstrates: `send_message`, `list_messages`, `acknowledge_message` — the basic HTTP messaging round-trip.
+
+### Live messaging (WebSocket)
+
+```bash
+cargo run --example live_messaging
+```
+
+Demonstrates: `listen_for_live_messages`, `send_live_message` — real-time WebSocket messaging between two peers with BRC-103 authentication.
+
+### Payments (PeerPay)
+
+```bash
+cargo run --example payments
+```
+
+Demonstrates: `create_payment_token`, `send_payment`, `list_incoming_payments`, `accept_payment` — the PeerPay payment lifecycle.
+
+### CommsLayer adapter
+
+```bash
+cargo run --example comms_layer
+```
+
+Demonstrates: `RemittanceAdapter` implementing the `CommsLayer` trait — the integration pattern for `RemittanceManager`.
+
 ## License
 
 Open BSV License - see [LICENSE](LICENSE) for details.

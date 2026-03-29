@@ -2,7 +2,7 @@
 
 ## What This Is
 
-A Rust client library for BSV MessageBox servers, providing full feature parity with the TypeScript `@bsv/message-box-client` (v1.3.0). A direct translation following the same pattern used for `bsv-rust-sdk` and `rust-wallet-toolbox` — same API surface, same behavior, different language. The crate is a standalone reusable package consumed by any Rust BSV application needing authenticated peer-to-peer messaging.
+A Rust client library for BSV MessageBox servers, providing full feature parity with the TypeScript `@bsv/message-box-client` v2.0.x. A direct translation following the same pattern used for `bsv-rust-sdk` and `rust-wallet-toolbox` — same API surface, same behavior, different language. The crate is a standalone reusable package consumed by any Rust BSV application needing authenticated peer-to-peer messaging.
 
 ## Core Value
 
@@ -12,22 +12,22 @@ Rust applications can send, receive, and manage BRC-31 authenticated messages wi
 
 ### Validated
 
-(None yet — ship to validate)
+- ✓ HTTP messaging (send, list, list_lite, acknowledge) via AuthFetch — v1.3
+- ✓ BRC-78 message encryption/decryption via WalletInterface — v1.3
+- ✓ HMAC-based message ID generation for idempotency — v1.3
+- ✓ Permission management (set, get, list, quote) — v1.3
+- ✓ Notification convenience methods (allow/deny/check/list/send) — v1.3
+- ✓ CommsLayer trait implementation (RemittanceAdapter) — v1.3
+- ✓ PeerPay (create/send/accept/reject payments, list incoming) — v1.3
+- ✓ WebSocket live messaging (send, listen, join/leave rooms) with BRC-103 auth — v1.3
+- ✓ Overlay host resolution (resolve recipient host, anoint/revoke host advertisements) — v1.3
+- ✓ Device registration for push notifications (register, list) — v1.3
+- ✓ Auto-initialization with host advertisement on first use — v1.3
+- ✓ Multi-host querying with message deduplication — v1.3
 
 ### Active
 
-- [ ] HTTP messaging (send, list, list_lite, acknowledge) via AuthFetch
-- [ ] BRC-78 message encryption/decryption via WalletInterface
-- [ ] HMAC-based message ID generation for idempotency
-- [ ] Permission management (set, get, list, quote)
-- [ ] Notification convenience methods (allow/deny/check/list/send)
-- [ ] CommsLayer trait implementation (RemittanceAdapter)
-- [ ] PeerPayClient equivalent (create/send/accept/reject payments, list incoming)
-- [ ] WebSocket live messaging (send, listen, join/leave rooms) via SDK's WebSocketTransport
-- [ ] Overlay host resolution (resolve recipient host, anoint/revoke host advertisements)
-- [ ] Device registration for push notifications (register, list)
-- [ ] Auto-initialization with host advertisement on first use
-- [ ] Multi-host querying with message deduplication
+(Next milestone requirements TBD)
 
 ### Out of Scope
 
@@ -71,11 +71,19 @@ Rust applications can send, receive, and manage BRC-31 authenticated messages wi
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| Standalone crate, not inline in edge-rs | Reusable across BSV Rust ecosystem, same pattern as TS package | — Pending |
-| Full parity with TS client | Demo needs RemittanceManager + payments + potentially live messaging for 6-node negotiation | — Pending |
-| Use SDK's WebSocketTransport for live messaging | Already implemented (348 lines), handles reconnect — no need for separate authsocket crate | — Pending |
-| Match TS encryption format exactly | Interop with existing TS clients on same MessageBox servers | — Pending |
-| Tiered implementation (HTTP → Payments → WebSocket → Overlay) | Build order follows dependency chain and allows incremental testing | — Pending |
+| Standalone crate, not inline in edge-rs | Reusable across BSV Rust ecosystem, same pattern as TS package | ✓ Good — clean separation |
+| Full parity with TS client | Demo needs RemittanceManager + payments + potentially live messaging for 6-node negotiation | ✓ Good — 54/54 methods |
+| Custom SocketIOTransport + Peer for BRC-103 | SDK's WebSocketTransport didn't support BRC-103 auth; built SocketIOTransport implementing Transport trait | ✓ Good — mutual auth works |
+| Match TS encryption format exactly | Interop with existing TS clients on same MessageBox servers | ✓ Good — live-tested |
+| Tiered implementation (HTTP → Payments → WebSocket → Overlay) | Build order follows dependency chain and allows incremental testing | ✓ Good — clean progression |
+| Client-initiated BRC-103 handshake | Server waits for client to send InitialRequest, not the other way around | ✓ Good — discovered via live testing |
+
+## Current State
+
+Shipped v1.3 with 6,613 lines of Rust across 11 source files.
+Tech stack: Rust 2021, bsv-rust-sdk (network feature), tokio, serde, rust_socketio.
+143 tests pass (94 unit + 12 integration + 6 parity + 31 live server).
+All 64 requirements complete. 2 low-severity tech debt items carried forward.
 
 ---
-*Last updated: 2026-03-26 after initialization*
+*Last updated: 2026-03-28 after v1.3 milestone*

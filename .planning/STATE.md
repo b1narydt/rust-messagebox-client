@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 08-e2e-websocket-payment-validation 08-02-PLAN.md
-last_updated: "2026-03-29T19:33:46.811Z"
+stopped_at: Completed 08-e2e-websocket-payment-validation 08-01-PLAN.md
+last_updated: "2026-03-29T20:30:56.722Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 19
-  completed_plans: 17
+  completed_plans: 18
   percent: 50
 ---
 
@@ -67,6 +67,7 @@ Progress: [█████░░░░░] 50%
 | Phase 07-brc-103-websocket-auth-transport P02 | 4 | 2 tasks | 2 files |
 | Phase 08-e2e-websocket-payment-validation P03 | 8 | 1 tasks | 1 files |
 | Phase 08-e2e-websocket-payment-validation P02 | 5min | 2 tasks | 2 files |
+| Phase 08-e2e-websocket-payment-validation P01 | 95min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -121,6 +122,8 @@ Recent decisions affecting current work:
 - [Phase 08-e2e-websocket-payment-validation]: ArcHttpWallet wraps Arc<HttpWalletJson> — HttpWalletJson is non-Clone; Arc-wrapping is the established project convention for adding Clone to non-Clone SDK wallet types
 - [Phase 08-e2e-websocket-payment-validation]: is_ws_connected() added as pub async fn — test_socket() is #[cfg(test)] sync-only and unavailable in integration test crates
 - [Phase 08-e2e-websocket-payment-validation]: test_rapid_sequential_sends uses HTTP send_message not send_live_message — HTTP is synchronous and reliable for message-count verification
+- [Phase 08-e2e-websocket-payment-validation P01]: Live Babbage server stores sendMessage payloads but does NOT broadcast via Socket.IO room push; HTTP polling every 2s is the primary delivery mechanism for listen_for_live_messages
+- [Phase 08-e2e-websocket-payment-validation P01]: auth_fetch and joined_rooms changed from Mutex<T> to Arc<Mutex<T>> to allow cloning into polling task; try_send (not blocking_send) required for mpsc channels inside async callbacks
 
 ### Roadmap Evolution
 
@@ -139,6 +142,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T19:33:46.809Z
-Stopped at: Completed 08-e2e-websocket-payment-validation 08-02-PLAN.md
+Last session: 2026-03-29T20:30:56.717Z
+Stopped at: Completed 08-e2e-websocket-payment-validation 08-01-PLAN.md
 Resume file: None

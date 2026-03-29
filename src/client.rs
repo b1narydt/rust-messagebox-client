@@ -213,11 +213,23 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Returns `Some(true)` if a WebSocket connection is active, `None` otherwise.
     ///
-    /// Test utility mirroring the TS `testSocket` accessor. Returns the connection
-    /// state only — the actual socket object is not exposed publicly.
+    /// Sync test utility mirroring the TS `testSocket` accessor. Only callable from
+    /// sync test contexts (e.g., unit tests) where `blocking_lock` is safe.
     #[cfg(test)]
     pub fn test_socket(&self) -> Option<bool> {
         let guard = self.ws_state.blocking_lock();
+        guard.as_ref().map(|ws| ws.is_connected())
+    }
+
+    /// Returns the current WebSocket connection state.
+    ///
+    /// `None` = no WebSocket connected yet. `Some(true)` = connected and authenticated.
+    /// `Some(false)` = connected but BRC-103 handshake not yet complete.
+    ///
+    /// Async version of `test_socket` — safe to call from integration tests and any
+    /// async context. Mirrors the TS `testSocket` accessor.
+    pub async fn is_ws_connected(&self) -> Option<bool> {
+        let guard = self.ws_state.lock().await;
         guard.as_ref().map(|ws| ws.is_connected())
     }
 

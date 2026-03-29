@@ -130,12 +130,12 @@ impl MessageBoxWebSocket {
             })
             // Application event layer: defensive fallback for non-BRC-103 paths.
             //
-            // NOTE (confirmed 2026-03-28): The TS AuthSocketClient wraps ALL application
-            // events (authenticated, authenticationSuccess, sendMessage, sendMessageAck-*)
-            // through BRC-103 envelopes. These on_any handlers will likely NEVER fire
-            // because the server sends everything inside authMessage. The
-            // general_msg_dispatcher is the PRIMARY path for all application events.
-            // These handlers are retained as a defensive fallback only.
+            // NOTE (confirmed 2026-03-29): The live Babbage server sends ALL handshake and
+            // room events as BRC-103 authMessage envelopes. For room message broadcasts,
+            // the server does NOT push to other clients via Socket.IO — messages are
+            // delivered via the HTTP polling fallback in listen_for_live_messages instead.
+            // These on_any handlers are retained as a defensive fallback for servers that
+            // DO broadcast raw Socket.IO events.
             .on_any(move |event, payload, _socket| {
                 let subs = subs_clone.clone();
                 let acks = acks_clone.clone();
@@ -288,12 +288,14 @@ impl MessageBoxWebSocket {
                     _ = async {
                         // Continuously drain the transport channel and dispatch messages
                         match peer.process_next().await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok(_dispatched) => {
+                                if !_dispatched {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
                             }
-                            Err(e) => {
-                                eprintln!("BRC-103 process_next error: {e}");
+                            Err(_) => {
+                                // BRC-103 verification errors (e.g. stale session, replayed nonce)
+                                // are non-fatal — the connection remains open; sleep briefly.
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }

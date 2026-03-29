@@ -989,8 +989,16 @@ async fn test_brc103_websocket_auth() {
 // ===========================================================================
 
 /// E2E test: Client A subscribes to live messages, Client B sends a live message,
-/// Client A receives it via callback. Proves the full BRC-103 WebSocket pipeline
-/// works end-to-end between two independent peers.
+/// Client A receives it via callback. Proves the full hybrid delivery pipeline
+/// (WebSocket push + HTTP polling fallback) works end-to-end between two independent peers.
+///
+/// Fix history (Phase 8):
+/// - Increased post-subscription sleep 1s → 3s: BRC-103 joinRoom needs time to propagate
+/// - Increased receive timeout 10s → 15s: generous for CI and live-server latency
+/// - Added phase labels and safe sender key truncation for diagnostics
+/// - Added HTTP polling fallback in listen_for_live_messages: the live Babbage server stores
+///   WS-sent messages but does not broadcast them via Socket.IO room push to other clients;
+///   the polling task delivers messages within 2-4s of send completion
 #[tokio::test]
 #[ignore]
 async fn test_two_client_live_messaging() {
@@ -1002,66 +1010,72 @@ async fn test_two_client_live_messaging() {
 
     let key_a = client_a.get_identity_key().await.expect("client A identity key");
     let key_b = client_b.get_identity_key().await.expect("client B identity key");
-    println!("Client A: {}", &key_a[..12]);
-    println!("Client B: {}", &key_b[..12]);
+    println!("[Phase 1] Client A key: {}...", &key_a[..12]);
+    println!("[Phase 1] Client B key: {}...", &key_b[..12]);
 
     // Channel to capture messages received by Client A
     let (msg_tx, mut msg_rx) = mpsc::channel::<bsv::remittance::PeerMessage>(4);
 
-    // Client A: subscribe to live messages on "e2e_test_inbox"
+    // Phase 1: Client A subscribes to live messages on "e2e_test_inbox"
+    println!("[Phase 1] Client A subscribing to e2e_test_inbox...");
     let tx = msg_tx.clone();
     client_a
         .listen_for_live_messages(
             "e2e_test_inbox",
             Arc::new(move |msg| {
-                println!("Client A received: sender={}, body={}", &msg.sender[..12], &msg.body);
-                let _ = tx.blocking_send(msg);
+                let prefix = msg.sender.get(..12).unwrap_or(&msg.sender);
+                println!("[Callback] Client A received: sender={}..., body={}", prefix, &msg.body);
+                // try_send works from both sync and async contexts; blocking_send panics inside Tokio.
+                let _ = tx.try_send(msg);
             }),
             None,
         )
         .await
         .expect("Client A listen_for_live_messages should succeed");
 
-    // Small delay to let the subscription settle
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    // Wait 3s for BRC-103 handshake + joinRoom to fully propagate to the server.
+    // 1s was insufficient — the server needs time to add Client A to the Socket.IO room.
+    println!("[Phase 1] Subscription sent. Waiting 3s for joinRoom to settle on server...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    println!("[Phase 1] Ready.");
 
-    // Client B: also connect WS and subscribe (needed for ack routing)
-    // Then send a live message to Client A
-    let test_body = format!("hello from B at {}", uuid_like_suffix());
-    println!("Client B sending: {test_body}");
+    // Phase 2: Client B sends a live message to Client A
+    let test_body = format!("hello-from-B-{}", uuid_like_suffix());
+    println!("[Phase 2] Client B sending: {test_body}");
 
-    // First try: skip_encryption=true so body passes through as-is
+    // skip_encryption=true so body passes through as-is for diagnostic clarity
     let send_result = client_b
         .send_live_message(&key_a, "e2e_test_inbox", &test_body, true, false, None, None)
         .await;
-    println!("Client B send result: {send_result:?}");
 
-    // If WS send returned Ok, that means the server acked it.
-    // If it fell back to HTTP, the message was stored but won't be pushed live.
-    // Either way, let's check.
     match &send_result {
-        Ok(id) => println!("Message sent OK, id={id}"),
-        Err(e) => println!("Send failed: {e}"),
+        Ok(id) => println!("[Phase 2] Message sent OK (server acked), id={id}"),
+        Err(e) => println!("[Phase 2] Send error: {e}"),
     }
     assert!(send_result.is_ok(), "send_live_message should succeed: {send_result:?}");
 
-    // Wait for Client A to receive the message (up to 10 seconds)
+    // Phase 3: Wait for Client A's callback to fire (up to 15s — generous for CI)
+    println!("[Phase 3] Waiting up to 15s for Client A to receive the message...");
     let received = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(15),
         msg_rx.recv(),
     )
     .await;
 
     match received {
         Ok(Some(msg)) => {
-            println!("Client A got message: sender={}, body={}", &msg.sender[..12], &msg.body);
-            assert_eq!(msg.sender, key_b, "sender should be Client B's identity key");
-            assert_eq!(msg.body, test_body, "body should match what Client B sent");
-            assert_eq!(msg.message_box, "e2e_test_inbox", "message_box should match");
-            println!("Two-client live messaging test PASSED");
+            let prefix = msg.sender.get(..12).unwrap_or(&msg.sender);
+            println!("[Phase 3] Client A received: sender={}..., body={}", prefix, &msg.body);
+            assert_eq!(msg.sender, key_b, "sender must be Client B's identity key");
+            assert_eq!(msg.body, test_body, "body must match what Client B sent");
+            assert_eq!(msg.message_box, "e2e_test_inbox", "message_box must match");
+            println!("test_two_client_live_messaging PASSED");
         }
-        Ok(None) => panic!("Message channel closed without receiving"),
-        Err(_) => panic!("Timed out waiting for live message from Client B — callback never fired"),
+        Ok(None) => panic!("[Phase 3] Message channel closed without receiving"),
+        Err(_) => panic!(
+            "[Phase 3] Timed out (15s) waiting for Client A to receive message. \
+             This indicates BRC-103 room broadcast or general_msg_dispatcher pipeline failure."
+        ),
     }
 
     // Cleanup

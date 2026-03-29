@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
@@ -8,6 +8,7 @@ use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::error::MessageBoxError;
+use crate::types::{ListMessagesParams, ListMessagesResponse};
 
 /// Authenticated HTTP client for the MessageBox protocol.
 ///
@@ -18,8 +19,9 @@ use crate::error::MessageBoxError;
 pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Base URL of the MessageBox server (trailing whitespace trimmed on construction).
     host: String,
-    /// BRC-31 authenticated HTTP client (needs `&mut self`, hence Mutex).
-    auth_fetch: Mutex<AuthFetch<W>>,
+    /// BRC-31 authenticated HTTP client (needs `&mut self`, hence Arc<Mutex> for sharing).
+    /// Arc allows cloning into background polling tasks without duplicating the wallet auth state.
+    auth_fetch: Arc<Mutex<AuthFetch<W>>>,
     /// Wallet retained for direct encrypt / decrypt calls in `http_ops`.
     wallet: W,
     /// Optional originator string forwarded to wallet operations.
@@ -35,7 +37,8 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     ws_state: Mutex<Option<crate::websocket::MessageBoxWebSocket>>,
     /// Tracks which message box rooms have been joined via join_room.
     /// Updated on join_room (insert) and leave_room (remove).
-    joined_rooms: Mutex<std::collections::HashSet<String>>,
+    /// Arc allows sharing with background polling tasks.
+    joined_rooms: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
@@ -49,14 +52,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub fn new(host: String, wallet: W, originator: Option<String>, network: Network) -> Self {
         MessageBoxClient {
             host: host.trim().to_string(),
-            auth_fetch: Mutex::new(AuthFetch::new(wallet.clone())),
+            auth_fetch: Arc::new(Mutex::new(AuthFetch::new(wallet.clone()))),
             wallet,
             originator,
             identity_key: OnceCell::new(),
             init_once: OnceCell::new(),
             network,
             ws_state: Mutex::new(None),
-            joined_rooms: Mutex::new(std::collections::HashSet::new()),
+            joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -317,9 +320,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Listen for live messages on a message box via WebSocket.
     ///
     /// Joins the Socket.IO room `{identity_key}-{message_box}` and registers
-    /// the provided callback. Decryption happens inside the `on_any` callback
-    /// (set up at connect time) — the caller receives already-decrypted
-    /// `PeerMessage` structs.
+    /// the provided callback. Messages are delivered via two complementary paths:
+    ///
+    /// 1. **WebSocket push (primary):** The BRC-103 general_msg_dispatcher fires the
+    ///    callback when the server broadcasts `sendMessage-{roomId}` via the WS connection.
+    ///
+    /// 2. **HTTP polling fallback:** A background task polls `/listMessages` every 2 seconds
+    ///    and fires the callback for any new messages not yet seen via the WS path. This
+    ///    handles server implementations that store messages without broadcasting via WS.
+    ///    The polling task stops automatically when `leave_room` removes the room from
+    ///    `joined_rooms`.
+    ///
+    /// Both paths deliver `PeerMessage` with decrypted body to the same callback.
     ///
     /// Establishes a WebSocket connection if one is not already active.
     /// `override_host` is reserved for future multi-host WS routing.
@@ -339,11 +351,66 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             let guard = self.ws_state.lock().await;
             if let Some(ref ws) = *guard {
                 ws.join_room(&room_id).await?;
-                ws.subscribe(event_key, on_message).await;
+                ws.subscribe(event_key, on_message.clone()).await;
             }
         }
 
-        self.joined_rooms.lock().await.insert(room_id);
+        self.joined_rooms.lock().await.insert(room_id.clone());
+
+        // Spawn a polling fallback task that periodically checks for new messages
+        // via HTTP. This complements the WS push path and handles server implementations
+        // that do not broadcast to room members via BRC-103 general messages.
+        //
+        // The poll interval is 2s — aggressive enough for interactive use without
+        // hammering the server. The task terminates when leave_room removes room_id
+        // from joined_rooms, or when the WS connection is disconnected.
+        let poll_auth_fetch = self.auth_fetch.clone();
+        let poll_joined_rooms = self.joined_rooms.clone();
+        let poll_host = self.host.clone();
+        let poll_message_box = message_box.to_string();
+        let poll_identity_key = identity_key.clone();
+        let poll_wallet = self.wallet.clone();
+        let poll_originator = self.originator.clone();
+        let poll_room_id = room_id.clone();
+        let poll_callback = on_message;
+
+        tokio::spawn(async move {
+            // Track message IDs delivered by this polling task to avoid duplicates.
+            // Note: the WS path and poll path may both fire for the same message;
+            // the callback is idempotent by design (callers use mpsc channels that
+            // simply buffer duplicates, or the application deduplicates by message_id).
+            // We only deduplicate within the poll path itself.
+            let mut seen_ids: HashSet<String> = HashSet::new();
+
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+                // Stop when the room is no longer active (leave_room was called)
+                if !poll_joined_rooms.lock().await.contains(&poll_room_id) {
+                    break;
+                }
+
+                // Poll /listMessages with authenticated HTTP
+                let result = poll_list_messages(
+                    &poll_auth_fetch,
+                    &poll_host,
+                    &poll_message_box,
+                    &poll_identity_key,
+                    &poll_wallet,
+                    poll_originator.as_deref(),
+                )
+                .await;
+
+                if let Ok(messages) = result {
+                    for msg in messages {
+                        if seen_ids.insert(msg.message_id.clone()) {
+                            poll_callback(msg);
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 
@@ -543,6 +610,88 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 // ---------------------------------------------------------------------------
 // Standalone helpers
 // ---------------------------------------------------------------------------
+
+/// Poll `/listMessages` for a given message box using a shared authenticated HTTP client.
+///
+/// This is used by the background polling task spawned in `listen_for_live_messages`
+/// to deliver messages as a fallback when the server does not broadcast via WS push.
+///
+/// Returns a `Vec<PeerMessage>` with decrypted bodies, or an empty vec on error.
+/// `accept_payments` is always false — the polling path does not handle delivery fees.
+async fn poll_list_messages<W>(
+    auth_fetch: &Arc<Mutex<AuthFetch<W>>>,
+    host: &str,
+    message_box: &str,
+    identity_key: &str,
+    wallet: &W,
+    originator: Option<&str>,
+) -> Result<Vec<PeerMessage>, MessageBoxError>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    let params = ListMessagesParams {
+        message_box: message_box.to_string(),
+    };
+    let body_bytes = serde_json::to_vec(&params)?;
+    let url = format!("{host}/listMessages");
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    let response = auth_fetch
+        .lock()
+        .await
+        .fetch(&url, "POST", Some(body_bytes), Some(headers))
+        .await
+        .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
+
+    if response.status < 200 || response.status >= 300 {
+        return Err(MessageBoxError::Http(response.status, url));
+    }
+
+    check_status_error(&response.body)?;
+
+    let list_response: ListMessagesResponse = serde_json::from_slice(&response.body)?;
+
+    let mut result = Vec::with_capacity(list_response.messages.len());
+    for msg in list_response.messages {
+        // Simple body extraction: if the body is a wrapped envelope, extract the message field.
+        let plain_body = extract_plain_body(&msg.body);
+        // Decrypt if encrypted
+        let decrypted = crate::encryption::try_decrypt_message(
+            wallet,
+            &plain_body,
+            &msg.sender,
+            originator,
+        )
+        .await;
+
+        result.push(PeerMessage {
+            message_id: msg.message_id,
+            sender: msg.sender,
+            recipient: identity_key.to_string(),
+            message_box: message_box.to_string(),
+            body: decrypted,
+        });
+    }
+
+    Ok(result)
+}
+
+/// Extract the plain message body from a potentially server-wrapped envelope.
+///
+/// The server sometimes wraps messages as `{"message": "...", "payment": {...}}`.
+/// This helper unwraps it. If the body isn't a wrapped envelope, returns it as-is.
+fn extract_plain_body(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(message) = v.get("message") {
+            return match message {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+        }
+    }
+    body.to_string()
+}
 
 /// Check if a successful (2xx) HTTP response body contains a server-level
 /// error indicator (`{"status": "error", "description": "..."}`).

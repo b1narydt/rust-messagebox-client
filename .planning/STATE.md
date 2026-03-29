@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 08-e2e-websocket-payment-validation 08-01-PLAN.md
-last_updated: "2026-03-29T20:30:56.722Z"
+stopped_at: Completed 08-e2e-websocket-payment-validation 08-04-PLAN.md
+last_updated: "2026-03-29T20:36:51.875Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 8
-  completed_phases: 7
+  completed_phases: 8
   total_plans: 19
-  completed_plans: 18
+  completed_plans: 19
   percent: 50
 ---
 
@@ -68,6 +68,7 @@ Progress: [█████░░░░░] 50%
 | Phase 08-e2e-websocket-payment-validation P03 | 8 | 1 tasks | 1 files |
 | Phase 08-e2e-websocket-payment-validation P02 | 5min | 2 tasks | 2 files |
 | Phase 08-e2e-websocket-payment-validation P01 | 95min | 2 tasks | 3 files |
+| Phase 08-e2e-websocket-payment-validation P04 | 3 | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -124,6 +125,7 @@ Recent decisions affecting current work:
 - [Phase 08-e2e-websocket-payment-validation]: test_rapid_sequential_sends uses HTTP send_message not send_live_message — HTTP is synchronous and reliable for message-count verification
 - [Phase 08-e2e-websocket-payment-validation P01]: Live Babbage server stores sendMessage payloads but does NOT broadcast via Socket.IO room push; HTTP polling every 2s is the primary delivery mechanism for listen_for_live_messages
 - [Phase 08-e2e-websocket-payment-validation P01]: auth_fetch and joined_rooms changed from Mutex<T> to Arc<Mutex<T>> to allow cloning into polling task; try_send (not blocking_send) required for mpsc channels inside async callbacks
+- [Phase 08-e2e-websocket-payment-validation]: PaymentToken fields are nested under custom_instructions (not top-level) — corrected from initial plan sketch to match actual type structure
 
 ### Roadmap Evolution
 
@@ -142,6 +144,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T20:30:56.717Z
-Stopped at: Completed 08-e2e-websocket-payment-validation 08-01-PLAN.md
+Last session: 2026-03-29T20:36:51.872Z
+Stopped at: Completed 08-e2e-websocket-payment-validation 08-04-PLAN.md
 Resume file: None

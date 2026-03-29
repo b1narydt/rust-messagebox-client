@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: milestone
 status: executing
-stopped_at: Completed 08-e2e-websocket-payment-validation 08-03-PLAN.md
-last_updated: "2026-03-29T19:32:15.651Z"
+stopped_at: Completed 08-e2e-websocket-payment-validation 08-02-PLAN.md
+last_updated: "2026-03-29T19:33:46.811Z"
 last_activity: 2026-03-26 — Plan 01-01 executed (crate scaffolding + encryption)
 progress:
   total_phases: 8
   completed_phases: 7
   total_plans: 19
-  completed_plans: 16
+  completed_plans: 17
   percent: 50
 ---
 
@@ -66,6 +66,7 @@ Progress: [█████░░░░░] 50%
 | Phase 07-brc-103-websocket-auth-transport P01 | 10 | 1 tasks | 2 files |
 | Phase 07-brc-103-websocket-auth-transport P02 | 4 | 2 tasks | 2 files |
 | Phase 08-e2e-websocket-payment-validation P03 | 8 | 1 tasks | 1 files |
+| Phase 08-e2e-websocket-payment-validation P02 | 5min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -118,6 +119,8 @@ Recent decisions affecting current work:
 - [Phase 07-brc-103-websocket-auth-transport]: general_msg_dispatcher is primary path for all application events (confirmed by TS source); on_any handlers are defensive fallbacks only
 - [Phase 07-brc-103-websocket-auth-transport]: reconnect(false) in ClientBuilder: BRC-103 requires fresh Peer + Transport on reconnect; transparent reconnect deferred to Phase 8
 - [Phase 08-e2e-websocket-payment-validation]: ArcHttpWallet wraps Arc<HttpWalletJson> — HttpWalletJson is non-Clone; Arc-wrapping is the established project convention for adding Clone to non-Clone SDK wallet types
+- [Phase 08-e2e-websocket-payment-validation]: is_ws_connected() added as pub async fn — test_socket() is #[cfg(test)] sync-only and unavailable in integration test crates
+- [Phase 08-e2e-websocket-payment-validation]: test_rapid_sequential_sends uses HTTP send_message not send_live_message — HTTP is synchronous and reliable for message-count verification
 
 ### Roadmap Evolution
 
@@ -136,6 +139,6 @@ None yet.
 
 ## Session Continuity
 
-Last session: 2026-03-29T19:32:15.648Z
-Stopped at: Completed 08-e2e-websocket-payment-validation 08-03-PLAN.md
+Last session: 2026-03-29T19:33:46.809Z
+Stopped at: Completed 08-e2e-websocket-payment-validation 08-02-PLAN.md
 Resume file: None

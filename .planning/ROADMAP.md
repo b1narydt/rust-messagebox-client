@@ -148,7 +148,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
   3. Edge cases tested: rapid sequential sends, large message bodies, permission denied flow, connect/disconnect cycles
   4. `examples/` directory contains runnable examples for messaging, live messaging, payments, and CommsLayer usage
   5. README updated with examples section
-**Plans:** 4 plans
+**Plans:** 2/4 plans executed
 
 Plans:
 - [ ] 08-01-PLAN.md — Fix and validate two-client live WebSocket messaging (diagnose, fix, bidirectional + join/leave tests)

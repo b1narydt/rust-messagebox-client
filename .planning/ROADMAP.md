@@ -126,7 +126,7 @@ Plans:
 ## Progress
 
 **Execution Order:**
-Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
+Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
@@ -137,3 +137,21 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 | 5. Overlay + Device Registration | 2/2 | Complete   | 2026-03-27 |
 | 6. Parity Verification | 3/3 | Complete   | 2026-03-27 |
 | 7. BRC-103 WebSocket Auth Transport | 2/2 | Complete   | 2026-03-28 |
+
+### Phase 8: E2E WebSocket + Payment Validation
+
+**Goal:** Prove every communication path works end-to-end between real peers on the live Babbage server — two-client live messaging, funded payment round-trips, edge cases, and ship runnable examples that serve as both documentation and regression tests
+**Depends on:** Phase 7
+**Success Criteria** (what must be TRUE):
+  1. Two clients can exchange live messages via WebSocket — Client A's subscription callback fires when Client B sends
+  2. Funded payment round-trip completes: create_payment_token → send_payment → list_incoming_payments → accept_payment with real satoshis via WalletClient
+  3. Edge cases tested: rapid sequential sends, large message bodies, permission denied flow, connect/disconnect cycles
+  4. `examples/` directory contains runnable examples for messaging, live messaging, payments, and CommsLayer usage
+  5. README updated with examples section
+**Plans:** 4 plans
+
+Plans:
+- [ ] 08-01-PLAN.md — Fix and validate two-client live WebSocket messaging (diagnose, fix, bidirectional + join/leave tests)
+- [ ] 08-02-PLAN.md — Edge case tests: rapid sequential sends, large message body, connect/disconnect cycle
+- [ ] 08-03-PLAN.md — Funded payment round-trip via HttpWalletJson (ArcHttpWallet wrapper + create/send/list/accept test)
+- [ ] 08-04-PLAN.md — Examples directory (4 runnable examples) and README update

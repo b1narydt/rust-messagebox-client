@@ -1083,6 +1083,225 @@ async fn test_two_client_live_messaging() {
     client_b.disconnect_web_socket().await.ok();
 }
 
+/// E2E bidirectional test: Client A and Client B each subscribe, then each sends to the other.
+/// Both must receive each other's message. Proves the polling fallback works in both directions.
+///
+/// Uses skip_encryption=true for diagnostic clarity.
+#[tokio::test]
+#[ignore]
+async fn test_bidirectional_live_messaging() {
+    use tokio::sync::mpsc;
+
+    let client_a = make_live_client();
+    let client_b = make_live_client();
+
+    let key_a = client_a.get_identity_key().await.expect("client A identity key");
+    let key_b = client_b.get_identity_key().await.expect("client B identity key");
+    println!("Client A key: {}...", &key_a[..12]);
+    println!("Client B key: {}...", &key_b[..12]);
+
+    let (tx_a, mut rx_a) = mpsc::channel::<bsv::remittance::PeerMessage>(4);
+    let (tx_b, mut rx_b) = mpsc::channel::<bsv::remittance::PeerMessage>(4);
+
+    // Both clients subscribe
+    let tx_a2 = tx_a.clone();
+    client_a
+        .listen_for_live_messages(
+            "e2e_bidir_inbox",
+            Arc::new(move |msg| {
+                println!("[A callback] sender={}..., body={}", &msg.sender[..12.min(msg.sender.len())], &msg.body);
+                let _ = tx_a2.try_send(msg);
+            }),
+            None,
+        )
+        .await
+        .expect("Client A listen_for_live_messages should succeed");
+
+    let tx_b2 = tx_b.clone();
+    client_b
+        .listen_for_live_messages(
+            "e2e_bidir_inbox",
+            Arc::new(move |msg| {
+                println!("[B callback] sender={}..., body={}", &msg.sender[..12.min(msg.sender.len())], &msg.body);
+                let _ = tx_b2.try_send(msg);
+            }),
+            None,
+        )
+        .await
+        .expect("Client B listen_for_live_messages should succeed");
+
+    // Wait 3s for both subscriptions to settle
+    println!("Waiting 3s for subscriptions to settle...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let uid = uuid_like_suffix();
+    let body_a_to_b = format!("hello-from-A-{uid}");
+    let body_b_to_a = format!("hello-from-B-{uid}");
+
+    // Client A sends to Client B
+    println!("Client A sending to B: {body_a_to_b}");
+    client_a
+        .send_live_message(&key_b, "e2e_bidir_inbox", &body_a_to_b, true, false, None, None)
+        .await
+        .expect("Client A send_live_message should succeed");
+
+    // Client B sends to Client A
+    println!("Client B sending to A: {body_b_to_a}");
+    client_b
+        .send_live_message(&key_a, "e2e_bidir_inbox", &body_b_to_a, true, false, None, None)
+        .await
+        .expect("Client B send_live_message should succeed");
+
+    // Client B receives A's message
+    println!("Waiting for Client B to receive A's message (up to 15s)...");
+    let recv_b = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(msg) = rx_b.recv().await {
+                if msg.body.contains(&uid) && msg.sender == key_a {
+                    return msg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("Client B must receive A's message within 15s");
+
+    assert_eq!(recv_b.sender, key_a, "message to B must be from A");
+    assert_eq!(recv_b.body, body_a_to_b, "body must match A's send");
+    println!("Client B received A's message OK");
+
+    // Client A receives B's message
+    println!("Waiting for Client A to receive B's message (up to 15s)...");
+    let recv_a = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(msg) = rx_a.recv().await {
+                if msg.body.contains(&uid) && msg.sender == key_b {
+                    return msg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("Client A must receive B's message within 15s");
+
+    assert_eq!(recv_a.sender, key_b, "message to A must be from B");
+    assert_eq!(recv_a.body, body_b_to_a, "body must match B's send");
+    println!("Client A received B's message OK");
+
+    println!("test_bidirectional_live_messaging PASSED");
+
+    // Cleanup
+    client_a.disconnect_web_socket().await.ok();
+    client_b.disconnect_web_socket().await.ok();
+}
+
+/// E2E join/leave room test: Client A subscribes, receives a message, then calls leave_room.
+/// After leaving, Client B sends another message. Client A must NOT receive the second message
+/// (5-second timeout expected).
+///
+/// This proves subscription lifecycle: messages stop arriving after leave_room.
+#[tokio::test]
+#[ignore]
+async fn test_join_leave_room() {
+    use tokio::sync::mpsc;
+
+    let client_a = make_live_client();
+    let client_b = make_live_client();
+
+    let key_a = client_a.get_identity_key().await.expect("client A identity key");
+    println!("Client A key: {}...", &key_a[..12]);
+
+    let (msg_tx, mut msg_rx) = mpsc::channel::<bsv::remittance::PeerMessage>(8);
+
+    // Client A subscribes
+    let tx = msg_tx.clone();
+    client_a
+        .listen_for_live_messages(
+            "e2e_joinleave_inbox",
+            Arc::new(move |msg| {
+                println!("[JL callback] received: body={}", &msg.body);
+                let _ = tx.try_send(msg);
+            }),
+            None,
+        )
+        .await
+        .expect("Client A listen_for_live_messages should succeed");
+
+    println!("Waiting 3s for subscription to settle...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let uid = uuid_like_suffix();
+
+    // Phase 1: Client B sends message 1 — Client A should receive it
+    let body1 = format!("msg1-{uid}");
+    println!("Phase 1: Client B sending message 1: {body1}");
+    client_b
+        .send_live_message(&key_a, "e2e_joinleave_inbox", &body1, true, false, None, None)
+        .await
+        .expect("Client B send message 1 should succeed");
+
+    let received1 = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        loop {
+            if let Some(msg) = msg_rx.recv().await {
+                if msg.body.contains(&uid) {
+                    return msg;
+                }
+            }
+        }
+    })
+    .await
+    .expect("Client A must receive message 1 within 15s");
+
+    assert_eq!(received1.body, body1, "message 1 body must match");
+    println!("Phase 1 PASSED: Client A received message 1");
+
+    // Phase 2: Client A leaves the room
+    println!("Phase 2: Client A leaving room...");
+    client_a
+        .leave_room("e2e_joinleave_inbox", None)
+        .await
+        .expect("leave_room should succeed");
+    println!("Phase 2: Client A left room. Waiting 1s...");
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+    // Phase 3: Client B sends message 2 — Client A should NOT receive it
+    let body2 = format!("msg2-{uid}");
+    println!("Phase 3: Client B sending message 2: {body2}");
+    client_b
+        .send_live_message(&key_a, "e2e_joinleave_inbox", &body2, true, false, None, None)
+        .await
+        .expect("Client B send message 2 should succeed");
+
+    // Expect timeout — no message should arrive after leave_room
+    let maybe_received2 = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        async {
+            loop {
+                if let Some(msg) = msg_rx.recv().await {
+                    // Only count messages from this test run (with our uid)
+                    if msg.body.contains(&uid) && msg.body != body1 {
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+    )
+    .await;
+
+    assert!(
+        maybe_received2.is_err(),
+        "Client A must NOT receive message 2 after leave_room, but got: {:?}",
+        maybe_received2
+    );
+    println!("Phase 3 PASSED: Client A did not receive message 2 after leave_room (timeout as expected)");
+
+    println!("test_join_leave_room PASSED");
+
+    // Cleanup
+    client_a.disconnect_web_socket().await.ok();
+    client_b.disconnect_web_socket().await.ok();
+}
+
 // ===========================================================================
 // Phase 8: Edge Cases
 // ===========================================================================

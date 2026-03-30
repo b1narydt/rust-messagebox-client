@@ -7,12 +7,13 @@ Six phases translate the TypeScript `@bsv/message-box-client` v1.3.0 into a prod
 ## Phases
 
 - [x] **Phase 1: HTTP Core + Foundation** - Crate scaffolding, encryption helpers, and basic authenticated HTTP messaging (send, list lite, acknowledge) (completed 2026-03-26)
-- [ ] **Phase 2: CommsLayer Adapter + Permissions** - `RemittanceAdapter` implementing `CommsLayer` trait, permission management, notification convenience methods
-- [ ] **Phase 3: PeerPay** - Payment token create/send/accept/reject/list and `list_messages` with auto-internalization
+- [x] **Phase 2: CommsLayer Adapter + Permissions** - `RemittanceAdapter` implementing `CommsLayer` trait, permission management, notification convenience methods (completed 2026-03-27)
+- [x] **Phase 3: PeerPay** - Payment token create/send/accept/reject/list and `list_messages` with auto-internalization (completed 2026-03-27)
 - [x] **Phase 4: WebSocket Live Messaging** - Room-based live messaging with HTTP fallback and live payment listener (completed 2026-03-27)
 - [x] **Phase 5: Overlay + Device Registration** - Host advertisement, overlay resolution, `init()`, multi-host deduplication, device registration (completed 2026-03-27)
 - [x] **Phase 6: Parity Verification** - Close all API surface gaps, add missing methods/params, then verify full parity via audit and tests (completed 2026-03-27)
 - [x] **Phase 7: BRC-103 WebSocket Auth Transport** - SocketIOTransport implementing SDK Transport trait, Peer-based mutual auth, signed authMessage envelopes (completed 2026-03-28)
+- [x] **Phase 8: E2E WebSocket + Payment Validation** - Two-client live messaging, funded payment round-trips, edge case tests, runnable examples (completed 2026-03-30)
 
 ## Phase Details
 
@@ -132,11 +133,12 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 |-------|----------------|--------|-----------|
 | 1. HTTP Core + Foundation | 2/2 | Complete   | 2026-03-26 |
 | 2. CommsLayer Adapter + Permissions | 2/2 | Complete | 2026-03-26 |
-| 3. PeerPay | 1/2 | In Progress|  |
+| 3. PeerPay | 2/2 | Complete   | 2026-03-27 |
 | 4. WebSocket Live Messaging | 2/2 | Complete   | 2026-03-27 |
 | 5. Overlay + Device Registration | 2/2 | Complete   | 2026-03-27 |
 | 6. Parity Verification | 3/3 | Complete   | 2026-03-27 |
 | 7. BRC-103 WebSocket Auth Transport | 2/2 | Complete   | 2026-03-28 |
+| 8. E2E WebSocket + Payment Validation | 4/4 | Complete   | 2026-03-30 |
 
 ### Phase 8: E2E WebSocket + Payment Validation
 
@@ -151,7 +153,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8
 **Plans:** 4/4 plans complete
 
 Plans:
-- [ ] 08-01-PLAN.md — Fix and validate two-client live WebSocket messaging (diagnose, fix, bidirectional + join/leave tests)
-- [ ] 08-02-PLAN.md — Edge case tests: rapid sequential sends, large message body, connect/disconnect cycle
-- [ ] 08-03-PLAN.md — Funded payment round-trip via HttpWalletJson (ArcHttpWallet wrapper + create/send/list/accept test)
-- [ ] 08-04-PLAN.md — Examples directory (4 runnable examples) and README update
+- [x] 08-01-PLAN.md — Fix and validate two-client live WebSocket messaging (diagnose, fix, bidirectional + join/leave tests)
+- [x] 08-02-PLAN.md — Edge case tests: rapid sequential sends, large message body, connect/disconnect cycle
+- [x] 08-03-PLAN.md — Funded payment round-trip via HttpWalletJson (ArcHttpWallet wrapper + create/send/list/accept test)
+- [x] 08-04-PLAN.md — Examples directory (4 runnable examples) and README update

@@ -7,7 +7,7 @@ use bsv::remittance::types::PeerMessage;
 use bsv::script::templates::{P2PKH, ScriptTemplateLock};
 use bsv::wallet::interfaces::{
     CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
-    InternalizeActionArgs, InternalizeOutput, Payment, WalletInterface,
+    InternalizeActionArgs, InternalizeOutput, Payment, SignActionArgs, WalletInterface,
 };
 use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
 
@@ -109,6 +109,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     labels: vec!["peerpay".to_string()],
                     options: Some(CreateActionOptions {
                         randomize_outputs: BooleanDefaultTrue(Some(false)),
+                        sign_and_process: BooleanDefaultTrue(None),
+                        accept_delayed_broadcast: BooleanDefaultTrue(None),
                         ..Default::default()
                     }),
                     reference: None,
@@ -118,10 +120,31 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
             .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
 
-        // Step 5: extract transaction bytes
-        let tx = create_result
-            .tx
-            .ok_or_else(|| MessageBoxError::Wallet("create_action returned no tx".to_string()))?;
+        // Step 5: handle two-step flow — if wallet returns signable_transaction,
+        // call sign_action to complete it (BRC-100 pattern for non-admin originators)
+        let tx = if let Some(tx_bytes) = create_result.tx {
+            tx_bytes
+        } else if let Some(signable) = create_result.signable_transaction {
+            let sign_result = self
+                .wallet()
+                .sign_action(
+                    SignActionArgs {
+                        reference: signable.reference,
+                        spends: std::collections::HashMap::new(),
+                        options: None,
+                    },
+                    self.originator(),
+                )
+                .await
+                .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+            sign_result
+                .tx
+                .ok_or_else(|| MessageBoxError::Wallet("sign_action returned no tx".to_string()))?
+        } else {
+            return Err(MessageBoxError::Wallet(
+                "create_action returned neither tx nor signable_transaction".to_string(),
+            ));
+        };
 
         // NOTE: outputIndex is NOT set at creation — matches TS behavior.
         // accept_payment uses unwrap_or(0) to default to 0.
@@ -188,11 +211,21 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Internalize a received payment and acknowledge the message.
     ///
-    /// Uses `.as_bytes().to_vec()` for derivation prefix/suffix — NOT base64 decoded.
-    /// This matches the TS internalize call which passes the raw strings as byte sequences.
+    /// Base64-decodes derivation_prefix/suffix back to raw bytes so the SDK's
+    /// bytes_as_base64 serde re-encodes them to the original base64 strings
+    /// that BSV Desktop expects.
     pub async fn accept_payment(&self, payment: &IncomingPayment) -> Result<(), MessageBoxError> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
         let sender_pk = PublicKey::from_string(&payment.sender)
             .map_err(|e| MessageBoxError::Wallet(format!("invalid sender key: {e}")))?;
+
+        let prefix_bytes = STANDARD
+            .decode(&payment.token.custom_instructions.derivation_prefix)
+            .map_err(|e| MessageBoxError::Wallet(format!("base64 decode prefix: {e}")))?;
+        let suffix_bytes = STANDARD
+            .decode(&payment.token.custom_instructions.derivation_suffix)
+            .map_err(|e| MessageBoxError::Wallet(format!("base64 decode suffix: {e}")))?;
 
         self.wallet()
             .internalize_action(
@@ -204,18 +237,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     outputs: vec![InternalizeOutput::WalletPayment {
                         output_index: payment.token.output_index.unwrap_or(0),
                         payment: Payment {
-                            derivation_prefix: payment
-                                .token
-                                .custom_instructions
-                                .derivation_prefix
-                                .as_bytes()
-                                .to_vec(),
-                            derivation_suffix: payment
-                                .token
-                                .custom_instructions
-                                .derivation_suffix
-                                .as_bytes()
-                                .to_vec(),
+                            derivation_prefix: prefix_bytes,
+                            derivation_suffix: suffix_bytes,
                             sender_identity_key: sender_pk,
                         },
                     }],
@@ -564,27 +587,26 @@ mod tests {
         assert_eq!(payments[0].token.amount, 1000);
     }
 
-    /// accept_payment uses .as_bytes().to_vec() for derivation prefix/suffix.
+    /// accept_payment base64-decodes derivation prefix/suffix before passing to SDK.
     ///
-    /// Verifies the Payment struct gets raw string bytes (not base64-decoded).
+    /// The SDK's bytes_as_base64 serde then re-encodes them to the original strings.
     #[test]
-    fn accept_payment_builds_correct_internalize_args() {
-        let prefix = "my-derivation-prefix";
-        let suffix = "my-derivation-suffix";
+    fn accept_payment_base64_round_trip() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
 
-        // as_bytes().to_vec() gives raw UTF-8 bytes of the string
-        let prefix_bytes = prefix.as_bytes().to_vec();
-        let suffix_bytes = suffix.as_bytes().to_vec();
+        // create_nonce returns base64 strings like these
+        let prefix = "dGVzdC1wcmVmaXg="; // base64("test-prefix")
+        let suffix = "dGVzdC1zdWZmaXg="; // base64("test-suffix")
 
-        // Verify these are the raw string bytes, not base64-decoded
-        assert_eq!(prefix_bytes, b"my-derivation-prefix".to_vec());
-        assert_eq!(suffix_bytes, b"my-derivation-suffix".to_vec());
+        // accept_payment decodes to raw bytes
+        let prefix_bytes = STANDARD.decode(prefix).unwrap();
+        let suffix_bytes = STANDARD.decode(suffix).unwrap();
+        assert_eq!(prefix_bytes, b"test-prefix");
+        assert_eq!(suffix_bytes, b"test-suffix");
 
-        // Verify round-trip: bytes back to string
-        assert_eq!(
-            String::from_utf8(prefix_bytes).unwrap(),
-            prefix
-        );
+        // SDK's bytes_as_base64 serde would re-encode back to the original strings
+        let re_encoded = STANDARD.encode(&prefix_bytes);
+        assert_eq!(re_encoded, prefix, "round-trip must produce original base64");
     }
 
     /// Construct IncomingPayment from a PaymentToken, verify all fields preserved.

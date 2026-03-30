@@ -132,6 +132,7 @@ dependencies = [
 [[package]]
 name = "bsv-sdk"
 version = "0.1.76"
+source = "git+https://github.com/b1narydt/bsv-rust-sdk?branch=main#a7d922b99609c832eac70b4a29ce30748907bbe3"
 dependencies = [
  "async-trait",
  "futures-util",

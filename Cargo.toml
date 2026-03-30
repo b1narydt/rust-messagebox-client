@@ -13,8 +13,7 @@ categories = ["cryptography", "network-programming"]
 name = "bsv_messagebox_client"
 
 [dependencies]
-# TODO: revert to git after b1narydt/bsv-rust-sdk#8 is merged (fixes HttpWalletJson serde)
-bsv-sdk = { path = "/tmp/bsv-rust-sdk-fix", features = ["network"] }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

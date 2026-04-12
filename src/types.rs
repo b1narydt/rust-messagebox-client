@@ -382,6 +382,85 @@ pub struct WsSendMessagePayload {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7 — Payment Request types (PeerPay Request System)
+// ---------------------------------------------------------------------------
+
+/// Message box names for the payment request system.
+pub const PAYMENT_REQUESTS_MESSAGEBOX: &str = "payment_requests";
+pub const PAYMENT_REQUEST_RESPONSES_MESSAGEBOX: &str = "payment_request_responses";
+
+/// Default limits for filtering incoming payment requests.
+pub const DEFAULT_PAYMENT_REQUEST_MIN_AMOUNT: u64 = 1000;
+pub const DEFAULT_PAYMENT_REQUEST_MAX_AMOUNT: u64 = 10_000_000;
+
+/// A payment request message sent to a recipient's `payment_requests` inbox.
+///
+/// Discriminated union: if `cancelled` is `Some(true)`, this is a cancellation
+/// message and `amount`/`description`/`expires_at` will be absent.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentRequestMessage {
+    pub request_id: String,
+    pub sender_identity_key: String,
+    pub request_proof: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<bool>,
+}
+
+/// Response to a payment request, sent to the requester's
+/// `payment_request_responses` inbox.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PaymentRequestResponse {
+    pub request_id: String,
+    pub status: String, // "paid" | "declined"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount_paid: Option<u64>,
+}
+
+/// A validated incoming payment request (after filtering and HMAC verification).
+#[derive(Clone, Debug)]
+pub struct IncomingPaymentRequest {
+    pub message_id: String,
+    pub sender: String,
+    pub request_id: String,
+    pub amount: u64,
+    pub description: String,
+    pub expires_at: u64,
+}
+
+/// Optional limits for filtering incoming payment requests.
+#[derive(Clone, Debug)]
+pub struct PaymentRequestLimits {
+    pub min_amount: u64,
+    pub max_amount: u64,
+}
+
+impl Default for PaymentRequestLimits {
+    fn default() -> Self {
+        Self {
+            min_amount: DEFAULT_PAYMENT_REQUEST_MIN_AMOUNT,
+            max_amount: DEFAULT_PAYMENT_REQUEST_MAX_AMOUNT,
+        }
+    }
+}
+
+/// Result returned from `request_payment`.
+#[derive(Clone, Debug)]
+pub struct PaymentRequestResult {
+    pub request_id: String,
+    pub request_proof: String,
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3 — PeerPay payment types
 // ---------------------------------------------------------------------------
 

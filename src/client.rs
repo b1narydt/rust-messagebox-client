@@ -442,6 +442,19 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
+        // If no host override, resolve the recipient's host via overlay.
+        // If the recipient is on a DIFFERENT host than ours, we must use HTTP
+        // (send_message with overlay resolution) since our WebSocket is only
+        // connected to self.host.
+        if override_host.is_none() {
+            let resolved = self.resolve_host_for_recipient(recipient).await
+                .unwrap_or_else(|_| self.host().to_string());
+            if resolved.trim() != self.host().trim() {
+                // Recipient is on a different MessageBox server — use HTTP with overlay
+                return self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await;
+            }
+        }
+
         // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
         // before checking socket.connected.
         if self.ensure_ws_connected(override_host).await.is_err() {

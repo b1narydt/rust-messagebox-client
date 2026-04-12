@@ -59,49 +59,6 @@ fn make_data_push(data: &[u8]) -> ScriptChunk {
     }
 }
 
-/// Build a PushDrop locking script from data fields and a compressed public key.
-///
-/// Produces the chunk layout:
-///   `<field_0> <field_1> ... <field_N-1> OP_2DROP* OP_DROP? <pubkey> OP_CHECKSIG`
-///
-/// This mirrors `PushDrop::lock()` from the SDK but accepts a raw public key
-/// byte slice instead of a `PrivateKey`, enabling wallet-derived keys to be
-/// embedded without exposing private key material.
-pub fn build_pushdrop_lock_from_fields_and_pubkey(
-    fields: &[Vec<u8>],
-    pubkey_bytes: &[u8],
-) -> Result<LockingScript, MessageBoxError> {
-    if fields.is_empty() {
-        return Err(MessageBoxError::Overlay(
-            "PushDrop: at least one data field required".into(),
-        ));
-    }
-
-    let mut chunks = Vec::new();
-
-    // Push each field onto the script
-    for field in fields {
-        chunks.push(make_data_push(field));
-    }
-
-    // Drop fields with OP_2DROP pairs then one OP_DROP if odd
-    let n = fields.len();
-    for _ in 0..n / 2 {
-        chunks.push(ScriptChunk::new_opcode(Op::Op2Drop));
-    }
-    for _ in 0..n % 2 {
-        chunks.push(ScriptChunk::new_opcode(Op::OpDrop));
-    }
-
-    // Push the public key and OP_CHECKSIG
-    chunks.push(ScriptChunk::new_raw(
-        pubkey_bytes.len() as u8,
-        Some(pubkey_bytes.to_vec()),
-    ));
-    chunks.push(ScriptChunk::new_opcode(Op::OpCheckSig));
-
-    Ok(LockingScript::from_script(Script::from_chunks(chunks)))
-}
 
 // ---------------------------------------------------------------------------
 // MessageBoxClient impl — host resolution methods
@@ -151,19 +108,27 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
 
+        let question = LookupQuestion {
+            service: "ls_messagebox".to_string(),
+            query: query_obj,
+        };
+
+        // The SLAP trackers serve as universal overlay lookup hosts. Services
+        // like ls_messagebox may not have dedicated SLAP registrations, so we
+        // add the default SLAP tracker URLs as host_overrides for ls_messagebox.
+        // This lets the resolver query them directly without SLAP→host discovery.
+        let mut host_overrides = std::collections::HashMap::new();
+        let tracker_urls = self.network.default_slap_trackers();
+        host_overrides.insert("ls_messagebox".to_string(), tracker_urls);
+
         let resolver = LookupResolver::new(LookupResolverConfig {
             network: self.network.clone(),
+            host_overrides,
             ..Default::default()
         });
 
         let answer = resolver
-            .query(
-                &LookupQuestion {
-                    service: "ls_messagebox".to_string(),
-                    query: query_obj,
-                },
-                None,
-            )
+            .query(&question, None)
             .await
             .map_err(|e| MessageBoxError::Overlay(e.to_string()))?;
 
@@ -282,9 +247,63 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let id_key_bytes = hex::decode(&identity_key)
             .map_err(|e| MessageBoxError::Overlay(format!("hex decode identity key: {e}")))?;
         let host_bytes = host.as_bytes().to_vec();
-        let fields = vec![id_key_bytes, host_bytes];
 
-        let locking_script = build_pushdrop_lock_from_fields_and_pubkey(&fields, &pubkey_bytes)?;
+        // Sign the concatenated field data (matches TS PushDrop.lock with includeSignature=true)
+        let data_to_sign: Vec<u8> = [id_key_bytes.as_slice(), host_bytes.as_slice()].concat();
+        let sig_result = self
+            .wallet()
+            .create_signature(
+                bsv::wallet::interfaces::CreateSignatureArgs {
+                    data: Some(data_to_sign),
+                    hash_to_directly_sign: None,
+                    protocol_id: Protocol {
+                        security_level: 1,
+                        protocol: "messagebox advertisement".to_string(),
+                    },
+                    key_id: "1".to_string(),
+                    counterparty: Counterparty {
+                        counterparty_type: CounterpartyType::Anyone,
+                        public_key: None,
+                    },
+                    privileged: false,
+                    privileged_reason: None,
+                    seek_permission: None,
+                },
+                self.originator(),
+            )
+            .await
+            .map_err(|e| MessageBoxError::Overlay(format!("sign fields: {e}")))?;
+
+        // Build PushDrop locking script using SDK's PushDrop template.
+        // We use a dummy PrivateKey(1) for PushDrop::new since we only need
+        // the script structure — the actual locking key is the wallet-derived
+        // pubkey which we embed by replacing the dummy pubkey in the output.
+        // The signature field from wallet.create_signature() is included as
+        // the last data field, matching the TS SDK's includeSignature=true.
+        let fields = vec![id_key_bytes, host_bytes, sig_result.signature];
+
+        // Build the locking script with "before" position using the derived pubkey.
+        // PushDrop template needs a PrivateKey, but we can build the chunks directly
+        // since we have the public key from wallet.get_public_key().
+        use bsv::script::templates::ScriptTemplateLock;
+        let locking_script = {
+            // Use PrivateKey(1) as dummy — we'll replace the pubkey
+            let mut dummy_buf = [0u8; 32];
+            dummy_buf[31] = 1;
+            let dummy_key = bsv::primitives::private_key::PrivateKey::from_bytes(&dummy_buf)
+                .map_err(|e| MessageBoxError::Overlay(format!("dummy key: {e}")))?;
+            let pd = PushDrop::new(fields, dummy_key);
+            let script = pd.lock()
+                .map_err(|e| MessageBoxError::Overlay(format!("PushDrop lock: {e}")))?;
+
+            // Replace the dummy pubkey (chunk 0) with the wallet-derived pubkey
+            let mut chunks = script.chunks().to_vec();
+            chunks[0] = ScriptChunk::new_raw(
+                pubkey_bytes.len() as u8,
+                Some(pubkey_bytes),
+            );
+            LockingScript::from_script(Script::from_chunks(chunks))
+        };
 
         // Create the overlay advertisement transaction
         let create_result = self
@@ -624,58 +643,6 @@ mod tests {
         )
     }
 
-    // -----------------------------------------------------------------------
-    // Task 1 tests
-    // -----------------------------------------------------------------------
-
-    /// `build_pushdrop_lock_from_fields_and_pubkey` with 2 fields must produce exactly
-    /// 5 chunks: field0, field1, OP_2DROP, pubkey, OP_CHECKSIG.
-    #[test]
-    fn test_build_pushdrop_lock_field_layout() {
-        let field0 = vec![0x03u8; 33]; // fake 33-byte compressed pubkey as first field
-        let field1 = b"https://example.com".to_vec();
-        let pubkey = vec![0x02u8; 33]; // fake compressed pubkey
-
-        let lock = build_pushdrop_lock_from_fields_and_pubkey(
-            &[field0, field1],
-            &pubkey,
-        )
-        .unwrap();
-
-        let chunks = lock.chunks();
-        // 2 data fields + 1 OP_2DROP + pubkey push + OP_CHECKSIG = 5 chunks
-        assert_eq!(chunks.len(), 5, "expected 5 chunks for 2-field PushDrop");
-
-        // data pushes have Some(data)
-        assert!(chunks[0].data.is_some(), "chunk 0 must be a data push");
-        assert!(chunks[1].data.is_some(), "chunk 1 must be a data push");
-        // OP_2DROP
-        assert_eq!(chunks[2].op, Op::Op2Drop, "chunk 2 must be OP_2DROP");
-        // pubkey data push
-        assert!(chunks[3].data.is_some(), "chunk 3 must be pubkey push");
-        // OP_CHECKSIG
-        assert_eq!(chunks[4].op, Op::OpCheckSig, "chunk 4 must be OP_CHECKSIG");
-    }
-
-    /// The PushDrop locking script must round-trip: decode recovers the original fields.
-    #[test]
-    fn test_build_pushdrop_lock_round_trip() {
-        let field0 = b"deadbeef01020304".to_vec();
-        let field1 = b"https://messagebox.example.com".to_vec();
-        let pubkey = vec![0x02u8; 33];
-
-        let lock = build_pushdrop_lock_from_fields_and_pubkey(
-            &[field0.clone(), field1.clone()],
-            &pubkey,
-        )
-        .unwrap();
-
-        let decoded = PushDrop::decode(&lock).expect("PushDrop::decode failed");
-        assert_eq!(decoded.fields.len(), 2, "should recover 2 fields");
-        assert_eq!(decoded.fields[0], field0, "field 0 must match");
-        assert_eq!(decoded.fields[1], field1, "field 1 must match");
-    }
-
     /// `resolve_host_for_recipient` falls back to `self.host` when overlay returns empty.
     ///
     /// With Network::Mainnet, `query_advertisements` will fail to reach SLAP trackers
@@ -689,36 +656,6 @@ mod tests {
             .await
             .expect("should not error");
         assert_eq!(host, "https://example.com", "must fall back to self.host");
-    }
-
-    // -----------------------------------------------------------------------
-    // Task 2 tests
-    // -----------------------------------------------------------------------
-
-    /// Verify PushDrop field round-trip for the anoint_host field layout.
-    ///
-    /// fields[0] = identity key bytes (33 bytes), fields[1] = host URL bytes
-    #[test]
-    fn test_anoint_host_pushdrop_fields() {
-        // identity key as raw bytes (hex::decode from a fake 33-byte hex pubkey)
-        let id_key_bytes = vec![0x02u8; 33];
-        let host_bytes = b"https://my.messagebox.host".to_vec();
-        let pubkey = vec![0x03u8; 33];
-
-        let lock = build_pushdrop_lock_from_fields_and_pubkey(
-            &[id_key_bytes.clone(), host_bytes.clone()],
-            &pubkey,
-        )
-        .unwrap();
-
-        let decoded = PushDrop::decode(&lock).expect("PushDrop::decode failed");
-        assert_eq!(decoded.fields[0], id_key_bytes, "identity key field must match");
-        assert_eq!(decoded.fields[1], host_bytes, "host field must match");
-        assert_eq!(
-            String::from_utf8(decoded.fields[1].clone()).unwrap(),
-            "https://my.messagebox.host",
-            "host field must be valid UTF-8"
-        );
     }
 
     /// revoke_host_advertisement builds an outpoint as "{txid}.{output_index}".

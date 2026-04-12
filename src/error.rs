@@ -24,4 +24,6 @@ pub enum MessageBoxError {
     WebSocket(String),
     #[error("overlay error: {0}")]
     Overlay(String),
+    #[error("validation error: {0}")]
+    Validation(String),
 }

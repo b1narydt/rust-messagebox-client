@@ -4,6 +4,7 @@ pub mod encryption;
 pub mod error;
 pub mod host_resolution;
 pub mod http_ops;
+pub mod payment_requests;
 pub mod peer_pay;
 pub mod permissions;
 pub mod socket_transport;

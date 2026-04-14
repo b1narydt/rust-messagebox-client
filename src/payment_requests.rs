@@ -530,6 +530,31 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         Ok(responses)
     }
 
+    /// Listen for live payment request responses via WebSocket.
+    ///
+    /// Wraps `listen_for_live_messages` on the `payment_request_responses` inbox.
+    /// Unparseable messages are silently skipped (safeParse behavior).
+    ///
+    /// Matches TS `PeerPayClient.listenForLivePaymentRequestResponses()`.
+    pub async fn listen_for_live_payment_request_responses(
+        &self,
+        on_response: Arc<dyn Fn(PaymentRequestResponse) + Send + Sync>,
+        override_host: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
+        let wrapper: Arc<dyn Fn(PeerMessage) + Send + Sync> = Arc::new(move |msg: PeerMessage| {
+            if let Ok(response) = serde_json::from_str::<PaymentRequestResponse>(&msg.body) {
+                on_response(response);
+            }
+        });
+
+        self.listen_for_live_messages(
+            PAYMENT_REQUEST_RESPONSES_MESSAGEBOX,
+            wrapper,
+            override_host,
+        )
+        .await
+    }
+
     // -----------------------------------------------------------------------
     // Permission helpers
     // -----------------------------------------------------------------------

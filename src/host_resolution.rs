@@ -369,7 +369,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         broadcaster
             .broadcast_beef(beef_bytes)
             .await
-            .map_err(|e| MessageBoxError::Overlay(format!("{e:?}")))?;
+            .map_err(|e| MessageBoxError::Overlay(format!("broadcast failed: {}", e.description)))?;
 
         Ok(txid)
     }
@@ -574,7 +574,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         broadcaster
             .broadcast_beef(signed_bytes)
             .await
-            .map_err(|e| MessageBoxError::Overlay(format!("{e:?}")))?;
+            .map_err(|e| MessageBoxError::Overlay(format!("broadcast failed: {}", e.description)))?;
 
         Ok(txid)
     }

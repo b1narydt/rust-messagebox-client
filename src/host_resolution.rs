@@ -21,7 +21,6 @@ use bsv::services::overlay_tools::{
     LookupResolver, LookupResolverConfig, TopicBroadcaster, TopicBroadcasterConfig,
 };
 use bsv::services::overlay_tools::{LookupAnswer, LookupQuestion};
-use bsv::transaction::broadcaster::Broadcaster;
 use bsv::transaction::Transaction;
 use bsv::wallet::interfaces::{
     CreateActionArgs, CreateActionInput, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
@@ -337,15 +336,23 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
             .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
 
-        // CRITICAL: Transaction::from_beef takes a hex string, not raw bytes.
-        // create_result.tx contains BEEF bytes — encode to hex first.
+        // create_action returns BEEF bytes. Parse to Transaction only for
+        // the txid — broadcast the original BEEF bytes directly to avoid
+        // losing the source transaction chain.
         let beef_bytes = create_result
             .tx
             .ok_or_else(|| MessageBoxError::Overlay("create_action returned no tx".into()))?;
-        let tx = Transaction::from_beef(&hex::encode(&beef_bytes))
+        let beef_hex = hex::encode(&beef_bytes);
+        let tx = Transaction::from_beef(&beef_hex)
             .map_err(|e| MessageBoxError::Overlay(format!("parse BEEF: {e}")))?;
+        let txid = tx
+            .id()
+            .map_err(|e| MessageBoxError::Overlay(format!("tx.id(): {e}")))?;
 
-        // Broadcast via TopicBroadcaster — tm_messagebox topic per Pitfall 4
+        // Broadcast the original BEEF bytes via TopicBroadcaster.
+        // We use broadcast_beef() to pass pre-built BEEF directly,
+        // avoiding the Transaction → to_beef() round-trip which loses
+        // source transactions.
         let broadcaster = TopicBroadcaster::new(
             vec!["tm_messagebox".to_string()],
             TopicBroadcasterConfig {
@@ -360,14 +367,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         .map_err(|e| MessageBoxError::Overlay(format!("build broadcaster: {e}")))?;
 
         broadcaster
-            .broadcast(&tx)
+            .broadcast_beef(beef_bytes)
             .await
             .map_err(|e| MessageBoxError::Overlay(format!("{e:?}")))?;
-
-        // tx.id() returns Result<String> directly — no "hex" arg unlike TS
-        let txid = tx
-            .id()
-            .map_err(|e| MessageBoxError::Overlay(format!("tx.id(): {e}")))?;
 
         Ok(txid)
     }
@@ -544,12 +546,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
             .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
 
-        // Step 7: Convert signed BEEF to Transaction and broadcast
+        // Step 7: Broadcast signed BEEF directly (avoids from_beef → to_beef round-trip)
         let signed_bytes = sign_result
             .tx
             .ok_or_else(|| MessageBoxError::Overlay("sign_action returned no tx".into()))?;
+
+        // Parse only for the txid — broadcast the original BEEF bytes.
         let signed_tx = Transaction::from_beef(&hex::encode(&signed_bytes))
             .map_err(|e| MessageBoxError::Overlay(format!("parse signed tx: {e}")))?;
+        let txid = signed_tx
+            .id()
+            .map_err(|e| MessageBoxError::Overlay(format!("signed_tx.id(): {e}")))?;
 
         let broadcaster = TopicBroadcaster::new(
             vec!["tm_messagebox".to_string()],
@@ -565,13 +572,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         .map_err(|e| MessageBoxError::Overlay(format!("build broadcaster: {e}")))?;
 
         broadcaster
-            .broadcast(&signed_tx)
+            .broadcast_beef(signed_bytes)
             .await
             .map_err(|e| MessageBoxError::Overlay(format!("{e:?}")))?;
-
-        let txid = signed_tx
-            .id()
-            .map_err(|e| MessageBoxError::Overlay(format!("signed_tx.id(): {e}")))?;
 
         Ok(txid)
     }

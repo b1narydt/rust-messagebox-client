@@ -195,7 +195,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         recipient: &str,
     ) -> Result<String, MessageBoxError> {
         let ads = self.query_advertisements(Some(recipient), None).await?;
-        if let Some(ad) = ads.into_iter().next() {
+        // Use the most recent advertisement (last in the list) — earlier entries
+        // may be stale from prior hosts that haven't been revoked yet.
+        if let Some(ad) = ads.into_iter().last() {
             Ok(ad.host)
         } else {
             Ok(self.host().to_string())

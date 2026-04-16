@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
-use rust_socketio::{Event, Payload};
+use rust_socketio::{Event, Payload, TransportType};
 use serde_json::json;
 use tokio::sync::{oneshot, Mutex};
 use tokio::sync::mpsc;
@@ -206,6 +206,11 @@ impl MessageBoxWebSocket {
             // Disable auto-reconnect for v1 — reconnect requires fresh Peer + Transport.
             // TODO: Phase 8 — implement transparent BRC-103 reconnect
             .reconnect(false)
+            // Force direct WebSocket transport. Skipping the polling→WS upgrade
+            // avoids a known race in rust_socketio 0.6.0 against strict Engine.IO
+            // v4 servers (socketioxide backing `message.b1nary.cloud`). Direct WS
+            // 101 upgrade is confirmed working against the server.
+            .transport_type(TransportType::Websocket)
             .connect()
             .await
             .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;

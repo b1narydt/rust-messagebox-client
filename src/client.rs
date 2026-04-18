@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
@@ -376,11 +376,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         tokio::spawn(async move {
             // Track message IDs delivered by this polling task to avoid duplicates.
-            // Note: the WS path and poll path may both fire for the same message;
-            // the callback is idempotent by design (callers use mpsc channels that
-            // simply buffer duplicates, or the application deduplicates by message_id).
-            // We only deduplicate within the poll path itself.
-            let mut seen_ids: HashSet<String> = HashSet::new();
+            // Bounded to 10,000 entries with FIFO eviction to prevent unbounded
+            // memory growth on long-lived connections.
+            let mut seen_ids = BoundedIdSet::new(10_000);
 
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -455,8 +453,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
 
-        // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
-        // before checking socket.connected.
+        // Auto-connect or reconnect — if the WebSocket is disconnected, drop the
+        // stale connection and establish a fresh one with a new BRC-103 handshake.
+        // This handles proxy timeouts and server restarts without falling through
+        // to the slower HTTP fallback path.
+        {
+            let guard = self.ws_state.lock().await;
+            if guard.as_ref().map(|ws| !ws.is_connected()).unwrap_or(false) {
+                drop(guard);
+                // Stale connection — tear down and reconnect
+                let _ = self.disconnect_web_socket().await;
+            }
+        }
         if self.ensure_ws_connected(override_host).await.is_err() {
             // HTTP fallback: use override_host if provided, otherwise overlay resolution
             return match override_host {
@@ -617,6 +625,46 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
 
         Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded dedup set
+// ---------------------------------------------------------------------------
+
+/// A bounded set with FIFO eviction for deduplicating message IDs.
+///
+/// Prevents unbounded memory growth in the HTTP polling fallback task.
+/// When the set reaches `capacity`, the oldest entry is evicted before
+/// inserting the new one.
+struct BoundedIdSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl BoundedIdSet {
+    fn new(capacity: usize) -> Self {
+        Self {
+            set: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Insert an ID. Returns `true` if the ID was new (not previously seen).
+    fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(id.clone());
+        self.order.push_back(id);
+        true
     }
 }
 
@@ -881,5 +929,35 @@ mod tests {
         // Public init() must exist — verified by type resolution.
         let _fut = client.init(None);
         let _ = _fut; // suppress unused warning
+    }
+
+    // -----------------------------------------------------------------------
+    // BoundedIdSet tests
+    // -----------------------------------------------------------------------
+
+    /// BoundedIdSet rejects duplicate inserts.
+    #[test]
+    fn bounded_id_set_rejects_duplicates() {
+        let mut set = super::BoundedIdSet::new(100);
+        assert!(set.insert("a".to_string()), "first insert returns true");
+        assert!(!set.insert("a".to_string()), "duplicate returns false");
+        assert_eq!(set.order.len(), 1);
+    }
+
+    /// BoundedIdSet evicts oldest entries when at capacity.
+    #[test]
+    fn bounded_id_set_evicts_oldest() {
+        let mut set = super::BoundedIdSet::new(3);
+        set.insert("a".to_string());
+        set.insert("b".to_string());
+        set.insert("c".to_string());
+        // At capacity — next insert should evict "a"
+        assert!(set.insert("d".to_string()));
+        assert!(!set.set.contains("a"), "oldest entry must be evicted");
+        assert!(set.set.contains("b"));
+        assert!(set.set.contains("c"));
+        assert!(set.set.contains("d"));
+        // "a" is now unknown — should be insertable again
+        assert!(set.insert("a".to_string()), "evicted entry can be re-inserted");
     }
 }

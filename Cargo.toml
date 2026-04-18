@@ -21,6 +21,7 @@ base64 = "0.22"
 async-trait = "0.1"
 thiserror = "2"
 rust_socketio = { version = "0.6", features = ["async"] }
+tokio-util = "0.7"
 futures-util = "0.3"
 hex = "0.4"
 rand = "0.8"

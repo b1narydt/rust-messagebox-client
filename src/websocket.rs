@@ -7,8 +7,8 @@ use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
 use rust_socketio::{Event, Payload};
 use serde_json::json;
-use tokio::sync::{oneshot, Mutex};
 use tokio::sync::mpsc;
+use tokio::sync::{oneshot, Mutex};
 
 use bsv::auth::peer::Peer;
 use bsv::auth::types::MessageType;
@@ -166,7 +166,8 @@ impl MessageBoxWebSocket {
                                         guard.get(&event_key).cloned()
                                     };
                                     if let Some(cb) = callback {
-                                        let room_id = name.strip_prefix("sendMessage-")
+                                        let room_id = name
+                                            .strip_prefix("sendMessage-")
                                             .unwrap_or("")
                                             .to_string();
                                         let decrypted_body = encryption::try_decrypt_message(
@@ -248,13 +249,11 @@ impl MessageBoxWebSocket {
 
         // Extract the server identity key captured by the on("authMessage") callback
         // from the server's InitialResponse during the handshake.
-        let server_identity_key = server_key_rx
-            .try_recv()
-            .map_err(|_| {
-                MessageBoxError::WebSocket(
-                    "BRC-103 handshake completed but server identity key not captured".into(),
-                )
-            })?;
+        let server_identity_key = server_key_rx.try_recv().map_err(|_| {
+            MessageBoxError::WebSocket(
+                "BRC-103 handshake completed but server identity key not captured".into(),
+            )
+        })?;
 
         // -----------------------------------------------------------------------
         // Spawn peer_task: owns the Peer, runs process_next() continuously + handles commands.
@@ -363,8 +362,8 @@ impl MessageBoxWebSocket {
                     } else if event_name.starts_with("sendMessageAck-") {
                         let mut guard = acks_clone2.lock().await;
                         if let Some(tx) = guard.remove(&event_name) {
-                            let success = data.get("status").and_then(|s| s.as_str())
-                                == Some("success");
+                            let success =
+                                data.get("status").and_then(|s| s.as_str()) == Some("success");
                             let _ = tx.send(success);
                         }
                     }
@@ -384,9 +383,7 @@ impl MessageBoxWebSocket {
             .map_err(|_| {
                 MessageBoxError::WebSocket("authenticationSuccess not received within 5s".into())
             })?
-            .map_err(|_| {
-                MessageBoxError::WebSocket("auth success channel dropped".into())
-            })?;
+            .map_err(|_| MessageBoxError::WebSocket("auth success channel dropped".into()))?;
 
         Ok(Self {
             client,

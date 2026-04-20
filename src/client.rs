@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
@@ -147,22 +147,26 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// 4. CRITICAL TS PARITY: catch anoint errors and continue — TS logs
     ///    "Failed to anoint host, continuing with default functionality".
     pub(crate) async fn assert_initialized(&self) -> Result<(), MessageBoxError> {
-        self.init_once.get_or_try_init(|| async {
-            let identity_key = self.get_identity_key().await?;
-            // Query existing advertisements for this identity+host pair.
-            // unwrap_or_default() because query_advertisements never fails (TS parity).
-            let ads = self.query_advertisements(Some(&identity_key), Some(&self.host)).await
-                .unwrap_or_default();
-            if ads.iter().all(|ad| ad.host.trim() != self.host.trim()) {
-                // No matching advertisement — anoint this host.
-                // CRITICAL TS PARITY: catch anoint errors and continue.
-                // TS: "Failed to anoint host, continuing with default functionality"
-                if let Err(e) = self.anoint_host(&self.host).await {
-                    eprintln!("Warning: failed to anoint host: {e}");
+        self.init_once
+            .get_or_try_init(|| async {
+                let identity_key = self.get_identity_key().await?;
+                // Query existing advertisements for this identity+host pair.
+                // unwrap_or_default() because query_advertisements never fails (TS parity).
+                let ads = self
+                    .query_advertisements(Some(&identity_key), Some(&self.host))
+                    .await
+                    .unwrap_or_default();
+                if ads.iter().all(|ad| ad.host.trim() != self.host.trim()) {
+                    // No matching advertisement — anoint this host.
+                    // CRITICAL TS PARITY: catch anoint errors and continue.
+                    // TS: "Failed to anoint host, continuing with default functionality"
+                    if let Err(e) = self.anoint_host(&self.host).await {
+                        eprintln!("Warning: failed to anoint host: {e}");
+                    }
                 }
-            }
-            Ok::<(), MessageBoxError>(())
-        }).await?;
+                Ok::<(), MessageBoxError>(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -178,14 +182,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             Some(host) => {
                 // TS parity: if targetHost provided, anoint THAT host directly
                 // instead of going through assert_initialized's self.host logic.
-                self.init_once.get_or_try_init(|| async {
-                    let _identity_key = self.get_identity_key().await?;
-                    // CRITICAL TS PARITY: catch anoint errors and continue.
-                    if let Err(e) = self.anoint_host(host).await {
-                        eprintln!("Warning: failed to anoint host: {e}");
-                    }
-                    Ok::<(), MessageBoxError>(())
-                }).await?;
+                self.init_once
+                    .get_or_try_init(|| async {
+                        let _identity_key = self.get_identity_key().await?;
+                        // CRITICAL TS PARITY: catch anoint errors and continue.
+                        if let Err(e) = self.anoint_host(host).await {
+                            eprintln!("Warning: failed to anoint host: {e}");
+                        }
+                        Ok::<(), MessageBoxError>(())
+                    })
+                    .await?;
                 Ok(())
             }
             None => self.assert_initialized().await,
@@ -280,10 +286,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
 
         if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(
-                response.status,
-                url.to_string(),
-            ));
+            return Err(MessageBoxError::Http(response.status, url.to_string()));
         }
 
         Ok(response)
@@ -299,7 +302,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// creates a new `MessageBoxWebSocket` with the current identity key.
     /// `rust_socketio` handles the Socket.IO handshake and HTTP-to-WS upgrade
     /// internally — we pass the same base URL used for HTTP requests.
-    async fn ensure_ws_connected(&self, override_host: Option<&str>) -> Result<(), MessageBoxError> {
+    async fn ensure_ws_connected(
+        &self,
+        override_host: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
         let mut guard = self.ws_state.lock().await;
         if guard.as_ref().map(|ws| ws.is_connected()).unwrap_or(false) {
             return Ok(());
@@ -376,11 +382,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         tokio::spawn(async move {
             // Track message IDs delivered by this polling task to avoid duplicates.
-            // Note: the WS path and poll path may both fire for the same message;
-            // the callback is idempotent by design (callers use mpsc channels that
-            // simply buffer duplicates, or the application deduplicates by message_id).
-            // We only deduplicate within the poll path itself.
-            let mut seen_ids: HashSet<String> = HashSet::new();
+            // Bounded to 10,000 entries with FIFO eviction to prevent unbounded
+            // memory growth on long-lived connections.
+            let mut seen_ids = BoundedIdSet::new(10_000);
 
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -447,21 +451,69 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // (send_message with overlay resolution) since our WebSocket is only
         // connected to self.host.
         if override_host.is_none() {
-            let resolved = self.resolve_host_for_recipient(recipient).await
+            let resolved = self
+                .resolve_host_for_recipient(recipient)
+                .await
                 .unwrap_or_else(|_| self.host().to_string());
             if resolved.trim() != self.host().trim() {
                 // Recipient is on a different MessageBox server — use HTTP with overlay
-                return self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await;
+                return self
+                    .send_message(
+                        recipient,
+                        message_box,
+                        body,
+                        skip_encryption,
+                        check_permissions,
+                        message_id,
+                        None,
+                    )
+                    .await;
             }
         }
 
-        // Auto-connect — matches TS which calls joinRoom (→ initializeConnection)
-        // before checking socket.connected.
-        if self.ensure_ws_connected(override_host).await.is_err() {
+        // Auto-connect or reconnect — if the WebSocket is disconnected, drop the
+        // stale connection and establish a fresh one with a new BRC-103 handshake.
+        // This handles proxy timeouts and server restarts without falling through
+        // to the slower HTTP fallback path.
+        {
+            let guard = self.ws_state.lock().await;
+            if guard.as_ref().map(|ws| !ws.is_connected()).unwrap_or(false) {
+                drop(guard);
+                // Stale connection — tear down and reconnect
+                if let Err(e) = self.disconnect_web_socket().await {
+                    eprintln!("Warning: stale WebSocket disconnect failed (proceeding to reconnect): {e}");
+                }
+            }
+        }
+        if let Err(e) = self.ensure_ws_connected(override_host).await {
+            eprintln!("Warning: WebSocket connection failed, falling back to HTTP: {e}");
             // HTTP fallback: use override_host if provided, otherwise overlay resolution
             return match override_host {
-                Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
-                None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
+                Some(host) => {
+                    self.send_message_to_host(
+                        host,
+                        recipient,
+                        message_box,
+                        body,
+                        skip_encryption,
+                        check_permissions,
+                        message_id,
+                        None,
+                    )
+                    .await
+                }
+                None => {
+                    self.send_message(
+                        recipient,
+                        message_box,
+                        body,
+                        skip_encryption,
+                        check_permissions,
+                        message_id,
+                        None,
+                    )
+                    .await
+                }
             };
         }
 
@@ -476,15 +528,61 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 if ws.join_room(&my_room).await.is_err() {
                     drop(guard);
                     return match override_host {
-                        Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
-                        None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
+                        Some(host) => {
+                            self.send_message_to_host(
+                                host,
+                                recipient,
+                                message_box,
+                                body,
+                                skip_encryption,
+                                check_permissions,
+                                message_id,
+                                None,
+                            )
+                            .await
+                        }
+                        None => {
+                            self.send_message(
+                                recipient,
+                                message_box,
+                                body,
+                                skip_encryption,
+                                check_permissions,
+                                message_id,
+                                None,
+                            )
+                            .await
+                        }
                     };
                 }
             } else {
                 drop(guard);
                 return match override_host {
-                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
-                    None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, message_id, None).await,
+                    Some(host) => {
+                        self.send_message_to_host(
+                            host,
+                            recipient,
+                            message_box,
+                            body,
+                            skip_encryption,
+                            check_permissions,
+                            message_id,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        self.send_message(
+                            recipient,
+                            message_box,
+                            body,
+                            skip_encryption,
+                            check_permissions,
+                            message_id,
+                            None,
+                        )
+                        .await
+                    }
                 };
             }
         }
@@ -493,13 +591,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let encrypted = if skip_encryption {
             body.to_string()
         } else {
-            crate::encryption::encrypt_body(
-                self.wallet(),
-                body,
-                recipient,
-                self.originator(),
-            )
-            .await?
+            crate::encryption::encrypt_body(self.wallet(), body, recipient, self.originator())
+                .await?
         };
         let message_id = if let Some(id) = message_id {
             id.to_string()
@@ -531,7 +624,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         {
             let guard = self.ws_state.lock().await;
             if let Some(ref ws) = *guard {
-                ws.emit_send_message(payload, ack_key.clone(), ack_tx).await?;
+                ws.emit_send_message(payload, ack_key.clone(), ack_tx)
+                    .await?;
             }
         }
 
@@ -547,8 +641,31 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 drop(guard);
                 // Fall back to HTTP — pass through all feature params
                 match override_host {
-                    Some(host) => self.send_message_to_host(host, recipient, message_box, body, skip_encryption, check_permissions, None, None).await,
-                    None => self.send_message(recipient, message_box, body, skip_encryption, check_permissions, None, None).await,
+                    Some(host) => {
+                        self.send_message_to_host(
+                            host,
+                            recipient,
+                            message_box,
+                            body,
+                            skip_encryption,
+                            check_permissions,
+                            None,
+                            None,
+                        )
+                        .await
+                    }
+                    None => {
+                        self.send_message(
+                            recipient,
+                            message_box,
+                            body,
+                            skip_encryption,
+                            check_permissions,
+                            None,
+                            None,
+                        )
+                        .await
+                    }
                 }
             }
         }
@@ -597,10 +714,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// Mirrors `post_json` but sends no body and no content-type header.
     /// The caller is responsible for building the full URL including query string.
-    pub(crate) async fn get_json(
-        &self,
-        url: &str,
-    ) -> Result<AuthFetchResponse, MessageBoxError> {
+    pub(crate) async fn get_json(&self, url: &str) -> Result<AuthFetchResponse, MessageBoxError> {
         let response = self
             .auth_fetch
             .lock()
@@ -610,13 +724,65 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
 
         if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(
-                response.status,
-                url.to_string(),
-            ));
+            return Err(MessageBoxError::Http(response.status, url.to_string()));
         }
 
         Ok(response)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bounded dedup set
+// ---------------------------------------------------------------------------
+
+/// A bounded set with FIFO eviction for deduplicating message IDs.
+///
+/// Prevents unbounded memory growth in the HTTP polling fallback task.
+/// When the set reaches `capacity`, the oldest entry is evicted before
+/// inserting the new one.
+struct BoundedIdSet {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl BoundedIdSet {
+    fn new(capacity: usize) -> Self {
+        assert!(capacity > 0, "BoundedIdSet capacity must be at least 1");
+        Self {
+            set: HashSet::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Insert an ID. Returns `true` if the ID was new (not previously seen).
+    fn insert(&mut self, id: String) -> bool {
+        if self.set.contains(&id) {
+            return false;
+        }
+        if self.order.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.set.remove(&old);
+            }
+        }
+        self.set.insert(id.clone());
+        self.order.push_back(id);
+        debug_assert_eq!(self.set.len(), self.order.len(),
+            "BoundedIdSet internal invariant violated: set/deque size mismatch");
+        true
+    }
+
+    /// Returns the number of IDs currently tracked.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Returns true if the given ID is currently in the set.
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
     }
 }
 
@@ -670,13 +836,9 @@ where
         // Simple body extraction: if the body is a wrapped envelope, extract the message field.
         let plain_body = extract_plain_body(&msg.body);
         // Decrypt if encrypted
-        let decrypted = crate::encryption::try_decrypt_message(
-            wallet,
-            &plain_body,
-            &msg.sender,
-            originator,
-        )
-        .await;
+        let decrypted =
+            crate::encryption::try_decrypt_message(wallet, &plain_body, &msg.sender, originator)
+                .await;
 
         result.push(PeerMessage {
             message_id: msg.message_id,
@@ -759,34 +921,188 @@ mod tests {
     // Delegate every WalletInterface method to the inner ProtoWallet.
     #[async_trait::async_trait]
     impl WalletInterface for ArcWallet {
-        async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-        async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-        async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-        async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-        async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-        async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-        async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-        async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-        async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-        async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-        async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-        async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-        async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-        async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-        async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-        async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-        async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-        async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-        async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-        async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-        async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-        async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-        async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-        async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-        async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+        async fn create_action(
+            &self,
+            args: CreateActionArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            self.0.create_action(args, orig).await
+        }
+        async fn sign_action(
+            &self,
+            args: SignActionArgs,
+            orig: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            self.0.sign_action(args, orig).await
+        }
+        async fn abort_action(
+            &self,
+            args: AbortActionArgs,
+            orig: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            self.0.abort_action(args, orig).await
+        }
+        async fn list_actions(
+            &self,
+            args: ListActionsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            self.0.list_actions(args, orig).await
+        }
+        async fn internalize_action(
+            &self,
+            args: InternalizeActionArgs,
+            orig: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            self.0.internalize_action(args, orig).await
+        }
+        async fn list_outputs(
+            &self,
+            args: ListOutputsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            self.0.list_outputs(args, orig).await
+        }
+        async fn relinquish_output(
+            &self,
+            args: RelinquishOutputArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            self.0.relinquish_output(args, orig).await
+        }
+        async fn get_public_key(
+            &self,
+            args: GetPublicKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            self.0.get_public_key(args, orig).await
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            args: RevealCounterpartyKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            self.0.reveal_counterparty_key_linkage(args, orig).await
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            args: RevealSpecificKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            self.0.reveal_specific_key_linkage(args, orig).await
+        }
+        async fn encrypt(
+            &self,
+            args: EncryptArgs,
+            orig: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            self.0.encrypt(args, orig).await
+        }
+        async fn decrypt(
+            &self,
+            args: DecryptArgs,
+            orig: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            self.0.decrypt(args, orig).await
+        }
+        async fn create_hmac(
+            &self,
+            args: CreateHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            self.0.create_hmac(args, orig).await
+        }
+        async fn verify_hmac(
+            &self,
+            args: VerifyHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            self.0.verify_hmac(args, orig).await
+        }
+        async fn create_signature(
+            &self,
+            args: CreateSignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            self.0.create_signature(args, orig).await
+        }
+        async fn verify_signature(
+            &self,
+            args: VerifySignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            self.0.verify_signature(args, orig).await
+        }
+        async fn acquire_certificate(
+            &self,
+            args: AcquireCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            self.0.acquire_certificate(args, orig).await
+        }
+        async fn list_certificates(
+            &self,
+            args: ListCertificatesArgs,
+            orig: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            self.0.list_certificates(args, orig).await
+        }
+        async fn prove_certificate(
+            &self,
+            args: ProveCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            self.0.prove_certificate(args, orig).await
+        }
+        async fn relinquish_certificate(
+            &self,
+            args: RelinquishCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            self.0.relinquish_certificate(args, orig).await
+        }
+        async fn discover_by_identity_key(
+            &self,
+            args: DiscoverByIdentityKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_identity_key(args, orig).await
+        }
+        async fn discover_by_attributes(
+            &self,
+            args: DiscoverByAttributesArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_attributes(args, orig).await
+        }
+        async fn is_authenticated(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.is_authenticated(orig).await
+        }
+        async fn wait_for_authentication(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.wait_for_authentication(orig).await
+        }
+        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            self.0.get_height(orig).await
+        }
+        async fn get_header_for_height(
+            &self,
+            args: GetHeaderArgs,
+            orig: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            self.0.get_header_for_height(args, orig).await
+        }
+        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            self.0.get_network(orig).await
+        }
+        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            self.0.get_version(orig).await
+        }
     }
 
     /// `new()` must trim leading/trailing whitespace from the host URL.
@@ -881,5 +1197,45 @@ mod tests {
         // Public init() must exist — verified by type resolution.
         let _fut = client.init(None);
         let _ = _fut; // suppress unused warning
+    }
+
+    // -----------------------------------------------------------------------
+    // BoundedIdSet tests
+    // -----------------------------------------------------------------------
+
+    /// BoundedIdSet rejects duplicate inserts.
+    #[test]
+    fn bounded_id_set_rejects_duplicates() {
+        let mut set = super::BoundedIdSet::new(100);
+        assert!(set.insert("a".to_string()), "first insert returns true");
+        assert!(!set.insert("a".to_string()), "duplicate returns false");
+        assert_eq!(set.len(), 1);
+    }
+
+    /// BoundedIdSet evicts oldest entries when at capacity.
+    #[test]
+    fn bounded_id_set_evicts_oldest() {
+        let mut set = super::BoundedIdSet::new(3);
+        set.insert("a".to_string());
+        set.insert("b".to_string());
+        set.insert("c".to_string());
+        // At capacity — next insert should evict "a"
+        assert!(set.insert("d".to_string()));
+        assert!(!set.contains("a"), "oldest entry must be evicted");
+        assert!(set.contains("b"));
+        assert!(set.contains("c"));
+        assert!(set.contains("d"));
+        // "a" is now unknown — should be insertable again
+        assert!(
+            set.insert("a".to_string()),
+            "evicted entry can be re-inserted"
+        );
+    }
+
+    /// BoundedIdSet panics on capacity=0.
+    #[test]
+    #[should_panic(expected = "capacity must be at least 1")]
+    fn bounded_id_set_rejects_zero_capacity() {
+        super::BoundedIdSet::new(0);
     }
 }

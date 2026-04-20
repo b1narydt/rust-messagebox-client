@@ -7,9 +7,8 @@ use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
 use rust_socketio::{Event, Payload};
 use serde_json::json;
-use tokio::sync::{oneshot, Mutex};
 use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::{oneshot, Mutex};
 
 use bsv::auth::peer::Peer;
 use bsv::auth::types::MessageType;
@@ -58,8 +57,6 @@ pub struct MessageBoxWebSocket {
     peer_tx: mpsc::Sender<PeerCommand>,
     /// The server's identity key captured during the BRC-103 handshake.
     server_identity_key: String,
-    /// Cancellation token for the keepalive task. Signalled on disconnect.
-    keepalive_cancel: CancellationToken,
 }
 
 impl MessageBoxWebSocket {
@@ -169,7 +166,8 @@ impl MessageBoxWebSocket {
                                         guard.get(&event_key).cloned()
                                     };
                                     if let Some(cb) = callback {
-                                        let room_id = name.strip_prefix("sendMessage-")
+                                        let room_id = name
+                                            .strip_prefix("sendMessage-")
                                             .unwrap_or("")
                                             .to_string();
                                         let decrypted_body = encryption::try_decrypt_message(
@@ -251,13 +249,11 @@ impl MessageBoxWebSocket {
 
         // Extract the server identity key captured by the on("authMessage") callback
         // from the server's InitialResponse during the handshake.
-        let server_identity_key = server_key_rx
-            .try_recv()
-            .map_err(|_| {
-                MessageBoxError::WebSocket(
-                    "BRC-103 handshake completed but server identity key not captured".into(),
-                )
-            })?;
+        let server_identity_key = server_key_rx.try_recv().map_err(|_| {
+            MessageBoxError::WebSocket(
+                "BRC-103 handshake completed but server identity key not captured".into(),
+            )
+        })?;
 
         // -----------------------------------------------------------------------
         // Spawn peer_task: owns the Peer, runs process_next() continuously + handles commands.
@@ -366,8 +362,8 @@ impl MessageBoxWebSocket {
                     } else if event_name.starts_with("sendMessageAck-") {
                         let mut guard = acks_clone2.lock().await;
                         if let Some(tx) = guard.remove(&event_name) {
-                            let success = data.get("status").and_then(|s| s.as_str())
-                                == Some("success");
+                            let success =
+                                data.get("status").and_then(|s| s.as_str()) == Some("success");
                             let _ = tx.send(success);
                         }
                     }
@@ -387,51 +383,7 @@ impl MessageBoxWebSocket {
             .map_err(|_| {
                 MessageBoxError::WebSocket("authenticationSuccess not received within 5s".into())
             })?
-            .map_err(|_| {
-                MessageBoxError::WebSocket("auth success channel dropped".into())
-            })?;
-
-        // Spawn a keepalive task that pings the server every 25 seconds.
-        // This prevents proxies/load balancers from killing idle WebSocket
-        // connections (typical timeout: 30-60s). The task re-joins an already-
-        // joined room as a lightweight no-op heartbeat — the server treats
-        // duplicate joinRoom as idempotent.
-        let keepalive_cancel = CancellationToken::new();
-        let keepalive_token = keepalive_cancel.clone();
-        let keepalive_peer_tx = peer_cmd_tx.clone();
-        let keepalive_connected = connected.clone();
-        let keepalive_rooms = joined_rooms.clone();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = keepalive_token.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(25)) => {}
-                }
-                if !keepalive_connected.load(Ordering::SeqCst) {
-                    break;
-                }
-                // Pick any joined room for a no-op re-join, or use a sentinel.
-                let room = {
-                    let guard = keepalive_rooms.lock().await;
-                    guard.iter().next().cloned()
-                };
-                let ping_room = room.unwrap_or_else(|| "keepalive".to_string());
-                let payload = encode_ws_event("joinRoom", json!(ping_room));
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                // Best-effort — if the channel is closed, the connection is gone.
-                if keepalive_peer_tx
-                    .send(PeerCommand::SendMessage {
-                        payload,
-                        reply: reply_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+            .map_err(|_| MessageBoxError::WebSocket("auth success channel dropped".into()))?;
 
         Ok(Self {
             client,
@@ -441,7 +393,6 @@ impl MessageBoxWebSocket {
             connected,
             peer_tx: peer_cmd_tx,
             server_identity_key,
-            keepalive_cancel,
         })
     }
 
@@ -574,8 +525,6 @@ impl MessageBoxWebSocket {
     /// Sends false to all remaining pending ack channels before dropping them.
     pub async fn disconnect(&self) -> Result<(), MessageBoxError> {
         self.connected.store(false, Ordering::SeqCst);
-        // Cancel the keepalive task before shutting down the peer
-        self.keepalive_cancel.cancel();
         // Signal the peer_task to terminate (best-effort — channel may already be closed)
         let _ = self.peer_tx.send(PeerCommand::Shutdown).await;
         // Drain pending acks — send false to signal failure

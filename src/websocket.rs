@@ -485,7 +485,7 @@ impl MessageBoxWebSocket {
         reply_rx
             .await
             .map_err(|_| MessageBoxError::WebSocket("peer reply dropped".into()))?
-            .map_err(|e| MessageBoxError::WebSocket(e))?;
+            .map_err(MessageBoxError::WebSocket)?;
         self.joined_rooms.lock().await.insert(room_id.to_string());
         Ok(())
     }
@@ -509,7 +509,7 @@ impl MessageBoxWebSocket {
         reply_rx
             .await
             .map_err(|_| MessageBoxError::WebSocket("peer reply dropped".into()))?
-            .map_err(|e| MessageBoxError::WebSocket(e))?;
+            .map_err(MessageBoxError::WebSocket)?;
         Ok(())
     }
 
@@ -544,13 +544,14 @@ impl MessageBoxWebSocket {
 
         let event_payload = encode_ws_event("sendMessage", payload);
         let (reply_tx, reply_rx) = oneshot::channel();
-        if let Err(_) = self
+        if self
             .peer_tx
             .send(PeerCommand::SendMessage {
                 payload: event_payload,
                 reply: reply_tx,
             })
             .await
+            .is_err()
         {
             // Clean up the pending ack so it doesn't leak until timeout
             self.pending_acks.lock().await.remove(&ack_key);

@@ -7,6 +7,7 @@ use bsv::services::overlay_tools::Network;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
 
+use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
 use crate::types::{ListMessagesParams, ListMessagesResponse};
 
@@ -467,6 +468,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// - `check_permissions`: when true, the HTTP fallback path fetches quotes and pays fees.
     /// - `message_id`: when Some, uses caller-supplied ID instead of HMAC-derived ID.
     /// - `override_host`: when Some, the HTTP fallback sends to that host directly.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_live_message(
         &self,
         recipient: &str,
@@ -476,7 +478,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         check_permissions: bool,
         message_id: Option<&str>,
         override_host: Option<&str>,
-    ) -> Result<String, MessageBoxError> {
+    ) -> Result<DeliveryMode, MessageBoxError> {
         // If no host override, resolve the recipient's host via overlay.
         // If the recipient is on a DIFFERENT host than ours, we must use HTTP
         // (send_message with overlay resolution) since our WebSocket is only
@@ -487,8 +489,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 .await
                 .unwrap_or_else(|_| self.host().to_string());
             if resolved.trim() != self.host().trim() {
-                // Recipient is on a different MessageBox server — use HTTP with overlay
-                return self
+                // Recipient is on a different MessageBox server — use HTTP with overlay.
+                // This is a persisted delivery (no live WS ack possible cross-host).
+                let msg_id = self
                     .send_message(
                         recipient,
                         message_box,
@@ -498,7 +501,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                         message_id,
                         None,
                     )
-                    .await;
+                    .await?;
+                return Ok(DeliveryMode::Persisted { message_id: msg_id });
             }
         }
 
@@ -518,8 +522,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
         if let Err(e) = self.ensure_ws_connected(override_host).await {
             eprintln!("Warning: WebSocket connection failed, falling back to HTTP: {e}");
-            // HTTP fallback: use override_host if provided, otherwise overlay resolution
-            return match override_host {
+            // HTTP fallback: use override_host if provided, otherwise overlay resolution.
+            // Returns Persisted because no WS ack was received.
+            let msg_id = match override_host {
                 Some(host) => {
                     self.send_message_to_host(
                         host,
@@ -531,7 +536,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                         message_id,
                         None,
                     )
-                    .await
+                    .await?
                 }
                 None => {
                     self.send_message(
@@ -543,9 +548,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                         message_id,
                         None,
                     )
-                    .await
+                    .await?
                 }
             };
+            return Ok(DeliveryMode::Persisted { message_id: msg_id });
         }
 
         // Join sender's own room before send — TS calls joinRoom(messageBox) which
@@ -558,7 +564,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             if let Some(ref ws) = *guard {
                 if ws.join_room(&my_room).await.is_err() {
                     drop(guard);
-                    return match override_host {
+                    let msg_id = match override_host {
                         Some(host) => {
                             self.send_message_to_host(
                                 host,
@@ -570,7 +576,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                                 message_id,
                                 None,
                             )
-                            .await
+                            .await?
                         }
                         None => {
                             self.send_message(
@@ -582,13 +588,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                                 message_id,
                                 None,
                             )
-                            .await
+                            .await?
                         }
                     };
+                    return Ok(DeliveryMode::Persisted { message_id: msg_id });
                 }
             } else {
                 drop(guard);
-                return match override_host {
+                let msg_id = match override_host {
                     Some(host) => {
                         self.send_message_to_host(
                             host,
@@ -600,7 +607,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             message_id,
                             None,
                         )
-                        .await
+                        .await?
                     }
                     None => {
                         self.send_message(
@@ -612,9 +619,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             message_id,
                             None,
                         )
-                        .await
+                        .await?
                     }
                 };
+                return Ok(DeliveryMode::Persisted { message_id: msg_id });
             }
         }
 
@@ -660,9 +668,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
 
-        // Await ack with 10-second timeout
+        // Await ack with 10-second timeout.
+        // Live: server acked via WS within the window → DeliveryMode::Live.
+        // Anything else (timeout, channel error, ack=false): fall back to HTTP
+        // and return DeliveryMode::Persisted.
         match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
-            Ok(Ok(true)) => Ok(message_id),
+            Ok(Ok(true)) => Ok(DeliveryMode::Live { message_id }),
             _ => {
                 // Clean up the pending ack to prevent channel leaks (Pitfall 7)
                 let guard = self.ws_state.lock().await;
@@ -670,8 +681,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     ws.remove_pending_ack(&ack_key).await;
                 }
                 drop(guard);
-                // Fall back to HTTP — pass through all feature params
-                match override_host {
+                tracing::debug!(
+                    "send_live_message: WS ack timed out or failed; falling back to HTTP"
+                );
+                // Fall back to HTTP — pass through all feature params.
+                // The HTTP path generates a fresh message ID; use that for the Persisted ID.
+                let http_id = match override_host {
                     Some(host) => {
                         self.send_message_to_host(
                             host,
@@ -683,7 +698,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             None,
                             None,
                         )
-                        .await
+                        .await?
                     }
                     None => {
                         self.send_message(
@@ -695,9 +710,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             None,
                             None,
                         )
-                        .await
+                        .await?
                     }
-                }
+                };
+                Ok(DeliveryMode::Persisted { message_id: http_id })
             }
         }
     }
@@ -1322,8 +1338,8 @@ mod tests {
         // If init_once were removed or its type changed, this compile-check fails.
         let _cell: &OnceCell<()> = &client.init_once;
         // Public init() must exist — verified by type resolution.
-        let _fut = client.init(None);
-        let _ = _fut; // suppress unused warning
+        // Verify init() exists and returns a Future — drop without awaiting.
+        drop(client.init(None));
     }
 
     // -----------------------------------------------------------------------

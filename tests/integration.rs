@@ -1,21 +1,21 @@
-/// Integration tests for the RemittanceAdapter CommsLayer implementation.
-///
-/// These tests exercise the send -> list -> ack cycle through the adapter.
-///
-/// # AuthFetch / wiremock compatibility note
-///
-/// `AuthFetch` performs BRC-31 mutual authentication which includes
-/// a nonce-based handshake.  wiremock serves static JSON responses that
-/// do not participate in this handshake, so `AuthFetch::fetch` will
-/// fail at the transport level before the HTTP response body is read.
-///
-/// For that reason, the HTTP transport path is covered by the unit tests in
-/// `src/http_ops.rs` and `src/adapter.rs`, and these integration tests
-/// focus on:
-///   1. Adapter construction and trait satisfaction (compile-time)
-///   2. `ServerPeerMessage` -> `PeerMessage` field mapping correctness
-///   3. Full send -> list -> ack cycle correctness verified at the
-///      mapping/logic layer using direct struct construction
+//! Integration tests for the RemittanceAdapter CommsLayer implementation.
+//!
+//! These tests exercise the send -> list -> ack cycle through the adapter.
+//!
+//! # AuthFetch / wiremock compatibility note
+//!
+//! `AuthFetch` performs BRC-31 mutual authentication which includes
+//! a nonce-based handshake.  wiremock serves static JSON responses that
+//! do not participate in this handshake, so `AuthFetch::fetch` will
+//! fail at the transport level before the HTTP response body is read.
+//!
+//! For that reason, the HTTP transport path is covered by the unit tests in
+//! `src/http_ops.rs` and `src/adapter.rs`, and these integration tests
+//! focus on:
+//!   1. Adapter construction and trait satisfaction (compile-time)
+//!   2. `ServerPeerMessage` -> `PeerMessage` field mapping correctness
+//!   3. Full send -> list -> ack cycle correctness verified at the
+//!      mapping/logic layer using direct struct construction
 
 use std::sync::Arc;
 
@@ -181,7 +181,7 @@ async fn test_send_list_ack_cycle() {
 
     // --- ACK phase ---
     // Verify the adapter accepts &[String] and converts to Vec<String> (Pitfall 4).
-    let ids_to_ack: &[String] = &[message_id.clone()];
+    let ids_to_ack: &[String] = std::slice::from_ref(&message_id);
     let converted: Vec<String> = ids_to_ack.to_vec();
     assert_eq!(converted, vec!["test-msg-001"], "ack IDs convert correctly");
 }

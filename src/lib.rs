@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod client;
+pub mod delivery;
 pub mod encryption;
 pub mod error;
 pub mod host_resolution;
@@ -13,5 +14,6 @@ pub mod websocket;
 
 pub use adapter::RemittanceAdapter;
 pub use client::MessageBoxClient;
+pub use delivery::DeliveryMode;
 pub use error::MessageBoxError;
 pub use types::*;

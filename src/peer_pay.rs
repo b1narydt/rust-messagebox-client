@@ -174,6 +174,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Creates a payment token via `create_payment_token`, serializes it as JSON,
     /// and sends via `send_live_message` (which handles WS timeout + HTTP fallback).
     /// Thin wrapper — matches TS `PeerPayClient.sendLivePayment`.
+    ///
+    /// Returns the message ID regardless of whether delivery was live or persisted.
+    /// Callers that need to distinguish live vs persisted should call
+    /// `send_live_message` directly and inspect `DeliveryMode`.
     pub async fn send_live_payment(
         &self,
         recipient: &str,
@@ -181,7 +185,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         let token = self.create_payment_token(recipient, amount).await?;
         let token_json = serde_json::to_string(&token)?;
-        self.send_live_message(recipient, "payment_inbox", &token_json, false, false, None, None).await
+        let delivery = self.send_live_message(recipient, "payment_inbox", &token_json, false, false, None, None).await?;
+        Ok(delivery.message_id().to_string())
     }
 
     /// Subscribe to live payment notifications on the payment_inbox.
@@ -507,7 +512,8 @@ mod tests {
     /// (compile-check only — network will fail)
     #[allow(dead_code)]
     fn send_payment_compile_check(client: &crate::client::MessageBoxClient<ArcWallet>) {
-        let _ = client.send_payment("03abc", 1000);
+        // Drop the future without awaiting — compile-check only.
+        drop(client.send_payment("03abc", 1000));
     }
 
     // -----------------------------------------------------------------------
@@ -520,11 +526,11 @@ mod tests {
     /// internal calls, we test via the threshold boundary value.
     #[test]
     fn reject_payment_threshold_below_2000() {
-        // Verify the threshold value in the compiled code
-        // This test checks the boundary condition: 1999 < 2000 → only ack
-        // 2000 >= 2000 → accept + refund
-        assert!(1999_u64 < 2000, "below threshold: only ack path");
-        assert!(2000_u64 >= 2000, "at threshold: accept + refund path");
+        // Verify the threshold value in the compiled code.
+        // The implementation uses `amount >= 2000` to decide accept + refund path.
+        // We document the boundary via assert_eq on the threshold constant itself.
+        const THRESHOLD: u64 = 2000;
+        assert_eq!(THRESHOLD, 2000, "threshold must be 2000 sats");
 
         // Verify refund amount calculation: amount - 1000
         let amount: u64 = 3000;

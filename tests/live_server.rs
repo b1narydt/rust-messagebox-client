@@ -1,11 +1,11 @@
-/// Live integration tests against https://messagebox.babbage.systems
-///
-/// These tests hit the real MessageBox server with BRC-103 authenticated
-/// requests via ProtoWallet. They are marked `#[ignore]` so they only run
-/// when explicitly requested: `cargo test --test live_server -- --ignored`
-///
-/// A fresh random wallet is used per test, so there is no state leakage
-/// between runs.
+//! Live integration tests against https://messagebox.babbage.systems
+//!
+//! These tests hit the real MessageBox server with BRC-103 authenticated
+//! requests via ProtoWallet. They are marked `#[ignore]` so they only run
+//! when explicitly requested: `cargo test --test live_server -- --ignored`
+//!
+//! A fresh random wallet is used per test, so there is no state leakage
+//! between runs.
 
 use std::sync::Arc;
 
@@ -1049,7 +1049,7 @@ async fn test_two_client_live_messaging() {
         .await;
 
     match &send_result {
-        Ok(id) => println!("[Phase 2] Message sent OK (server acked), id={id}"),
+        Ok(d) => println!("[Phase 2] Message sent OK, id={}, live={}", d.message_id(), d.is_live()),
         Err(e) => println!("[Phase 2] Send error: {e}"),
     }
     assert!(send_result.is_ok(), "send_live_message should succeed: {send_result:?}");

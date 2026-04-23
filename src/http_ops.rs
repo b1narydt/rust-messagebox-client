@@ -74,6 +74,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// 1. Asserts the client is initialized.
     /// 2. Resolves recipient's host via overlay (falls back to self.host if unreachable).
     /// 3. Delegates to `send_message_to_host` with the resolved host.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message(
         &self,
         recipient: &str,

@@ -17,7 +17,7 @@ use bsv::services::overlay_tools::Network;
 use bsv::wallet::error::WalletError;
 use bsv::wallet::interfaces::*;
 use bsv::wallet::proto_wallet::ProtoWallet;
-use bsv_messagebox_client::MessageBoxClient;
+use bsv_messagebox_client::{DeliveryMode, MessageBoxClient};
 use tokio::sync::mpsc;
 
 const LIVE_HOST: &str = "https://messagebox.babbage.systems";
@@ -116,7 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // send_live_message attempts WebSocket delivery (10s ack timeout) and falls
     // back to HTTP if the ack is not received in time.
     println!("Client B sending live message...");
-    client_b
+    let delivery = client_b
         .send_live_message(
             &key_a,              // recipient identity key
             "demo_live_inbox",   // message box name
@@ -127,7 +127,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None,                // override_host
         )
         .await?;
-    println!("Message sent.");
+    match &delivery {
+        DeliveryMode::Live { message_id } => {
+            println!("Message sent live (WS ack received). ID: {message_id}");
+        }
+        DeliveryMode::Persisted { message_id } => {
+            println!("Message persisted via HTTP fallback (WS ack timed out). ID: {message_id}");
+        }
+    }
 
     // Wait up to 15s for Client A to receive the message via the polling fallback.
     println!("Waiting for Client A to receive...");

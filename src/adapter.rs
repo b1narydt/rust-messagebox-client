@@ -106,6 +106,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
     ///
     /// Passes `host_override` through to `MessageBoxClient::send_live_message`
     /// which applies it on the HTTP fallback path.
+    ///
+    /// The `CommsLayer` trait requires `Result<String, RemittanceError>`.
+    /// `MessageBoxClient::send_live_message` now returns `Result<DeliveryMode>`;
+    /// we extract the message ID via `.message_id()`. Callers that need to
+    /// distinguish live vs persisted delivery should use `MessageBoxClient`
+    /// directly rather than going through this adapter.
     async fn send_live_message(
         &self,
         recipient: &str,
@@ -116,6 +122,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> CommsLayer for Remittan
         self.inner
             .send_live_message(recipient, message_box, body, false, false, None, host_override)
             .await
+            .map(|d| d.message_id().to_string())
             .map_err(|e| RemittanceError::Protocol(e.to_string()))
     }
 

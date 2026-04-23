@@ -1,3 +1,4 @@
 .planning/
 target/
 .claude/
+Cargo.lock

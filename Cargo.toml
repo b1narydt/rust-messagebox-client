@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-client"
-version = "1.0.1"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.87"
 description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
@@ -13,7 +13,7 @@ categories = ["cryptography", "network-programming"]
 name = "bsv_messagebox_client"
 
 [dependencies]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+bsv-sdk = { version = "0.2", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -10,6 +10,9 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::error::MessageBoxError;
 use crate::types::{ListMessagesParams, ListMessagesResponse};
 
+/// Callback type for live message subscriptions.
+type SubscriptionCallback = Arc<dyn Fn(PeerMessage) + Send + Sync>;
+
 /// Authenticated HTTP client for the MessageBox protocol.
 ///
 /// `MessageBoxClient<W>` wraps `AuthFetch<W>` behind a `tokio::sync::Mutex`
@@ -39,6 +42,11 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Updated on join_room (insert) and leave_room (remove).
     /// Arc allows sharing with background polling tasks.
     joined_rooms: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Registry of active subscriptions: room_id → callback. Survives reconnects.
+    /// Entries are added by listen_for_live_messages and removed by leave_room.
+    /// On WS reconnect, ensure_ws_connected replays joinRoom + re-subscribes
+    /// each entry on the fresh socket.
+    subscriptions: Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
 }
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
@@ -60,6 +68,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             network,
             ws_state: Mutex::new(None),
             joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            subscriptions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -319,6 +328,24 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             self.originator.clone(),
         )
         .await?;
+
+        // Replay subscriptions on the fresh socket so general_msg_dispatcher
+        // has callbacks registered for every active room. Without this, events
+        // delivered to the reconnected socket are silently dropped.
+        {
+            let subs = self.subscriptions.lock().await;
+            for (room_id, callback) in subs.iter() {
+                let event_key = format!("sendMessage-{room_id}");
+                // Re-join the room — ignore errors (server may already know us)
+                if let Err(e) = ws.join_room(room_id).await {
+                    tracing::warn!(room_id, error = %e, "joinRoom replay failed on reconnect");
+                } else {
+                    ws.subscribe(event_key, callback.clone()).await;
+                    tracing::info!(room_id, "replayed subscription on reconnected socket");
+                }
+            }
+        }
+
         *guard = Some(ws);
         Ok(())
     }
@@ -357,9 +384,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             let guard = self.ws_state.lock().await;
             if let Some(ref ws) = *guard {
                 ws.join_room(&room_id).await?;
-                ws.subscribe(event_key, on_message.clone()).await;
+                ws.subscribe(event_key.clone(), on_message.clone()).await;
             }
         }
+
+        // Register in the subscription registry so ensure_ws_connected can replay
+        // this subscription on any future reconnect.
+        self.subscriptions.lock().await.insert(room_id.clone(), on_message.clone());
 
         self.joined_rooms.lock().await.insert(room_id.clone());
 
@@ -692,6 +723,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
         self.joined_rooms.lock().await.remove(&room_id);
+        // Remove from subscription registry so future reconnects don't replay it.
+        self.subscriptions.lock().await.remove(&room_id);
         Ok(())
     }
 
@@ -1143,6 +1176,100 @@ mod tests {
     fn get_json_compiles(client: &MessageBoxClient<ArcWallet>) {
         // If get_json does not exist or has wrong signature, this fn fails to compile.
         let _fut = client.get_json("https://example.com/test");
+    }
+
+    // -----------------------------------------------------------------------
+    // Fix 2: Subscription registry tests
+    // -----------------------------------------------------------------------
+
+    /// Subscription registry starts empty on construction.
+    #[tokio::test]
+    async fn subscription_registry_starts_empty() {
+        let wallet = ArcWallet::new();
+        let client = MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            None,
+            Network::Mainnet,
+        );
+        let subs = client.subscriptions.lock().await;
+        assert!(subs.is_empty(), "subscriptions must be empty on new client");
+    }
+
+    /// Subscription registry can be populated and queried directly.
+    ///
+    /// This exercises the same path as listen_for_live_messages inserting into
+    /// the registry. Full reconnect replay requires a live Socket.IO server.
+    #[tokio::test]
+    async fn subscription_registry_insert_and_lookup() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let wallet = ArcWallet::new();
+        let client = MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet.clone(),
+            None,
+            Network::Mainnet,
+        );
+        let identity_key = client.get_identity_key().await.expect("identity key");
+
+        // Simulate what listen_for_live_messages does: build room_id and insert callback.
+        let room_id = format!("{identity_key}-test_inbox");
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let callback: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+            Arc::new(move |_msg| {
+                fired_clone.store(true, Ordering::SeqCst);
+            });
+
+        client
+            .subscriptions
+            .lock()
+            .await
+            .insert(room_id.clone(), callback.clone());
+
+        // Verify it was stored
+        let subs = client.subscriptions.lock().await;
+        assert!(subs.contains_key(&room_id), "room_id must be in registry");
+        assert_eq!(subs.len(), 1, "registry must have exactly one entry");
+
+        // Verify the stored callback is callable
+        let cb = subs.get(&room_id).cloned().expect("callback must exist");
+        drop(subs);
+        cb(bsv::remittance::types::PeerMessage {
+            message_id: "test".to_string(),
+            sender: "03sender".to_string(),
+            recipient: identity_key.clone(),
+            message_box: "test_inbox".to_string(),
+            body: "hello".to_string(),
+        });
+        assert!(fired.load(Ordering::SeqCst), "callback must have been invoked");
+    }
+
+    /// Subscription registry entry is removed when leave_room is called — compile check.
+    ///
+    /// Full removal requires ws_state to be Some (live connection). Here we verify
+    /// the direct remove path on the registry in isolation.
+    #[tokio::test]
+    async fn subscription_registry_remove_on_leave() {
+        let wallet = ArcWallet::new();
+        let client = MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            None,
+            Network::Mainnet,
+        );
+        let identity_key = client.get_identity_key().await.expect("identity key");
+        let room_id = format!("{identity_key}-inbox");
+
+        // Insert a dummy callback
+        let cb: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+            Arc::new(|_| {});
+        client.subscriptions.lock().await.insert(room_id.clone(), cb);
+        assert_eq!(client.subscriptions.lock().await.len(), 1, "inserted");
+
+        // Remove it directly (simulates what leave_room does)
+        client.subscriptions.lock().await.remove(&room_id);
+        assert!(client.subscriptions.lock().await.is_empty(), "removed");
     }
 
     /// `check_status_error` returns Ok for success body.

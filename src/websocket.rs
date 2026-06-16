@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
-use rust_socketio::{Event, Payload};
+use rust_socketio::Event;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::{oneshot, Mutex};
@@ -101,14 +101,7 @@ impl MessageBoxWebSocket {
             Arc::new(Mutex::new(Some(auth_success_tx)));
 
         // Clone shared state for the on_any callback closure
-        let subs_clone = subscriptions.clone();
-        let acks_clone = pending_acks.clone();
         let conn_clone = connected.clone();
-        let auth_success_on_any = auth_success_shared.clone();
-
-        // Wallet and originator captured by value — needed in defensive on_any fallback paths
-        let wallet_clone = wallet.clone();
-        let originator_clone = originator.clone();
 
         // Move owned copies into the on("authMessage") callback
         let auth_msg_tx_clone = auth_msg_tx.clone();
@@ -133,78 +126,19 @@ impl MessageBoxWebSocket {
                 }
                 .boxed()
             })
-            // Application event layer: defensive fallback for non-BRC-103 paths.
+            // Connection-state only — NOT an application-event path.
             //
-            // NOTE (confirmed 2026-03-29): The live Babbage server sends ALL handshake and
-            // room events as BRC-103 authMessage envelopes. For room message broadcasts,
-            // the server does NOT push to other clients via Socket.IO — messages are
-            // delivered via the HTTP polling fallback in listen_for_live_messages instead.
-            // These on_any handlers are retained as a defensive fallback for servers that
-            // DO broadcast raw Socket.IO events.
-            .on_any(move |event, payload, _socket| {
-                let subs = subs_clone.clone();
-                let acks = acks_clone.clone();
+            // Parity with @bsv/authsocket-client: every application event (room
+            // messages, acks, authenticationSuccess) arrives EXCLUSIVELY as a
+            // BRC-103-verified general message via `general_msg_dispatcher`.
+            // We deliberately do NOT process raw Socket.IO application events:
+            // accepting an unsigned raw event would be an unauthenticated receive
+            // path. This handler only mirrors `ioSocket.on('disconnect', ...)`.
+            .on_any(move |event, _payload, _socket| {
                 let conn = conn_clone.clone();
-                let auth_success = auth_success_on_any.clone();
-                let wallet = wallet_clone.clone();
-                let originator = originator_clone.clone();
-
                 async move {
-                    match &event {
-                        // BRC-103 replaces the bare `authenticated` emit on connect.
-                        // Do NOT re-emit here — the Peer handles authentication.
-                        Event::Connect => {}
-                        Event::Custom(name) => {
-                            if name == "authenticationSuccess" {
-                                conn.store(true, Ordering::SeqCst);
-                                // Race with general_msg_dispatcher — first one wins
-                                let mut guard = auth_success.lock().await;
-                                if let Some(tx) = guard.take() {
-                                    let _ = tx.send(());
-                                }
-                            } else if name.starts_with("sendMessage-") {
-                                // Defensive fallback — primary path is general_msg_dispatcher
-                                let event_key = name.clone();
-                                if let Some(server_msg) = extract_server_peer_message(&payload) {
-                                    let callback = {
-                                        let guard = subs.lock().await;
-                                        guard.get(&event_key).cloned()
-                                    };
-                                    if let Some(cb) = callback {
-                                        let room_id = name
-                                            .strip_prefix("sendMessage-")
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let decrypted_body = encryption::try_decrypt_message(
-                                            &wallet,
-                                            &server_msg.body,
-                                            &server_msg.sender,
-                                            originator.as_deref(),
-                                        )
-                                        .await;
-                                        let (recipient, message_box) = split_room_id(&room_id);
-                                        cb(PeerMessage {
-                                            message_id: server_msg.message_id,
-                                            sender: server_msg.sender,
-                                            recipient,
-                                            message_box,
-                                            body: decrypted_body,
-                                        });
-                                    }
-                                }
-                            } else if name.starts_with("sendMessageAck-") {
-                                // Defensive fallback — primary path is general_msg_dispatcher
-                                let mut guard = acks.lock().await;
-                                if let Some(tx) = guard.remove(name.as_str()) {
-                                    let success = parse_ack_status(&payload);
-                                    let _ = tx.send(success);
-                                }
-                            }
-                        }
-                        Event::Close => {
-                            conn.store(false, Ordering::SeqCst);
-                        }
-                        _ => {}
+                    if matches!(event, Event::Close) {
+                        conn.store(false, Ordering::SeqCst);
                     }
                 }
                 .boxed()
@@ -600,34 +534,6 @@ impl MessageBoxWebSocket {
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Parse a `ServerPeerMessage` from the first element of a Payload::Text.
-fn extract_server_peer_message(payload: &Payload) -> Option<ServerPeerMessage> {
-    match payload {
-        Payload::Text(values) => {
-            let first = values.first()?;
-            serde_json::from_value(first.clone()).ok()
-        }
-        _ => None,
-    }
-}
-
-/// Parse the ack status from a Socket.IO payload.
-///
-/// Returns true if the status is "success", false otherwise.
-fn parse_ack_status(payload: &Payload) -> bool {
-    match payload {
-        Payload::Text(values) => {
-            if let Some(v) = values.first() {
-                return v.get("status").and_then(|s| s.as_str()) == Some("success");
-            }
-            false
-        }
-        #[allow(deprecated)]
-        Payload::String(s) => s.contains("success"),
-        _ => false,
-    }
-}
 
 /// Split a room ID into (recipient/owner_identity_key, message_box_name).
 ///

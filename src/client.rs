@@ -354,18 +354,21 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Listen for live messages on a message box via WebSocket.
     ///
     /// Joins the Socket.IO room `{identity_key}-{message_box}` and registers
-    /// the provided callback. Messages are delivered via two complementary paths:
+    /// the provided callback. Messages can arrive via three paths, all funnelled
+    /// through one shared dedup wrapper so the callback fires at most once per id:
     ///
-    /// 1. **WebSocket push (primary):** The BRC-103 general_msg_dispatcher fires the
-    ///    callback when the server broadcasts `sendMessage-{roomId}` via the WS connection.
+    /// 1. **WebSocket push (primary):** the BRC-103 `general_msg_dispatcher` fires
+    ///    the callback when the server broadcasts a signed `sendMessage-{roomId}`.
+    /// 2. **WebSocket `on_any` (fallback):** the same callback, for servers that
+    ///    emit raw (unsigned) room events.
+    /// 3. **HTTP poll (backstop):** a background task that *stands down* for any
+    ///    interval in which WS push already delivered (so it does not poll every
+    ///    2 s when live push is healthy), and otherwise polls `/listMessages` to
+    ///    catch anything the WS paths missed — forcing a catch-up at least every
+    ///    `MAX_POLL_SKIPS` intervals. Stops when `leave_room` removes the room
+    ///    from `joined_rooms`.
     ///
-    /// 2. **HTTP polling fallback:** A background task polls `/listMessages` every 2 seconds
-    ///    and fires the callback for any new messages not yet seen via the WS path. This
-    ///    handles server implementations that store messages without broadcasting via WS.
-    ///    The polling task stops automatically when `leave_room` removes the room from
-    ///    `joined_rooms`.
-    ///
-    /// Both paths deliver `PeerMessage` with decrypted body to the same callback.
+    /// All paths deliver `PeerMessage` with decrypted body to the same callback.
     ///
     /// Establishes a WebSocket connection if one is not already active.
     /// `override_host` is reserved for future multi-host WS routing.
@@ -383,7 +386,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         // One user callback, three possible delivery paths (WS primary
         // dispatcher, WS `on_any` fallback, HTTP poll). Wrap once so a
-        // `message_id` reaches the user exactly once regardless of which path
+        // `message_id` reaches the user at most once regardless of which path
         // wins the race.
         let deduped = exactly_once(on_message);
 
@@ -428,6 +431,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             let mut last_activity = poll_ws_activity.load(Ordering::Relaxed);
+            let mut skipped: u32 = 0;
 
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -437,19 +441,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     break;
                 }
 
-                // If WebSocket push delivered anything since the last tick, live
-                // push is healthy — skip the redundant HTTP poll this cycle.
+                // Stand down while WS push is healthy, but force a catch-up at
+                // least every MAX_POLL_SKIPS intervals so partial push loss on an
+                // otherwise-active connection can't permanently suppress the poll.
                 let activity = poll_ws_activity.load(Ordering::Relaxed);
-                if activity != last_activity {
-                    last_activity = activity;
+                if !poll_should_run(activity, &mut last_activity, &mut skipped) {
                     continue;
                 }
 
-                // WS quiet for a full interval: run the backstop poll. Cheap
-                // no-op when the mailbox is simply idle; a genuine catch-up when
-                // live push stalled. The shared `deduped` callback suppresses
-                // anything WS may have already delivered.
-                let result = poll_list_messages(
+                // Backstop poll. Cheap no-op when the mailbox is simply idle; a
+                // genuine catch-up when live push stalled. The shared `deduped`
+                // callback suppresses anything WS already delivered.
+                match poll_list_messages(
                     &poll_auth_fetch,
                     &poll_host,
                     &poll_message_box,
@@ -457,11 +460,22 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     &poll_wallet,
                     poll_originator.as_deref(),
                 )
-                .await;
-
-                if let Ok(messages) = result {
-                    for msg in messages {
-                        poll_callback(msg);
+                .await
+                {
+                    Ok(messages) => {
+                        for msg in messages {
+                            poll_callback(msg);
+                        }
+                    }
+                    // The poll IS the correctness backstop — never swallow its
+                    // error silently. A persistent failure here means both live
+                    // push (already stalled) and the backstop are down.
+                    Err(e) => {
+                        tracing::warn!(
+                            room_id = %poll_room_id,
+                            error = %e,
+                            "poll backstop failed — message catch-up unavailable this interval"
+                        );
                     }
                 }
 
@@ -804,28 +818,37 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 }
 
 // ---------------------------------------------------------------------------
-// Bounded dedup set
+// Delivery callback wrappers
 // ---------------------------------------------------------------------------
 
-/// A bounded set with FIFO eviction for deduplicating message IDs.
-///
-/// Prevents unbounded memory growth in the HTTP polling fallback task.
-/// When the set reaches `capacity`, the oldest entry is evicted before
-/// inserting the new one.
+/// Maximum consecutive poll-backstop skips before a poll is forced regardless of
+/// WS activity. At the 2 s interval this caps the catch-up window at ~16 s, so a
+/// chatty room that keeps WS *activity* alive can never permanently suppress the
+/// backstop even if *individual* pushes are being lost.
+const MAX_POLL_SKIPS: u32 = 7;
+
 /// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
 /// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
 /// fallback, or the HTTP poll backstop. Without this, a server that both pushes
 /// and is polled (or an `on_any`/dispatcher race) fires the callback twice.
-/// Bounded FIFO set guards against unbounded memory on long-lived listeners.
+///
+/// Dedup is bounded to the most recent 10,000 distinct ids (FIFO eviction), so a
+/// duplicate separated from its original by more than 10,000 intervening ids can
+/// still slip through — acceptable for the single-use-mailbox traffic this
+/// serves. This suppresses duplicates only; delivery liveness comes from the
+/// WS + poll paths, not from this wrapper.
 fn exactly_once(
     inner: Arc<dyn Fn(PeerMessage) + Send + Sync>,
 ) -> Arc<dyn Fn(PeerMessage) + Send + Sync> {
     let seen = Arc::new(std::sync::Mutex::new(BoundedIdSet::new(10_000)));
     Arc::new(move |msg: PeerMessage| {
-        let fresh = seen
-            .lock()
-            .expect("exactly_once dedup mutex poisoned")
-            .insert(msg.message_id.clone());
+        // Recover rather than panic on poison: a poisoned dedup set is harmless
+        // (worst case one duplicate delivery), whereas panicking here would kill
+        // the WS dispatcher or the spawned poll task and stop delivery entirely.
+        let fresh = match seen.lock() {
+            Ok(mut g) => g.insert(msg.message_id.clone()),
+            Err(poisoned) => poisoned.into_inner().insert(msg.message_id.clone()),
+        };
         if fresh {
             inner(msg);
         }
@@ -846,6 +869,33 @@ fn record_ws_activity(
     })
 }
 
+/// Decide whether the poll backstop should run this interval, given the current
+/// WS-activity counter vs the value at the last check.
+///
+/// Skips (returns `false`) while WS push is delivering — *unless* `MAX_POLL_SKIPS`
+/// consecutive skips have accrued, in which case it forces a poll so partial push
+/// loss on an otherwise-active connection can't permanently suppress catch-up.
+/// Updates `last_activity` and `skipped` in place.
+fn poll_should_run(current_activity: u64, last_activity: &mut u64, skipped: &mut u32) -> bool {
+    if current_activity != *last_activity && *skipped < MAX_POLL_SKIPS {
+        *last_activity = current_activity;
+        *skipped += 1;
+        return false; // WS push is healthy this interval — stand down
+    }
+    *last_activity = current_activity;
+    *skipped = 0;
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Bounded dedup set
+// ---------------------------------------------------------------------------
+
+/// A bounded set with FIFO eviction for deduplicating message IDs.
+///
+/// Prevents unbounded memory growth in the HTTP polling fallback task.
+/// When the set reaches `capacity`, the oldest entry is evicted before
+/// inserting the new one.
 struct BoundedIdSet {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -1487,6 +1537,73 @@ mod tests {
 
         assert_eq!(activity.load(Ordering::Relaxed), 2, "counter bumped per delivery");
         assert_eq!(count.load(Ordering::SeqCst), 2, "inner callback forwarded each time");
+    }
+
+    #[test]
+    fn poll_should_run_runs_when_ws_quiet() {
+        // current == last → WS delivered nothing this interval → poll runs.
+        let mut last = 5u64;
+        let mut skipped = 0u32;
+        assert!(super::poll_should_run(5, &mut last, &mut skipped));
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn poll_should_run_stands_down_when_ws_active() {
+        // current != last → WS delivered → stand down (within the skip budget).
+        let mut last = 5u64;
+        let mut skipped = 0u32;
+        assert!(!super::poll_should_run(6, &mut last, &mut skipped));
+        assert_eq!(last, 6, "last_activity advances to current");
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn poll_should_run_forces_catch_up_after_max_skips() {
+        // A perpetually-active connection must still be polled at least every
+        // MAX_POLL_SKIPS intervals so partial push loss can't suppress catch-up.
+        let mut last = 0u64;
+        let mut skipped = 0u32;
+        let mut runs = 0u32;
+        for tick in 1..=(super::MAX_POLL_SKIPS as u64 * 3) {
+            // WS "delivers" every interval → counter always changes.
+            if super::poll_should_run(tick, &mut last, &mut skipped) {
+                runs += 1;
+            }
+        }
+        // Over 3*MAX_POLL_SKIPS always-active intervals, the forced poll fires
+        // roughly every (MAX_POLL_SKIPS+1) intervals — at least twice.
+        assert!(runs >= 2, "forced catch-up must fire periodically, got {runs}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exactly_once_is_safe_under_concurrent_delivery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The deduped callback is shared across the WS dispatcher, on_any, and
+        // the poll task concurrently. Hammer the same ids from many tasks and
+        // assert each id is delivered exactly once.
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+            Arc::new(move |_m| {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        let deduped = super::exactly_once(inner);
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cb = deduped.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..100 {
+                    cb(peer_msg(&format!("m{i}")));
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        // 100 distinct ids, each delivered exactly once despite 8 racing tasks.
+        assert_eq!(count.load(Ordering::SeqCst), 100);
     }
 
     #[test]

@@ -381,27 +381,39 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         self.ensure_ws_connected(override_host).await?;
 
+        // One user callback, three possible delivery paths (WS primary
+        // dispatcher, WS `on_any` fallback, HTTP poll). Wrap once so a
+        // `message_id` reaches the user exactly once regardless of which path
+        // wins the race.
+        let deduped = exactly_once(on_message);
+
+        // WS-only delivery counter. Bumped on every WebSocket delivery so the
+        // HTTP poll backstop below can detect healthy live-push and stand down,
+        // instead of hitting /listMessages every 2s for every active mailbox.
+        let ws_activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ws_callback = record_ws_activity(deduped.clone(), ws_activity.clone());
+
         {
             let guard = self.ws_state.lock().await;
             if let Some(ref ws) = *guard {
                 ws.join_room(&room_id).await?;
-                ws.subscribe(event_key.clone(), on_message.clone()).await;
+                ws.subscribe(event_key.clone(), ws_callback.clone()).await;
             }
         }
 
         // Register in the subscription registry so ensure_ws_connected can replay
-        // this subscription on any future reconnect.
-        self.subscriptions.lock().await.insert(room_id.clone(), on_message.clone());
+        // this subscription (with its dedup + activity wrappers) on any reconnect.
+        self.subscriptions.lock().await.insert(room_id.clone(), ws_callback.clone());
 
         self.joined_rooms.lock().await.insert(room_id.clone());
 
-        // Spawn a polling fallback task that periodically checks for new messages
-        // via HTTP. This complements the WS push path and handles server implementations
-        // that do not broadcast to room members via BRC-103 general messages.
-        //
-        // The poll interval is 2s — aggressive enough for interactive use without
-        // hammering the server. The task terminates when leave_room removes room_id
-        // from joined_rooms, or when the WS connection is disconnected.
+        // Spawn the HTTP poll BACKSTOP. With the server signing room broadcasts
+        // onto the client's authenticated primary path, live WS push is the fast
+        // path. The poll now exists only to (a) support servers that don't push
+        // and (b) recover if the WS connection silently stalls — so it stands
+        // down for any interval in which a WS delivery already occurred. This
+        // keeps redundant /listMessages load off the server under high-frequency,
+        // many-connection traffic while preserving a correctness backstop.
         let poll_auth_fetch = self.auth_fetch.clone();
         let poll_joined_rooms = self.joined_rooms.clone();
         let poll_host = self.host.clone();
@@ -410,13 +422,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let poll_wallet = self.wallet.clone();
         let poll_originator = self.originator.clone();
         let poll_room_id = room_id.clone();
-        let poll_callback = on_message;
+        let poll_callback = deduped;
+        let poll_ws_activity = ws_activity;
 
         tokio::spawn(async move {
-            // Track message IDs delivered by this polling task to avoid duplicates.
-            // Bounded to 10,000 entries with FIFO eviction to prevent unbounded
-            // memory growth on long-lived connections.
-            let mut seen_ids = BoundedIdSet::new(10_000);
+            use std::sync::atomic::Ordering;
+            let mut last_activity = poll_ws_activity.load(Ordering::Relaxed);
 
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -426,7 +437,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     break;
                 }
 
-                // Poll /listMessages with authenticated HTTP
+                // If WebSocket push delivered anything since the last tick, live
+                // push is healthy — skip the redundant HTTP poll this cycle.
+                let activity = poll_ws_activity.load(Ordering::Relaxed);
+                if activity != last_activity {
+                    last_activity = activity;
+                    continue;
+                }
+
+                // WS quiet for a full interval: run the backstop poll. Cheap
+                // no-op when the mailbox is simply idle; a genuine catch-up when
+                // live push stalled. The shared `deduped` callback suppresses
+                // anything WS may have already delivered.
                 let result = poll_list_messages(
                     &poll_auth_fetch,
                     &poll_host,
@@ -439,11 +461,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
                 if let Ok(messages) = result {
                     for msg in messages {
-                        if seen_ids.insert(msg.message_id.clone()) {
-                            poll_callback(msg);
-                        }
+                        poll_callback(msg);
                     }
                 }
+
+                // Refresh in case a WS delivery landed while we were polling.
+                last_activity = poll_ws_activity.load(Ordering::Relaxed);
             }
         });
 
@@ -789,6 +812,40 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 /// Prevents unbounded memory growth in the HTTP polling fallback task.
 /// When the set reaches `capacity`, the oldest entry is evicted before
 /// inserting the new one.
+/// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
+/// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
+/// fallback, or the HTTP poll backstop. Without this, a server that both pushes
+/// and is polled (or an `on_any`/dispatcher race) fires the callback twice.
+/// Bounded FIFO set guards against unbounded memory on long-lived listeners.
+fn exactly_once(
+    inner: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+) -> Arc<dyn Fn(PeerMessage) + Send + Sync> {
+    let seen = Arc::new(std::sync::Mutex::new(BoundedIdSet::new(10_000)));
+    Arc::new(move |msg: PeerMessage| {
+        let fresh = seen
+            .lock()
+            .expect("exactly_once dedup mutex poisoned")
+            .insert(msg.message_id.clone());
+        if fresh {
+            inner(msg);
+        }
+    })
+}
+
+/// Wrap a callback so every invocation first bumps `activity`. Installed only on
+/// the WebSocket delivery path, so the HTTP poll backstop can tell when live
+/// push is healthy and stand down (see the poll loop in
+/// [`MessageBoxClient::listen_for_live_messages`]).
+fn record_ws_activity(
+    inner: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+    activity: Arc<std::sync::atomic::AtomicU64>,
+) -> Arc<dyn Fn(PeerMessage) + Send + Sync> {
+    Arc::new(move |msg: PeerMessage| {
+        activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inner(msg);
+    })
+}
+
 struct BoundedIdSet {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -1380,5 +1437,80 @@ mod tests {
     #[should_panic(expected = "capacity must be at least 1")]
     fn bounded_id_set_rejects_zero_capacity() {
         super::BoundedIdSet::new(0);
+    }
+
+    fn peer_msg(id: &str) -> bsv::remittance::types::PeerMessage {
+        bsv::remittance::types::PeerMessage {
+            message_id: id.to_string(),
+            sender: "03sender".to_string(),
+            recipient: "02recipient".to_string(),
+            message_box: "inbox".to_string(),
+            body: "body".to_string(),
+        }
+    }
+
+    #[test]
+    fn exactly_once_delivers_each_message_id_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+            Arc::new(move |_m| {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        let deduped = super::exactly_once(inner);
+
+        // Same id arriving on three "paths" (WS dispatcher, WS on_any, poll).
+        deduped(peer_msg("m1"));
+        deduped(peer_msg("m1"));
+        deduped(peer_msg("m1"));
+        // A distinct id still gets through.
+        deduped(peer_msg("m2"));
+
+        assert_eq!(count.load(Ordering::SeqCst), 2, "m1 once + m2 once");
+    }
+
+    #[test]
+    fn record_ws_activity_bumps_counter_and_forwards() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let activity = Arc::new(AtomicU64::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+            Arc::new(move |_m| {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        let wrapped = super::record_ws_activity(inner, activity.clone());
+
+        wrapped(peer_msg("m1"));
+        wrapped(peer_msg("m2"));
+
+        assert_eq!(activity.load(Ordering::Relaxed), 2, "counter bumped per delivery");
+        assert_eq!(count.load(Ordering::SeqCst), 2, "inner callback forwarded each time");
+    }
+
+    #[test]
+    fn exactly_once_composes_with_record_ws_activity() {
+        // Mirrors the wiring in listen_for_live_messages: the WS path stamps
+        // activity then delivers through the shared dedup; the poll path shares
+        // the same dedup. A message delivered by WS must not be re-delivered by
+        // a later poll of the same id.
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        let activity = Arc::new(AtomicU64::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = count.clone();
+        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+            Arc::new(move |_m| {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        let deduped = super::exactly_once(inner);
+        let ws_path = super::record_ws_activity(deduped.clone(), activity.clone());
+        let poll_path = deduped;
+
+        ws_path(peer_msg("m1")); // delivered via WS, stamps activity
+        poll_path(peer_msg("m1")); // poll re-sees the same id → suppressed
+
+        assert_eq!(count.load(Ordering::SeqCst), 1, "delivered exactly once across paths");
+        assert_eq!(activity.load(Ordering::Relaxed), 1, "only the WS path stamps activity");
     }
 }

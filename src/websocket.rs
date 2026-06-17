@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use rust_socketio::asynchronous::{Client as SocketClient, ClientBuilder};
-use rust_socketio::Event;
+use rust_socketio::{Event, TransportType};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::{oneshot, Mutex};
@@ -14,6 +14,12 @@ use tokio::sync::{oneshot, Mutex};
 /// no-op event. Must be below the Socket.IO / EngineIO ping timeout (typically
 /// 25–60 s depending on server configuration). 20 s gives comfortable headroom.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Maximum time to wait for the Socket.IO namespace connect-ack ("40{sid}")
+/// before failing the connection. A healthy server acks in well under a second
+/// even across a network hop; the bound exists so a server that never completes
+/// the namespace handshake fails fast instead of hanging the caller.
+const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 use bsv::auth::peer::Peer;
 use bsv::auth::types::MessageType;
@@ -100,13 +106,35 @@ impl MessageBoxWebSocket {
         let auth_success_shared: Arc<Mutex<Option<oneshot::Sender<()>>>> =
             Arc::new(Mutex::new(Some(auth_success_tx)));
 
-        // Clone shared state for the on_any callback closure
+        // Clone shared state for the connect/close lifecycle callbacks.
         let conn_clone = connected.clone();
+        let conn_close_clone = connected.clone();
+
+        // Socket.IO connect-ack gate (consumed by the wait before the first emit).
+        //
+        // `rust_socketio::connect()` sends the namespace CONNECT packet ("40") and
+        // returns immediately, without waiting for the server's connect-ack
+        // ("40{sid}"). Emitting an event in that window races the handshake, and
+        // servers that follow the Socket.IO spec strictly (e.g. socketioxide)
+        // reject an event received before the namespace is connected and close the
+        // socket. On loopback the ack typically wins the race; across any network
+        // hop that coalesces the CONNECT and the event into a single read — common
+        // through reverse proxies and load balancers — the event can land first and
+        // the connection is dropped. Closing the race explicitly (hold the first
+        // emit until Event::Connect) makes the handshake reliable on every path.
+        let (connect_ready_tx, mut connect_ready_rx) = mpsc::channel::<()>(1);
+        let connect_ready_tx_cb = connect_ready_tx.clone();
 
         // Move owned copies into the on("authMessage") callback
         let auth_msg_tx_clone = auth_msg_tx.clone();
         let server_key_tx_clone = server_key_tx.clone();
 
+        // We register handlers ONLY for `authMessage` (the BRC-103 transport) and
+        // the Connect/Close lifecycle events. There is deliberately no handler for
+        // raw Socket.IO application events: for parity with @bsv/authsocket-client,
+        // every application message (room delivery, acks, authenticationSuccess)
+        // must arrive as a BRC-103-verified general message, never as an unsigned
+        // raw event. Registering no raw-event handler keeps that receive path closed.
         let client = ClientBuilder::new(url)
             // BRC-103 transport layer: all authMessage events feed into the Peer channel
             .on("authMessage", move |payload, _socket| {
@@ -126,23 +154,38 @@ impl MessageBoxWebSocket {
                 }
                 .boxed()
             })
-            // Connection-state only — NOT an application-event path.
+            // Lifecycle events are routed through the per-event `on` map (rust_socketio
+            // delivers only Message/Custom events to `on_any`), so Connect and Close
+            // each need a dedicated handler.
             //
-            // Parity with @bsv/authsocket-client: every application event (room
-            // messages, acks, authenticationSuccess) arrives EXCLUSIVELY as a
-            // BRC-103-verified general message via `general_msg_dispatcher`.
-            // We deliberately do NOT process raw Socket.IO application events:
-            // accepting an unsigned raw event would be an unauthenticated receive
-            // path. This handler only mirrors `ioSocket.on('disconnect', ...)`.
-            .on_any(move |event, _payload, _socket| {
+            // Connect: the namespace connect-ack ("40{sid}") arrived — the socket is
+            // ready, so release the connect-ready gate to unblock the first emit.
+            .on(Event::Connect, move |_payload, _socket| {
                 let conn = conn_clone.clone();
+                let ready = connect_ready_tx_cb.clone();
                 async move {
-                    if matches!(event, Event::Close) {
-                        conn.store(false, Ordering::SeqCst);
-                    }
+                    conn.store(true, Ordering::SeqCst);
+                    let _ = ready.try_send(());
                 }
                 .boxed()
             })
+            // Close: the transport went away — mark disconnected so the next call reconnects.
+            .on(Event::Close, move |_payload, _socket| {
+                let conn = conn_close_clone.clone();
+                async move {
+                    conn.store(false, Ordering::SeqCst);
+                }
+                .boxed()
+            })
+            // Connect WebSocket-first rather than the EngineIO default (HTTP
+            // long-poll, then upgrade to WebSocket). The upgrade handshake exchanges
+            // "2probe"/"3probe" frames that many reverse proxies and load balancers
+            // forward unreliably: the HTTP 101 succeeds but the probe never
+            // round-trips, leaving the connection stuck on slow long-polling — or
+            // stalled until the BRC-103 handshake times out. A WS-first connect runs
+            // the EngineIO handshake directly over the WebSocket, which intermediaries
+            // treat as an ordinary upgraded connection, so live push works on any path.
+            .transport_type(TransportType::Websocket)
             // Disable auto-reconnect for v1 — reconnect requires fresh Peer + Transport.
             // TODO: Phase 8 — implement transparent BRC-103 reconnect
             .reconnect(false)
@@ -181,6 +224,18 @@ impl MessageBoxWebSocket {
         // The Peer discovers it from the server's InitialResponse and updates
         // the session accordingly.
         // -----------------------------------------------------------------------
+        // Hold the first emit until the namespace connect-ack arrives, so the
+        // BRC-103 InitialRequest is never delivered ahead of the namespace
+        // handshake (see the connect-ready gate above).
+        match tokio::time::timeout(CONNECT_ACK_TIMEOUT, connect_ready_rx.recv()).await {
+            Ok(Some(())) => {}
+            _ => {
+                return Err(MessageBoxError::WebSocket(
+                    "Socket.IO connect-ack not received before timeout".into(),
+                ))
+            }
+        }
+
         let auth_payload = encode_ws_event("authenticated", json!({"identityKey": identity_key}));
         peer.send_message("", auth_payload)
             .await

@@ -7,6 +7,39 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.3] — 2026-06-16
+
+### Fixed
+
+- **Live WebSocket delivery now works through reverse proxies and load balancers**
+  (`src/websocket.rs`). Two independent issues prevented the BRC-103 handshake
+  from completing once a proxy sat between client and server, silently forcing
+  every connection onto the slow HTTP long-poll fallback:
+  - **Connect WebSocket-first** (`transport_type(TransportType::Websocket)`).
+    The EngineIO default (long-poll, then upgrade) exchanges `2probe`/`3probe`
+    upgrade frames that many intermediaries forward unreliably — the HTTP 101
+    succeeds but the probe never round-trips. A WS-first connect runs the
+    EngineIO handshake directly over the WebSocket, which proxies treat as an
+    ordinary upgraded connection.
+  - **Gate the first emit on the namespace connect-ack.** `rust_socketio`'s
+    `connect()` sends the Socket.IO CONNECT (`40`) and returns without awaiting
+    the server's ack (`40{sid}`), so the BRC-103 InitialRequest could be emitted
+    before the namespace was established. Across a network hop the CONNECT and
+    the event coalesce into one read, and spec-strict servers (e.g. socketioxide)
+    reject the premature event and close the socket. The first emit now waits for
+    `Event::Connect` (bounded by `CONNECT_ACK_TIMEOUT`).
+  - Verified end-to-end against a deployed server behind a CDN + platform proxy:
+    sequential receive latency p50 ≈ 0.1 s (was ~2 s on the poll fallback),
+    0 timeouts, and 100% delivery across 50 concurrent WebSocket connections.
+
+- **Connection-close detection now fires** (`src/websocket.rs`). Close handling
+  was registered via `on_any`, which `rust_socketio` only invokes for
+  Message/Custom events — so `Event::Close` was never observed. Moved to a
+  dedicated `on(Event::Close, …)` handler so a dropped transport correctly marks
+  the socket disconnected for reconnect-on-next-call.
+
+---
+
 ## [0.1.2] — 2026-06-16
 
 ### Security

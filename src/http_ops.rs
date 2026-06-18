@@ -8,7 +8,7 @@ use futures_util::future::join_all;
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
-use crate::client::check_status_error;
+use crate::client::{check_status_error, is_duplicate_message_rejection};
 use crate::types::{AcknowledgeMessageParams, FailedRecipient, ListMessagesParams, ListMessagesResponse, MessagePayment, MessagePaymentOutput, SendListParams, SendListResult, SentRecipient, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
 
@@ -182,7 +182,35 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let body_bytes = serde_json::to_vec(&request)?;
         let url = format!("{host}/sendMessage");
-        let response = self.post_json(&url, body_bytes).await?;
+        // Use the raw POST so we can inspect the body even on a non-2xx status.
+        // The relay rejects a duplicate `messageId` with HTTP 400 + a structured
+        // body; `post_json` would early-return `Err(Http(400))` and discard that
+        // body, hiding the duplicate signal from us.
+        let response = self.post_json_raw(&url, body_bytes).await?;
+
+        // IDEMPOTENT-DELIVERY SEMANTICS: a duplicate-message rejection means the
+        // relay ALREADY has this exact `messageId` stored — i.e. the message was
+        // already delivered. Because `generate_message_id` is a deterministic
+        // HMAC over (body, recipient, originator), two concurrent sends of the
+        // same logical message collide on the same id: one insert wins, the
+        // other gets `ERR_DUPLICATE_MESSAGE`. The logical send DID succeed, so we
+        // return Ok with the (already-known) message id instead of an error. This
+        // prevents spurious failures + retries under concurrent presign sends.
+        //
+        // We match the relay's PRECISE duplicate signal (`code ==
+        // "ERR_DUPLICATE_MESSAGE"`), never a blanket "swallow all 400s" — genuine
+        // auth / validation rejections continue to surface as errors below.
+        if is_duplicate_message_rejection(&response.body) {
+            return Ok(resolved_message_id);
+        }
+
+        // Non-2xx that ISN'T a duplicate → genuine HTTP failure. Preserve the
+        // status-code error `post_json` would have produced.
+        if response.status < 200 || response.status >= 300 {
+            return Err(MessageBoxError::Http(response.status, url));
+        }
+
+        // 2xx but possibly a logical `{"status":"error",...}` payload.
         check_status_error(&response.body)?;
 
         // PARITY: TS returns server messageId when present, falls back to HMAC ID

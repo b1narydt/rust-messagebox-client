@@ -6,6 +6,9 @@ use bsv::remittance::types::PeerMessage;
 use bsv::services::overlay_tools::Network;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
+// `Mutex` is still used for WebSocket state, joined rooms, and the subscription
+// registry — see the corresponding fields below. It is NO LONGER used for
+// `auth_fetch`, which is now concurrency-safe (`&self`) and shared bare via `Arc`.
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
@@ -16,16 +19,23 @@ type SubscriptionCallback = Arc<dyn Fn(PeerMessage) + Send + Sync>;
 
 /// Authenticated HTTP client for the MessageBox protocol.
 ///
-/// `MessageBoxClient<W>` wraps `AuthFetch<W>` behind a `tokio::sync::Mutex`
-/// because `AuthFetch::fetch()` takes `&mut self` and must be called from
-/// async context.  A `std::sync::Mutex` held across `.await` panics under
-/// Tokio — this is load-bearing and must not be changed.
+/// `MessageBoxClient<W>` shares a single `AuthFetch<W>` via a bare `Arc` (no
+/// `Mutex`). `AuthFetch` is now concurrency-safe: every method takes `&self`,
+/// so any number of requests can be in flight on one session simultaneously.
+/// The client therefore never serializes HTTP round-trips — concurrent
+/// `send`/`list`/`poll` calls on the same `MessageBoxClient` execute in
+/// parallel, bounded only by the wallet and the network, not by a client-side
+/// lock. (Previously `AuthFetch::fetch()` took `&mut self`, forcing an
+/// `Arc<Mutex<AuthFetch>>` that funnelled all traffic through one lock and
+/// capped throughput at ~35 req/s; that bottleneck is gone.)
 pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Base URL of the MessageBox server (trailing whitespace trimmed on construction).
     host: String,
-    /// BRC-31 authenticated HTTP client (needs `&mut self`, hence Arc<Mutex> for sharing).
-    /// Arc allows cloning into background polling tasks without duplicating the wallet auth state.
-    auth_fetch: Arc<Mutex<AuthFetch<W>>>,
+    /// BRC-31 authenticated HTTP client. `&self`-concurrency-safe, so it is shared
+    /// via a bare `Arc` — N requests can be in flight on one session at once.
+    /// The `Arc` lets background polling tasks share the same wallet auth state
+    /// without a lock or duplicating it.
+    auth_fetch: Arc<AuthFetch<W>>,
     /// Wallet retained for direct encrypt / decrypt calls in `http_ops`.
     wallet: W,
     /// Optional originator string forwarded to wallet operations.
@@ -61,7 +71,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub fn new(host: String, wallet: W, originator: Option<String>, network: Network) -> Self {
         MessageBoxClient {
             host: host.trim().to_string(),
-            auth_fetch: Arc::new(Mutex::new(AuthFetch::new(wallet.clone()))),
+            auth_fetch: Arc::new(AuthFetch::new(wallet.clone())),
             wallet,
             originator,
             identity_key: OnceCell::new(),
@@ -276,9 +286,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// POST JSON bytes to `url` using BRC-31 authenticated transport.
     ///
-    /// The entire `fetch()` call executes while the lock is held.  This is
-    /// correct because `fetch()` is the outermost operation; no re-entrant
-    /// locking occurs on the Phase 1 code path.
+    /// `fetch()` takes `&self` and is concurrency-safe, so this call holds no
+    /// client-side lock — multiple `post_json` calls on the same client run in
+    /// parallel.
     pub(crate) async fn post_json(
         &self,
         url: &str,
@@ -289,8 +299,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let response = self
             .auth_fetch
-            .lock()
-            .await
             .fetch(url, "POST", Some(body_bytes), Some(headers))
             .await
             .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
@@ -300,6 +308,28 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
 
         Ok(response)
+    }
+
+    /// POST JSON bytes to `url`, returning the response **regardless of HTTP
+    /// status** so the caller can inspect the body on a non-2xx reply.
+    ///
+    /// `post_json` early-returns `Err(Http(status))` on any non-2xx response and
+    /// discards the body — which is correct for most endpoints, but loses the
+    /// relay's structured error payload. `sendMessage` needs that payload to
+    /// distinguish the idempotent `ERR_DUPLICATE_MESSAGE` rejection (delivered
+    /// HTTP 400) from genuine failures, so it uses this raw variant instead.
+    pub(crate) async fn post_json_raw(
+        &self,
+        url: &str,
+        body_bytes: Vec<u8>,
+    ) -> Result<AuthFetchResponse, MessageBoxError> {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+
+        self.auth_fetch
+            .fetch(url, "POST", Some(body_bytes), Some(headers))
+            .await
+            .map_err(|e| MessageBoxError::Auth(e.to_string()))
     }
 
     // -----------------------------------------------------------------------
@@ -803,8 +833,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub(crate) async fn get_json(&self, url: &str) -> Result<AuthFetchResponse, MessageBoxError> {
         let response = self
             .auth_fetch
-            .lock()
-            .await
             .fetch(url, "GET", None, None)
             .await
             .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
@@ -954,7 +982,7 @@ impl BoundedIdSet {
 /// Returns a `Vec<PeerMessage>` with decrypted bodies, or an empty vec on error.
 /// `accept_payments` is always false — the polling path does not handle delivery fees.
 async fn poll_list_messages<W>(
-    auth_fetch: &Arc<Mutex<AuthFetch<W>>>,
+    auth_fetch: &Arc<AuthFetch<W>>,
     host: &str,
     message_box: &str,
     identity_key: &str,
@@ -973,8 +1001,6 @@ where
     headers.insert("content-type".to_string(), "application/json".to_string());
 
     let response = auth_fetch
-        .lock()
-        .await
         .fetch(&url, "POST", Some(body_bytes), Some(headers))
         .await
         .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
@@ -1022,6 +1048,40 @@ fn extract_plain_body(body: &str) -> String {
         }
     }
     body.to_string()
+}
+
+/// Detect the relay's *duplicate-message* rejection in a response body.
+///
+/// The MessageBox relay rejects a re-send of an already-stored `messageId` with
+/// HTTP 400 and body `{"status":"error","code":"ERR_DUPLICATE_MESSAGE",
+/// "description":"Duplicate message."}` (see
+/// `rust-messagebox-server/src/handlers/send_message.rs` — `error_response(
+/// BAD_REQUEST, "ERR_DUPLICATE_MESSAGE", "Duplicate message.")`).
+///
+/// Because `generate_message_id` is a deterministic HMAC over
+/// `(body, recipient, originator)`, two concurrent sends of the *same logical
+/// message* derive the *same* `messageId`: one wins the insert, the other gets
+/// this rejection. A duplicate rejection therefore means the message was
+/// **already delivered** — it is idempotent-delivery success, NOT a failure.
+///
+/// We match on the precise `code == "ERR_DUPLICATE_MESSAGE"` signal (not a
+/// blanket "ignore all 400s"), so genuine auth / validation rejections
+/// (`ERR_INVALID_RECIPIENT_KEY`, `ERR_MESSAGE_REQUIRED`, BRC-31 auth failures,
+/// …) still surface as errors.
+///
+/// Note: NOT a TS-parity behaviour. `@bsv/message-box-client` (v2.0.6) treats
+/// any non-`success` send response as a thrown error and has no idempotent
+/// duplicate handling; this is a deliberate Rust-side correctness improvement
+/// for concurrent presign sends that collide on the deterministic messageId.
+pub(crate) fn is_duplicate_message_rejection(body: &[u8]) -> bool {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        if v.get("status").and_then(|s| s.as_str()) == Some("error")
+            && v.get("code").and_then(|c| c.as_str()) == Some("ERR_DUPLICATE_MESSAGE")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Check if a successful (2xx) HTTP response body contains a server-level
@@ -1411,6 +1471,31 @@ mod tests {
         let err = check_status_error(body).unwrap_err();
         assert!(matches!(err, crate::error::MessageBoxError::Auth(_)));
         assert_eq!(err.to_string(), "auth error: permission denied");
+    }
+
+    /// `is_duplicate_message_rejection` matches the relay's precise duplicate signal.
+    #[test]
+    fn is_duplicate_message_rejection_matches_exact_code() {
+        use super::is_duplicate_message_rejection;
+        // The exact body the relay returns (HTTP 400) for a duplicate messageId.
+        let dup = br#"{"status":"error","code":"ERR_DUPLICATE_MESSAGE","description":"Duplicate message."}"#;
+        assert!(is_duplicate_message_rejection(dup), "must match ERR_DUPLICATE_MESSAGE");
+    }
+
+    /// Genuine validation / auth errors must NOT be treated as duplicates.
+    #[test]
+    fn is_duplicate_message_rejection_rejects_other_errors() {
+        use super::is_duplicate_message_rejection;
+        let invalid = br#"{"status":"error","code":"ERR_INVALID_RECIPIENT_KEY","description":"bad key"}"#;
+        let missing = br#"{"status":"error","code":"ERR_MESSAGE_REQUIRED","description":"no body"}"#;
+        // An error body with no `code` field (e.g. a raw BRC-31 auth failure).
+        let no_code = br#"{"status":"error","description":"permission denied"}"#;
+        let success = br#"{"status":"success","messageId":"abc"}"#;
+        assert!(!is_duplicate_message_rejection(invalid), "ERR_INVALID_RECIPIENT_KEY is not a duplicate");
+        assert!(!is_duplicate_message_rejection(missing), "ERR_MESSAGE_REQUIRED is not a duplicate");
+        assert!(!is_duplicate_message_rejection(no_code), "no-code error is not a duplicate");
+        assert!(!is_duplicate_message_rejection(success), "success is not a duplicate");
+        assert!(!is_duplicate_message_rejection(b"not json"), "malformed body is not a duplicate");
     }
 
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).

@@ -7,6 +7,40 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **Half-open WebSocket detection (issue #7)** (`src/websocket.rs`, `src/client.rs`).
+  A black-holed socket (peer gone, no TCP FIN) was previously invisible until the
+  next write failed — up to 20 s+ of silently dropped inbound messages. Added an
+  inbound **read-deadline watchdog**: every inbound frame (BRC-103 authMessage,
+  general message, ack) stamps a monotonic timestamp, and a 1 s watchdog declares
+  the socket dead if nothing arrives within `READ_DEADLINE` (5 s, ~2.5× the
+  keepalive round-trip). The keepalive probe still runs every 20 s to elicit
+  inbound traffic; the deadline, not the next write, is now the liveness gate.
+- **Proactive reconnect** (`src/client.rs`). A background supervisor watches the
+  connection flag and, on a half-open death, re-establishes the socket with
+  jittered exponential backoff (250 ms → 10 s) and replays joinRoom +
+  re-subscribe for every active subscription — without waiting for the next
+  send/receive call. `is_ws_connected()` now reflects reality within the
+  detection window.
+
+### Changed
+
+- **Un-serialized the WebSocket send path** (`src/websocket.rs`). Removed the
+  single-command-at-a-time `peer_tx` funnel (one `tokio::select!` loop that
+  awaited each `peer.send_message` before the next) — the WS-path twin of the
+  `Arc<Mutex<AuthFetch>>` already removed from the HTTP path. Sends now sign
+  through the `&self` `Peer::create_general_message` (lock-free against the
+  shared session, bsv-sdk ≥ 0.2.86) and emit on the cloned Socket.IO `Client`
+  (whose `emit` is `&self`), so N concurrent `send_live_message` calls on one
+  socket sign + emit + await their acks in parallel. Ack correlation moved from a
+  single `oneshot` per `sendMessageAck-{roomId}` to a FIFO `VecDeque` per key, so
+  concurrent same-room sends each resolve against one room-scoped ack in order
+  (the server ack carries no messageId). Wire format unchanged — TS/Go/Rust
+  interop holds.
+
 ## [0.1.3] — 2026-06-16
 
 ### Fixed

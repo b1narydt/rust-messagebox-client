@@ -17,6 +17,53 @@ use crate::types::{ListMessagesParams, ListMessagesResponse};
 /// Callback type for live message subscriptions.
 type SubscriptionCallback = Arc<dyn Fn(PeerMessage) + Send + Sync>;
 
+/// Backoff bounds for the proactive reconnect supervisor.
+const RECONNECT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+const RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Establish a fresh WebSocket connection and swap it into `ws_state`, replaying
+/// joinRoom + re-subscribe for every active subscription.
+///
+/// Shared by `ensure_ws_connected` (lazy/on-demand connect) and the reconnect
+/// supervisor (proactive heal). Lives as a free function — taking `Arc` handles
+/// rather than `&self` — so the `'static` supervisor task can call it without a
+/// self-reference. On success the new socket replaces whatever was in
+/// `ws_state`; the old (dead) socket is dropped, tearing down its tasks.
+async fn reconnect_ws<W>(
+    ws_state: &Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
+    subscriptions: &Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
+    ws_url: &str,
+    identity_key: &str,
+    wallet: W,
+    originator: Option<String>,
+) -> Result<(), MessageBoxError>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    let ws = crate::websocket::MessageBoxWebSocket::connect(ws_url, identity_key, wallet, originator)
+        .await?;
+
+    // Replay subscriptions on the fresh socket so the general_msg_dispatcher
+    // has callbacks registered for every active room. Without this, events
+    // delivered to the reconnected socket are silently dropped.
+    {
+        let subs = subscriptions.lock().await;
+        for (room_id, callback) in subs.iter() {
+            let event_key = format!("sendMessage-{room_id}");
+            // Re-join the room — ignore errors (server may already know us)
+            if let Err(e) = ws.join_room(room_id).await {
+                tracing::warn!(room_id, error = %e, "joinRoom replay failed on reconnect");
+            } else {
+                ws.subscribe(event_key, callback.clone()).await;
+                tracing::info!(room_id, "replayed subscription on reconnected socket");
+            }
+        }
+    }
+
+    *ws_state.lock().await = Some(ws);
+    Ok(())
+}
+
 /// Authenticated HTTP client for the MessageBox protocol.
 ///
 /// `MessageBoxClient<W>` shares a single `AuthFetch<W>` via a bare `Arc` (no
@@ -48,7 +95,12 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Defaults to Mainnet; pass Network::Local for localhost integration tests.
     pub(crate) network: Network,
     /// WebSocket connection state (None until first live message call).
-    ws_state: Mutex<Option<crate::websocket::MessageBoxWebSocket>>,
+    ///
+    /// `Arc` so the background reconnect supervisor task can share it and swap a
+    /// freshly reconnected socket in without a self-reference.
+    ws_state: Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
+    /// Ensures the reconnect supervisor task is spawned at most once per client.
+    reconnect_supervisor: OnceCell<()>,
     /// Tracks which message box rooms have been joined via join_room.
     /// Updated on join_room (insert) and leave_room (remove).
     /// Arc allows sharing with background polling tasks.
@@ -77,7 +129,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             identity_key: OnceCell::new(),
             init_once: OnceCell::new(),
             network,
-            ws_state: Mutex::new(None),
+            ws_state: Arc::new(Mutex::new(None)),
+            reconnect_supervisor: OnceCell::new(),
             joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -346,13 +399,25 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        let mut guard = self.ws_state.lock().await;
-        if guard.as_ref().map(|ws| ws.is_connected()).unwrap_or(false) {
+        // Fast path: already connected.
+        if self
+            .ws_state
+            .lock()
+            .await
+            .as_ref()
+            .map(|ws| ws.is_connected())
+            .unwrap_or(false)
+        {
+            // Still make sure the supervisor is watching this live socket.
+            self.spawn_reconnect_supervisor(override_host).await?;
             return Ok(());
         }
+
         let identity_key = self.get_identity_key().await?;
         let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
-        let ws = crate::websocket::MessageBoxWebSocket::connect(
+        reconnect_ws(
+            &self.ws_state,
+            &self.subscriptions,
             &ws_url,
             &identity_key,
             self.wallet.clone(),
@@ -360,24 +425,102 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         )
         .await?;
 
-        // Replay subscriptions on the fresh socket so general_msg_dispatcher
-        // has callbacks registered for every active room. Without this, events
-        // delivered to the reconnected socket are silently dropped.
-        {
-            let subs = self.subscriptions.lock().await;
-            for (room_id, callback) in subs.iter() {
-                let event_key = format!("sendMessage-{room_id}");
-                // Re-join the room — ignore errors (server may already know us)
-                if let Err(e) = ws.join_room(room_id).await {
-                    tracing::warn!(room_id, error = %e, "joinRoom replay failed on reconnect");
-                } else {
-                    ws.subscribe(event_key, callback.clone()).await;
-                    tracing::info!(room_id, "replayed subscription on reconnected socket");
-                }
-            }
+        // Start the proactive reconnect supervisor (idempotent) so a later
+        // half-open death is healed in the background, not on the next call.
+        self.spawn_reconnect_supervisor(override_host).await?;
+        Ok(())
+    }
+
+    /// Spawn the background reconnect supervisor exactly once.
+    ///
+    /// The supervisor watches the WS connection's `is_connected()` flag. When the
+    /// watchdog (websocket.rs) flips it false on a half-open death — within
+    /// ~READ_DEADLINE, not 20 s+ — the supervisor proactively re-establishes the
+    /// socket with jittered backoff and replays joinRoom + re-subscribes every
+    /// active subscription, WITHOUT waiting for the next send/receive call. This
+    /// is what makes `is_ws_connected()` reflect reality and live delivery resume
+    /// on its own after a transient partition.
+    async fn spawn_reconnect_supervisor(
+        &self,
+        override_host: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
+        if self.reconnect_supervisor.get().is_some() {
+            return Ok(());
+        }
+        let identity_key = self.get_identity_key().await?;
+        let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
+
+        // OnceCell::set races are benign — only one initializer wins; the loser
+        // simply skips spawning a duplicate.
+        if self.reconnect_supervisor.set(()).is_err() {
+            return Ok(());
         }
 
-        *guard = Some(ws);
+        let ws_state = self.ws_state.clone();
+        let subscriptions = self.subscriptions.clone();
+        let wallet = self.wallet.clone();
+        let originator = self.originator.clone();
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                // Only reconnect if (a) a socket exists, (b) it is dead, and
+                // (c) there is at least one active subscription to keep alive.
+                // A fresh client with no live listeners should not hold a socket
+                // open just because the supervisor is running.
+                let needs_reconnect = {
+                    let guard = ws_state.lock().await;
+                    match guard.as_ref() {
+                        Some(ws) => !ws.is_connected(),
+                        None => false,
+                    }
+                };
+                if !needs_reconnect {
+                    continue;
+                }
+                if subscriptions.lock().await.is_empty() {
+                    continue;
+                }
+
+                // Reconnect with jittered exponential backoff until it succeeds
+                // or the listeners go away.
+                let mut backoff = RECONNECT_BASE_BACKOFF;
+                loop {
+                    if subscriptions.lock().await.is_empty() {
+                        break;
+                    }
+                    match reconnect_ws(
+                        &ws_state,
+                        &subscriptions,
+                        &ws_url,
+                        &identity_key,
+                        wallet.clone(),
+                        originator.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            tracing::info!("WS reconnected proactively after half-open death");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, backoff_ms = backoff.as_millis() as u64, "proactive WS reconnect failed; retrying");
+                            // Jitter: sleep backoff ± up to 25% to avoid
+                            // thundering-herd reconnects across many clients.
+                            let jitter = rand::random::<f64>() * 0.5 - 0.25; // [-0.25, +0.25)
+                            let millis = backoff.as_millis() as f64 * (1.0 + jitter);
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                millis.max(1.0) as u64,
+                            ))
+                            .await;
+                            backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
+                        }
+                    }
+                }
+            }
+        });
+
         Ok(())
     }
 

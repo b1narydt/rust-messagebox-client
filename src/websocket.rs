@@ -13,18 +13,40 @@ use tokio::sync::mpsc;
 use tokio::sync::{oneshot, Mutex};
 
 /// Interval at which the keepalive task emits a probe to elicit inbound
-/// traffic. Must be below the Socket.IO / EngineIO ping timeout (typically
-/// 25–60 s depending on server configuration). 20 s gives comfortable headroom.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+/// traffic.
+///
+/// CRITICAL INVARIANT (issue #7 regression fix): this MUST be comfortably
+/// below `READ_DEADLINE`. The keepalive probe is an `authenticated` event; the
+/// server replies with a signed `authenticationSuccess` general message
+/// (rust-messagebox-server `handle_general_event` → `emit_signed`), which the
+/// `general_msg_dispatcher` decodes and uses to stamp `last_inbound_ms`. That
+/// round-trip is therefore the liveness signal that keeps a *subscribed-but-idle*
+/// socket alive — an idle socket receives NO application frames, so without the
+/// keepalive round-trip refreshing the deadline inside the window the watchdog
+/// false-fires and triggers a reconnect storm.
+///
+/// At 2 s, a healthy socket refreshes `last_inbound_ms` roughly every 2 s, so a
+/// 6 s `READ_DEADLINE` tolerates ~3 missed keepalive round-trips (transient
+/// scheduling jitter, a slow GC pause, one dropped probe) before declaring the
+/// socket dead. rust_socketio 0.6 exposes no engine.io pong/heartbeat callback
+/// (its `Event` enum is only Message/Error/Custom/Connect/Close), so the
+/// application-level keepalive round-trip is the *only* liveness signal
+/// available — hence it must cycle well inside the deadline.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Inbound read deadline for half-open detection. If NO frame of any kind
-/// (BRC-103 authMessage, general message, ack) arrives within this window, the
-/// socket is declared dead and a reconnect is triggered. A healthy socket emits
-/// at least one frame per keepalive round-trip, plus engine.io's own ping/pong;
-/// 5 s is ~2.5× the round-trip budget for a live link, so it does not false-fire
-/// on a healthy-but-idle connection while still detecting a black-holed peer
-/// (no FIN) far faster than the old 20 s+ "next write fails" path (issue #7).
-const READ_DEADLINE: Duration = Duration::from_secs(5);
+/// (BRC-103 authMessage, general message, ack, OR the keepalive's
+/// `authenticationSuccess` reply) arrives within this window, the socket is
+/// declared dead and a reconnect is triggered.
+///
+/// A healthy socket refreshes `last_inbound_ms` every `KEEPALIVE_INTERVAL`
+/// (2 s) via the keepalive round-trip, so 6 s = ~3× the keepalive cycle: it
+/// never false-fires on a healthy-but-idle connection (the previous 5 s deadline
+/// vs 20 s keepalive caused exactly that — a reconnect storm every ~5–6 s on
+/// every idle subscriber, issue #7) while still detecting a black-holed peer
+/// (half-open, no TCP FIN) within ~6–7 s, far faster than the old 20 s+ "next
+/// write fails" path.
+const READ_DEADLINE: Duration = Duration::from_secs(6);
 
 /// How often the watchdog checks the inbound read deadline.
 const WATCHDOG_TICK: Duration = Duration::from_secs(1);
@@ -411,9 +433,11 @@ impl MessageBoxWebSocket {
                 // Skip the immediate first tick so we don't ping before the
                 // handshake settles.
                 interval.tick().await;
-                // Latch as for the watchdog: the first tick is KEEPALIVE_INTERVAL
-                // (20 s) out, well after authenticationSuccess, but guard anyway so
-                // a slow handshake can't make the keepalive exit before coming up.
+                // Latch as for the watchdog: guard against a slow handshake so
+                // the keepalive can't exit before the connection comes up. The
+                // first probe fires one KEEPALIVE_INTERVAL after connect; the
+                // handshake's own authMessage/authenticationSuccess frames keep
+                // last_inbound_ms fresh in the meantime.
                 let mut was_connected = false;
                 loop {
                     interval.tick().await;
@@ -1094,17 +1118,29 @@ mod tests {
         );
     }
 
-    /// The read deadline must be meaningfully tighter than the old "next write
-    /// fails" path (≥ KEEPALIVE_INTERVAL, i.e. 20s+) — target <~5s detection.
+    /// The keepalive MUST cycle comfortably inside the read deadline, so a
+    /// healthy-but-idle socket always refreshes `last_inbound_ms` (via the
+    /// keepalive's `authenticationSuccess` reply) before the watchdog fires.
+    /// This is the regression guard for issue #7: the bug was KEEPALIVE_INTERVAL
+    /// (20s) > READ_DEADLINE (5s), so an idle socket starved of app frames
+    /// false-fired the watchdog and triggered a reconnect storm.
     #[test]
-    fn read_deadline_is_tighter_than_keepalive() {
+    fn keepalive_cycles_inside_read_deadline() {
         assert!(
-            READ_DEADLINE < KEEPALIVE_INTERVAL,
-            "half-open detection must beat the 20s+ keepalive-failure path"
+            KEEPALIVE_INTERVAL < READ_DEADLINE,
+            "keepalive must refresh liveness before the watchdog fires (issue #7)"
         );
+        // At least 2 keepalive cycles must fit inside the deadline so a single
+        // missed/jittered probe doesn't trip the watchdog on a healthy link.
         assert!(
-            READ_DEADLINE <= Duration::from_secs(5),
-            "detection target is <~5s"
+            KEEPALIVE_INTERVAL * 2 <= READ_DEADLINE,
+            "deadline must tolerate at least one missed keepalive round-trip"
+        );
+        // Detection must still be fast (<~8s) — don't fix the storm by making
+        // half-open detection sluggish.
+        assert!(
+            READ_DEADLINE <= Duration::from_secs(8),
+            "genuine half-open detection target is <~8s"
         );
     }
 }

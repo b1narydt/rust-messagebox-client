@@ -59,7 +59,6 @@ const CONNECT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 use bsv::auth::peer::Peer;
 use bsv::auth::types::{AuthMessage, MessageType};
-use bsv::remittance::types::PeerMessage;
 use bsv::wallet::interfaces::WalletInterface;
 
 use crate::encryption;
@@ -67,10 +66,11 @@ use crate::error::MessageBoxError;
 use crate::socket_transport::{
     decode_ws_event, encode_ws_event, parse_auth_message_from_payload, SocketIOTransport,
 };
-use crate::types::ServerPeerMessage;
+use crate::types::{AuthenticatedPeerMessage, ServerPeerMessage};
 
 /// Subscriber callback: event key → message handler.
-type SubscriptionMap = Arc<Mutex<HashMap<String, Arc<dyn Fn(PeerMessage) + Send + Sync>>>>;
+type SubscriptionMap =
+    Arc<Mutex<HashMap<String, Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>>>>;
 
 /// Pending ack queue keyed by `sendMessageAck-{roomId}`.
 ///
@@ -565,20 +565,26 @@ impl MessageBoxWebSocket {
                                             .strip_prefix("sendMessage-")
                                             .unwrap_or("")
                                             .to_string();
-                                        let decrypted_body = encryption::try_decrypt_message(
+                                        // Typed decrypt: carry authenticated-decrypt
+                                        // provenance to the subscriber so the MPC
+                                        // transport can fail-closed. Body string is
+                                        // identical to the legacy try_decrypt_message.
+                                        let outcome = encryption::try_decrypt_message_typed(
                                             &wallet_clone2,
                                             &server_msg.body,
                                             &server_msg.sender,
                                             originator_clone2.as_deref(),
                                         )
                                         .await;
+                                        let authenticated_decrypt = outcome.is_authenticated();
                                         let (recipient, message_box) = split_room_id(&room_id);
-                                        cb(PeerMessage {
+                                        cb(AuthenticatedPeerMessage {
                                             message_id: server_msg.message_id,
                                             sender: server_msg.sender,
                                             recipient,
                                             message_box,
-                                            body: decrypted_body,
+                                            body: outcome.into_body(),
+                                            authenticated_decrypt,
                                         });
                                     }
                                 }
@@ -715,7 +721,7 @@ impl MessageBoxWebSocket {
     pub async fn subscribe(
         &self,
         event_key: String,
-        callback: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+        callback: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
     ) {
         self.subscriptions.lock().await.insert(event_key, callback);
     }

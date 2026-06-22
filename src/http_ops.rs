@@ -790,13 +790,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // Decrypt each message body in-place.
         // PARITY: originator is None here — matches TS listMessagesLite which omits originator
         for msg in &mut list_response.messages {
-            msg.body = encryption::try_decrypt_message(
+            // Typed decrypt: surface whether the body genuinely AEAD-decrypted so
+            // provenance-requiring consumers (the MPC transport) can fail-closed.
+            // String result is identical to the legacy try_decrypt_message.
+            let outcome = encryption::try_decrypt_message_typed(
                 self.wallet(),
                 &msg.body,
                 &msg.sender,
                 None, // PARITY: matches TS listMessagesLite which omits originator
             )
             .await;
+            msg.authenticated_decrypt = outcome.is_authenticated();
+            msg.body = outcome.into_body();
         }
 
         Ok(list_response.messages)

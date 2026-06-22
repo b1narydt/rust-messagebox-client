@@ -12,10 +12,14 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
-use crate::types::{ListMessagesParams, ListMessagesResponse};
+use crate::types::{AuthenticatedPeerMessage, ListMessagesParams, ListMessagesResponse};
 
-/// Callback type for live message subscriptions.
-type SubscriptionCallback = Arc<dyn Fn(PeerMessage) + Send + Sync>;
+/// Internal callback type for live message subscriptions. Carries the
+/// authenticated-decrypt provenance flag end-to-end (WS dispatch, reconnect
+/// replay, HTTP poll backstop). The public `listen_for_live_messages` adapts a
+/// caller's `Fn(PeerMessage)` onto this by dropping the flag; the public
+/// `listen_for_live_messages_typed` exposes it directly.
+type SubscriptionCallback = Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>;
 
 /// Backoff bounds for the proactive reconnect supervisor.
 const RECONNECT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
@@ -551,6 +555,37 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         on_message: Arc<dyn Fn(PeerMessage) + Send + Sync>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // Adapt the legacy `Fn(PeerMessage)` consumer onto the typed core by
+        // dropping the authenticated-decrypt flag. Existing consumers (peerpay,
+        // payment_requests, adapter) are unaffected — same `PeerMessage` delivery.
+        let typed: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> =
+            Arc::new(move |m: AuthenticatedPeerMessage| {
+                on_message(PeerMessage {
+                    message_id: m.message_id,
+                    sender: m.sender,
+                    recipient: m.recipient,
+                    message_box: m.message_box,
+                    body: m.body,
+                });
+            });
+        self.listen_for_live_messages_typed(message_box, typed, override_host)
+            .await
+    }
+
+    /// Typed sibling of [`Self::listen_for_live_messages`] that delivers an
+    /// [`AuthenticatedPeerMessage`] carrying the authenticated-decrypt provenance
+    /// flag. Use this when a consumer must reject bodies that did not AEAD-decrypt
+    /// against the claimed sender (the MPC transport's fail-closed boundary).
+    ///
+    /// Identical delivery semantics to `listen_for_live_messages` (WS primary,
+    /// WS `on_any` fallback, HTTP poll backstop; exactly-once dedup; reconnect
+    /// replay) — only the delivered type differs.
+    pub async fn listen_for_live_messages_typed(
+        &self,
+        message_box: &str,
+        on_message: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
+        override_host: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
         let event_key = format!("sendMessage-{room_id}");
@@ -1009,10 +1044,10 @@ const MAX_POLL_SKIPS: u32 = 7;
 /// serves. This suppresses duplicates only; delivery liveness comes from the
 /// WS + poll paths, not from this wrapper.
 fn exactly_once(
-    inner: Arc<dyn Fn(PeerMessage) + Send + Sync>,
-) -> Arc<dyn Fn(PeerMessage) + Send + Sync> {
+    inner: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
+) -> Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> {
     let seen = Arc::new(std::sync::Mutex::new(BoundedIdSet::new(10_000)));
-    Arc::new(move |msg: PeerMessage| {
+    Arc::new(move |msg: AuthenticatedPeerMessage| {
         // Recover rather than panic on poison: a poisoned dedup set is harmless
         // (worst case one duplicate delivery), whereas panicking here would kill
         // the WS dispatcher or the spawned poll task and stop delivery entirely.
@@ -1031,10 +1066,10 @@ fn exactly_once(
 /// push is healthy and stand down (see the poll loop in
 /// [`MessageBoxClient::listen_for_live_messages`]).
 fn record_ws_activity(
-    inner: Arc<dyn Fn(PeerMessage) + Send + Sync>,
+    inner: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
     activity: Arc<std::sync::atomic::AtomicU64>,
-) -> Arc<dyn Fn(PeerMessage) + Send + Sync> {
-    Arc::new(move |msg: PeerMessage| {
+) -> Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> {
+    Arc::new(move |msg: AuthenticatedPeerMessage| {
         activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         inner(msg);
     })
@@ -1122,7 +1157,8 @@ impl BoundedIdSet {
 /// This is used by the background polling task spawned in `listen_for_live_messages`
 /// to deliver messages as a fallback when the server does not broadcast via WS push.
 ///
-/// Returns a `Vec<PeerMessage>` with decrypted bodies, or an empty vec on error.
+/// Returns a `Vec<AuthenticatedPeerMessage>` with decrypted bodies (and their
+/// authenticated-decrypt provenance), or an empty vec on error.
 /// `accept_payments` is always false — the polling path does not handle delivery fees.
 async fn poll_list_messages<W>(
     auth_fetch: &Arc<AuthFetch<W>>,
@@ -1131,7 +1167,7 @@ async fn poll_list_messages<W>(
     identity_key: &str,
     wallet: &W,
     originator: Option<&str>,
-) -> Result<Vec<PeerMessage>, MessageBoxError>
+) -> Result<Vec<AuthenticatedPeerMessage>, MessageBoxError>
 where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
@@ -1160,17 +1196,23 @@ where
     for msg in list_response.messages {
         // Simple body extraction: if the body is a wrapped envelope, extract the message field.
         let plain_body = extract_plain_body(&msg.body);
-        // Decrypt if encrypted
-        let decrypted =
-            crate::encryption::try_decrypt_message(wallet, &plain_body, &msg.sender, originator)
-                .await;
+        // Typed decrypt: carry authenticated-decrypt provenance through the poll
+        // backstop so the MPC transport fails-closed identically on this path.
+        let outcome = crate::encryption::try_decrypt_message_typed(
+            wallet,
+            &plain_body,
+            &msg.sender,
+            originator,
+        )
+        .await;
 
-        result.push(PeerMessage {
+        result.push(AuthenticatedPeerMessage {
             message_id: msg.message_id,
             sender: msg.sender,
             recipient: identity_key.to_string(),
             message_box: message_box.to_string(),
-            body: decrypted,
+            authenticated_decrypt: outcome.is_authenticated(),
+            body: outcome.into_body(),
         });
     }
 
@@ -1542,7 +1584,7 @@ mod tests {
         let room_id = format!("{identity_key}-test_inbox");
         let fired = Arc::new(AtomicBool::new(false));
         let fired_clone = fired.clone();
-        let callback: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+        let callback: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(move |_msg| {
                 fired_clone.store(true, Ordering::SeqCst);
             });
@@ -1561,12 +1603,13 @@ mod tests {
         // Verify the stored callback is callable
         let cb = subs.get(&room_id).cloned().expect("callback must exist");
         drop(subs);
-        cb(bsv::remittance::types::PeerMessage {
+        cb(crate::types::AuthenticatedPeerMessage {
             message_id: "test".to_string(),
             sender: "03sender".to_string(),
             recipient: identity_key.clone(),
             message_box: "test_inbox".to_string(),
             body: "hello".to_string(),
+            authenticated_decrypt: true,
         });
         assert!(fired.load(Ordering::SeqCst), "callback must have been invoked");
     }
@@ -1588,7 +1631,7 @@ mod tests {
         let room_id = format!("{identity_key}-inbox");
 
         // Insert a dummy callback
-        let cb: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+        let cb: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(|_| {});
         client.subscriptions.lock().await.insert(room_id.clone(), cb);
         assert_eq!(client.subscriptions.lock().await.len(), 1, "inserted");
@@ -1717,13 +1760,14 @@ mod tests {
         super::BoundedIdSet::new(0);
     }
 
-    fn peer_msg(id: &str) -> bsv::remittance::types::PeerMessage {
-        bsv::remittance::types::PeerMessage {
+    fn peer_msg(id: &str) -> crate::types::AuthenticatedPeerMessage {
+        crate::types::AuthenticatedPeerMessage {
             message_id: id.to_string(),
             sender: "03sender".to_string(),
             recipient: "02recipient".to_string(),
             message_box: "inbox".to_string(),
             body: "body".to_string(),
+            authenticated_decrypt: true,
         }
     }
 
@@ -1732,7 +1776,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(move |_m| {
                 c.fetch_add(1, Ordering::SeqCst);
             });
@@ -1754,7 +1798,7 @@ mod tests {
         let activity = Arc::new(AtomicU64::new(0));
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(move |_m| {
                 c.fetch_add(1, Ordering::SeqCst);
             });
@@ -1812,7 +1856,7 @@ mod tests {
         // assert each id is delivered exactly once.
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(move |_m| {
                 c.fetch_add(1, Ordering::SeqCst);
             });
@@ -1844,7 +1888,7 @@ mod tests {
         let activity = Arc::new(AtomicU64::new(0));
         let count = Arc::new(AtomicUsize::new(0));
         let c = count.clone();
-        let inner: Arc<dyn Fn(bsv::remittance::types::PeerMessage) + Send + Sync> =
+        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(move |_m| {
                 c.fetch_add(1, Ordering::SeqCst);
             });

@@ -553,6 +553,7 @@ mod tests {
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
                 acknowledged: None,
+                authenticated_decrypt: false,
             },
             ServerPeerMessage {
                 message_id: "msg2".to_string(),
@@ -561,6 +562,7 @@ mod tests {
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
                 acknowledged: None,
+                authenticated_decrypt: false,
             },
             ServerPeerMessage {
                 message_id: "msg3".to_string(),
@@ -569,6 +571,7 @@ mod tests {
                 created_at: "2024-01-01T00:00:00Z".to_string(),
                 updated_at: "2024-01-01T00:00:00Z".to_string(),
                 acknowledged: None,
+                authenticated_decrypt: false,
             },
         ];
 

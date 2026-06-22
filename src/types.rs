@@ -337,6 +337,36 @@ pub struct ServerPeerMessage {
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acknowledged: Option<bool>,
+    /// `true` iff `body` was produced by a genuine authenticated (AEAD) decrypt
+    /// of an encrypted envelope against `sender`'s key — set by
+    /// [`crate::client::MessageBoxClient::list_messages_lite`] via the typed
+    /// decrypt path. ADDITIVE + `#[serde(default)]`: never sent on the wire by the
+    /// server (it is `false` after deserialization), so this does not break wire
+    /// compatibility or any existing consumer (e.g. peerpay). Consumers requiring
+    /// sender provenance (the MPC transport) reject bodies with this `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub authenticated_decrypt: bool,
+}
+
+/// A live-delivered peer message paired with its authenticated-decrypt provenance.
+///
+/// Client-owned sibling of `bsv::remittance::types::PeerMessage` (which is an
+/// upstream SDK type we cannot extend). Delivered by
+/// [`crate::client::MessageBoxClient::listen_for_live_messages_typed`] so that
+/// provenance-requiring consumers (the MPC transport) can fail-closed on bodies
+/// that did not AEAD-decrypt against `sender`. The legacy
+/// [`crate::client::MessageBoxClient::listen_for_live_messages`] continues to
+/// deliver a bare `PeerMessage` (this flag dropped) for existing consumers.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedPeerMessage {
+    pub message_id: String,
+    pub sender: String,
+    pub recipient: String,
+    pub message_box: String,
+    pub body: String,
+    /// `true` iff `body` came from a genuine authenticated (AEAD) decrypt of an
+    /// encrypted envelope against `sender`'s key.
+    pub authenticated_decrypt: bool,
 }
 
 /// Response from the `/listMessages` endpoint.

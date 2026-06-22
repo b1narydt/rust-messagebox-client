@@ -138,6 +138,93 @@ pub async fn try_decrypt_message<W: WalletInterface>(
     raw_body.to_string()
 }
 
+/// Outcome of [`try_decrypt_message_typed`] — distinguishes a body that genuinely
+/// AEAD-decrypted from one that was merely passed through (plaintext or a
+/// fail-open decrypt failure).
+///
+/// SECURITY (fail-closed boundary support): `try_decrypt_message` returns a bare
+/// `String` and is **fail-OPEN** — on AEAD-decrypt failure it returns the raw
+/// encrypted envelope, and for non-encrypted bodies it returns the raw plaintext.
+/// Callers that require sender provenance (e.g. the MPC transport, whose messages
+/// are ALWAYS sent encrypted) cannot tell those apart from a real decrypt. This
+/// typed sibling preserves that distinction so the caller can reject anything that
+/// did not authenticate-decrypt against the claimed sender's key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecryptOutcome {
+    /// The encrypted-envelope branch ran and `decrypt_body` returned `Ok` — the
+    /// body genuinely AEAD-decrypted against the claimed sender. The inner string
+    /// is the recovered plaintext.
+    Decrypted(String),
+    /// The body was NOT authenticated-decrypted: either a non-encrypted passthrough
+    /// (Case 3) or an `{"encryptedMessage":...}` body whose `decrypt_body` failed
+    /// (the Case-2 fail-open branch). The inner string is the raw body verbatim,
+    /// byte-for-byte identical to what `try_decrypt_message` would return.
+    Plaintext(String),
+}
+
+impl DecryptOutcome {
+    /// The recovered/passthrough body string, regardless of authenticity. Equals
+    /// exactly what [`try_decrypt_message`] returns for the same inputs.
+    pub fn into_body(self) -> String {
+        match self {
+            DecryptOutcome::Decrypted(s) | DecryptOutcome::Plaintext(s) => s,
+        }
+    }
+
+    /// `true` iff the body genuinely AEAD-decrypted (the `Decrypted` variant).
+    pub fn is_authenticated(&self) -> bool {
+        matches!(self, DecryptOutcome::Decrypted(_))
+    }
+}
+
+/// Typed sibling of [`try_decrypt_message`] that additionally surfaces whether the
+/// body genuinely AEAD-decrypted.
+///
+/// Returns [`DecryptOutcome::Decrypted`] ONLY when the encrypted-envelope branch
+/// (`{"encryptedMessage":...}`) ran AND `decrypt_body` returned `Ok`. Returns
+/// [`DecryptOutcome::Plaintext`] for the Case-3 non-encrypted passthrough AND for
+/// the Case-2 decrypt-failure fail-open branch.
+///
+/// The returned body string is byte-for-byte identical to [`try_decrypt_message`]
+/// for the same inputs, so this is a strict superset — callers that only need the
+/// string can call `.into_body()`.
+pub async fn try_decrypt_message_typed<W: WalletInterface>(
+    wallet: &W,
+    raw_body: &str,
+    sender_pubkey_hex: &str,
+    originator: Option<&str>,
+) -> DecryptOutcome {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_body) {
+        // Case 1: payment envelope wrapper — unwrap and recurse. Authenticity of
+        // the OUTER wrapper is irrelevant; the inner recursion decides.
+        if let Some(inner) = v.get("message") {
+            let inner_str = if inner.is_string() {
+                inner.as_str().unwrap().to_string()
+            } else {
+                inner.to_string()
+            };
+            return Box::pin(try_decrypt_message_typed(
+                wallet,
+                &inner_str,
+                sender_pubkey_hex,
+                originator,
+            ))
+            .await;
+        }
+
+        // Case 2: encrypted body — Decrypted only on a genuine Ok, else fail-open Plaintext.
+        if v.get("encryptedMessage").is_some() {
+            return match decrypt_body(wallet, raw_body, sender_pubkey_hex, originator).await {
+                Ok(plaintext) => DecryptOutcome::Decrypted(plaintext),
+                Err(_) => DecryptOutcome::Plaintext(raw_body.to_string()),
+            };
+        }
+    }
+
+    // Case 3: plaintext passthrough — not authenticated.
+    DecryptOutcome::Plaintext(raw_body.to_string())
+}
+
 /// Generate a deterministic HMAC-based message ID for idempotency.
 ///
 /// CRITICAL: The TS uses `JSON.stringify(message.body)` as the HMAC data (line 917).
@@ -307,6 +394,82 @@ mod tests {
 
         let result = try_decrypt_message(&receiver, &wrapped, &sender_pk, None).await;
         assert_eq!(result, message);
+    }
+
+    #[tokio::test]
+    async fn typed_decrypt_plaintext_body_is_plaintext_outcome() {
+        // A valid-shaped plaintext WireMessage body must NOT be reported as
+        // authenticated — this is the bypass the fail-closed boundary defends.
+        let wallet = make_wallet();
+        let other = make_wallet();
+        let other_pk = identity_hex(&other).await;
+
+        let body = r#"{"sender":0,"is_broadcast":true,"msg":{"round":1}}"#;
+        let outcome = try_decrypt_message_typed(&wallet, body, &other_pk, None).await;
+        assert_eq!(outcome, DecryptOutcome::Plaintext(body.to_string()));
+        assert!(!outcome.is_authenticated());
+        assert_eq!(outcome.into_body(), body);
+    }
+
+    #[tokio::test]
+    async fn typed_decrypt_non_json_plaintext_is_plaintext_outcome() {
+        let wallet = make_wallet();
+        let other = make_wallet();
+        let other_pk = identity_hex(&other).await;
+
+        let outcome = try_decrypt_message_typed(&wallet, "plain text", &other_pk, None).await;
+        assert!(!outcome.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn typed_decrypt_failed_aead_fails_open_to_plaintext_outcome() {
+        // An {"encryptedMessage":...} body that does NOT decrypt under our key must
+        // be reported Plaintext (fail-open string parity) but NOT authenticated.
+        let wallet = make_wallet();
+        let other = make_wallet();
+        let other_pk = identity_hex(&other).await;
+
+        let body = r#"{"encryptedMessage":"AAAAbase64ciphertext=="}"#;
+        let outcome = try_decrypt_message_typed(&wallet, body, &other_pk, None).await;
+        assert!(!outcome.is_authenticated(), "garbage ciphertext must not authenticate");
+        // String parity with try_decrypt_message (fail-open returns raw body).
+        let legacy = try_decrypt_message(&wallet, body, &other_pk, None).await;
+        assert_eq!(outcome.into_body(), legacy);
+    }
+
+    #[tokio::test]
+    async fn typed_decrypt_round_trip_is_decrypted_outcome() {
+        let sender = make_wallet();
+        let receiver = make_wallet();
+        let sender_pk = identity_hex(&sender).await;
+        let receiver_pk = identity_hex(&receiver).await;
+
+        let message = "secret authenticated content";
+        let encrypted = encrypt_body(&sender, message, &receiver_pk, None)
+            .await
+            .expect("encrypt");
+
+        let outcome = try_decrypt_message_typed(&receiver, &encrypted, &sender_pk, None).await;
+        assert_eq!(outcome, DecryptOutcome::Decrypted(message.to_string()));
+        assert!(outcome.is_authenticated());
+    }
+
+    #[tokio::test]
+    async fn typed_decrypt_payment_envelope_round_trip_is_decrypted() {
+        let sender = make_wallet();
+        let receiver = make_wallet();
+        let sender_pk = identity_hex(&sender).await;
+        let receiver_pk = identity_hex(&receiver).await;
+
+        let message = "wrapped authenticated content";
+        let encrypted = encrypt_body(&sender, message, &receiver_pk, None)
+            .await
+            .expect("encrypt");
+        let wrapped = serde_json::json!({"message": encrypted, "payment": {"txid": "abc"}})
+            .to_string();
+
+        let outcome = try_decrypt_message_typed(&receiver, &wrapped, &sender_pk, None).await;
+        assert_eq!(outcome, DecryptOutcome::Decrypted(message.to_string()));
     }
 
     #[tokio::test]

@@ -153,6 +153,7 @@ async fn test_send_list_ack_cycle() {
         created_at: "2024-01-01T00:00:00Z".to_string(),
         updated_at: "2024-01-01T00:00:00Z".to_string(),
         acknowledged: None,
+        authenticated_decrypt: false,
     };
 
     // Apply the same mapping logic as RemittanceAdapter::list_messages.
@@ -211,6 +212,7 @@ async fn test_list_messages_recipient_populated_from_identity_key() {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             acknowledged: None,
+            authenticated_decrypt: false,
         },
         ServerPeerMessage {
             message_id: "msg-b".to_string(),
@@ -219,6 +221,7 @@ async fn test_list_messages_recipient_populated_from_identity_key() {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:00:00Z".to_string(),
             acknowledged: None,
+            authenticated_decrypt: false,
         },
     ];
 

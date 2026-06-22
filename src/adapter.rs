@@ -238,6 +238,7 @@ mod tests {
             created_at: "2024-01-01T00:00:00Z".to_string(),
             updated_at: "2024-01-01T00:01:00Z".to_string(),
             acknowledged: None,
+            authenticated_decrypt: false,
         };
         let identity_key = "03myidentitykey".to_string();
         let message_box = "payment_inbox";

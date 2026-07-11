@@ -977,15 +977,25 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let _ = override_host;
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
+        // Tear down LOCAL subscription state FIRST and UNCONDITIONALLY, before the
+        // WS emit. The HTTP poll backstop loop breaks only when `joined_rooms` no
+        // longer contains the room, and reconnect-replay is driven by
+        // `subscriptions`. Neither must depend on the WS `leaveRoom` emit
+        // succeeding: if the socket is flaky at teardown (exactly when churn
+        // peaks), gating removal on the emit would leave the per-box
+        // `GET /listMessages` poll running forever and re-subscribing on
+        // reconnect — the listener leak this teardown exists to close.
+        self.joined_rooms.lock().await.remove(&room_id);
+        self.subscriptions.lock().await.remove(&room_id);
+        // Best-effort server-side leave. The local teardown above already stopped
+        // the poll loop; the server also drops the room on disconnect. A failed
+        // emit is surfaced to the caller but no longer leaves a leak behind.
         {
             let guard = self.ws_state.lock().await;
             if let Some(ref ws) = *guard {
                 ws.leave_room(&room_id).await?;
             }
         }
-        self.joined_rooms.lock().await.remove(&room_id);
-        // Remove from subscription registry so future reconnects don't replay it.
-        self.subscriptions.lock().await.remove(&room_id);
         Ok(())
     }
 

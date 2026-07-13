@@ -6,9 +6,12 @@
 //! - `anoint_host` — broadcast a host advertisement via SHIP/PushDrop
 //! - `revoke_host_advertisement` — spend an existing advertisement UTXO
 //!
-//! The PushDrop locking script is built manually from chunks because the Rust SDK's
-//! `PushDrop::new` requires a raw `PrivateKey`, which `WalletInterface` does not expose.
-//! We derive the public key via `wallet.get_public_key` with `forSelf: true` instead.
+//! Advertisement locking scripts are built with the SDK's `PushDrop` template
+//! (bsv-sdk >= 0.3), which is wallet-driven: it derives the locking key via
+//! `getPublicKey` and appends the `createSignature` field itself. Earlier versions
+//! of the template took a raw `PrivateKey` — which `WalletInterface` cannot expose —
+//! so this module used to hand-build the script from chunks around a dummy key.
+//! That workaround is gone.
 
 use std::collections::HashMap;
 
@@ -16,14 +19,14 @@ use bsv::script::locking_script::LockingScript;
 use bsv::script::op::Op;
 use bsv::script::script::Script;
 use bsv::script::script_chunk::ScriptChunk;
-use bsv::script::templates::PushDrop;
+use bsv::script::templates::push_drop::{decode as decode_push_drop, LockPosition, PushDrop};
 use bsv::services::overlay_tools::{
     LookupResolver, LookupResolverConfig, TopicBroadcaster, TopicBroadcasterConfig,
 };
 use bsv::services::overlay_tools::{LookupAnswer, LookupQuestion};
 use bsv::transaction::Transaction;
 use bsv::wallet::interfaces::{
-    CreateActionArgs, CreateActionInput, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
+    CreateActionArgs, CreateActionInput, CreateActionOptions, CreateActionOutput,
     SignActionArgs, SignActionSpend, WalletInterface,
 };
 use bsv::wallet::types::{
@@ -148,7 +151,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 }
 
                 let script = &tx.outputs[idx].locking_script;
-                let pd = match PushDrop::decode(script) {
+                let pd = match decode_push_drop(script) {
                     Ok(t) => t,
                     Err(_) => continue,
                 };
@@ -213,96 +216,40 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn anoint_host(&self, host: &str) -> Result<String, MessageBoxError> {
         let identity_key = self.get_identity_key().await?;
 
-        // Derive the public key for the PushDrop locking script.
-        // Uses protocol [1, "messagebox advertisement"], keyId "1", counterparty Anyone, forSelf true.
-        // This is the key the wallet will use when signing inputs that spend this output.
-        let pk_result = self
-            .wallet()
-            .get_public_key(
-                GetPublicKeyArgs {
-                    identity_key: false,
-                    protocol_id: Some(Protocol {
-                        security_level: 1,
-                        protocol: "messagebox advertisement".to_string(),
-                    }),
-                    key_id: Some("1".to_string()),
-                    counterparty: Some(Counterparty {
-                        counterparty_type: CounterpartyType::Anyone,
-                        public_key: None,
-                    }),
-                    privileged: false,
-                    privileged_reason: None,
-                    for_self: Some(true),
-                    seek_permission: None,
-                },
-                self.originator(),
-            )
-            .await
-            .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
-
-        let pubkey_bytes = pk_result.public_key.to_der();
 
         // fields[0] = raw identity key bytes (hex-decoded per Pitfall 3)
         let id_key_bytes = hex::decode(&identity_key)
             .map_err(|e| MessageBoxError::Overlay(format!("hex decode identity key: {e}")))?;
         let host_bytes = host.as_bytes().to_vec();
 
-        // Sign the concatenated field data (matches TS PushDrop.lock with includeSignature=true)
-        let data_to_sign: Vec<u8> = [id_key_bytes.as_slice(), host_bytes.as_slice()].concat();
-        let sig_result = self
-            .wallet()
-            .create_signature(
-                bsv::wallet::interfaces::CreateSignatureArgs {
-                    data: Some(data_to_sign),
-                    hash_to_directly_sign: None,
-                    protocol_id: Protocol {
-                        security_level: 1,
-                        protocol: "messagebox advertisement".to_string(),
-                    },
-                    key_id: "1".to_string(),
-                    counterparty: Counterparty {
-                        counterparty_type: CounterpartyType::Anyone,
-                        public_key: None,
-                    },
-                    privileged: false,
-                    privileged_reason: None,
-                    seek_permission: None,
+        // bsv-sdk 0.3: PushDrop is wallet-driven, so it derives the locking key and
+        // appends the signature field itself — with the SAME (protocol, keyID,
+        // counterparty, forSelf) triple used for the pubkey derivation above.
+        //
+        // This replaces a workaround that the old PrivateKey-based API forced:
+        // sign the fields by hand, construct PushDrop with a DUMMY PrivateKey(1)
+        // just to get the script shape, then splice chunk[0] to swap the dummy
+        // pubkey for the wallet-derived one. That was script surgery standing in
+        // for an API that couldn't express "lock to a key the wallet derives".
+        // Same bytes, none of the surgery.
+        let locking_script = PushDrop::new(self.wallet(), self.originator().map(String::from))
+            .lock(
+                vec![id_key_bytes, host_bytes],
+                Protocol {
+                    security_level: 1,
+                    protocol: "messagebox advertisement".to_string(),
                 },
-                self.originator(),
+                "1",
+                Counterparty {
+                    counterparty_type: CounterpartyType::Anyone,
+                    public_key: None,
+                },
+                true, // for_self — matches the get_public_key derivation above
+                true, // include_signature — TS/Go default; appends sig as field[2]
+                LockPosition::Before,
             )
             .await
-            .map_err(|e| MessageBoxError::Overlay(format!("sign fields: {e}")))?;
-
-        // Build PushDrop locking script using SDK's PushDrop template.
-        // We use a dummy PrivateKey(1) for PushDrop::new since we only need
-        // the script structure — the actual locking key is the wallet-derived
-        // pubkey which we embed by replacing the dummy pubkey in the output.
-        // The signature field from wallet.create_signature() is included as
-        // the last data field, matching the TS SDK's includeSignature=true.
-        let fields = vec![id_key_bytes, host_bytes, sig_result.signature];
-
-        // Build the locking script with "before" position using the derived pubkey.
-        // PushDrop template needs a PrivateKey, but we can build the chunks directly
-        // since we have the public key from wallet.get_public_key().
-        use bsv::script::templates::ScriptTemplateLock;
-        let locking_script = {
-            // Use PrivateKey(1) as dummy — we'll replace the pubkey
-            let mut dummy_buf = [0u8; 32];
-            dummy_buf[31] = 1;
-            let dummy_key = bsv::primitives::private_key::PrivateKey::from_bytes(&dummy_buf)
-                .map_err(|e| MessageBoxError::Overlay(format!("dummy key: {e}")))?;
-            let pd = PushDrop::new(fields, dummy_key);
-            let script = pd.lock()
-                .map_err(|e| MessageBoxError::Overlay(format!("PushDrop lock: {e}")))?;
-
-            // Replace the dummy pubkey (chunk 0) with the wallet-derived pubkey
-            let mut chunks = script.chunks().to_vec();
-            chunks[0] = ScriptChunk::new_raw(
-                pubkey_bytes.len() as u8,
-                Some(pubkey_bytes),
-            );
-            LockingScript::from_script(Script::from_chunks(chunks))
-        };
+            .map_err(|e| MessageBoxError::Overlay(format!("PushDrop lock: {e}")))?;
 
         // Create the overlay advertisement transaction
         let create_result = self

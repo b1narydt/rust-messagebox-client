@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-client"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.87"
 description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
@@ -14,7 +14,7 @@ name = "bsv_messagebox_client"
 
 [dependencies]
 # Requires >=0.2.86 for the concurrency-safe &self AuthFetch API.
-bsv-sdk = { version = "0.2.86", features = ["network"] }
+bsv-sdk = { version = "0.3", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -31,8 +31,3 @@ tracing = "0.1"
 wiremock = "0.6"
 tokio-test = "0.4"
 
-# TEMP: bsv-sdk 0.2.86 (concurrency-safe &self Peer/AuthFetch) is not yet
-# published. Build against the local repo until it lands on crates.io, then
-# remove this patch.
-[patch.crates-io]
-bsv-sdk = { path = "../bsv-rust-sdk" }

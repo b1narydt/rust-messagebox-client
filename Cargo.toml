@@ -13,8 +13,13 @@ categories = ["cryptography", "network-programming"]
 name = "bsv_messagebox_client"
 
 [dependencies]
-# Requires >=0.2.86 for the concurrency-safe &self AuthFetch API.
-bsv-sdk = { version = "0.3", features = ["network"] }
+# Shared BRC-103 Socket.IO transport (extracted from this crate's websocket.rs
+# + socket_transport.rs). Path dep for now — publish authsocket before the next
+# bsv-messagebox-client release.
+authsocket = { path = "../rust-authsocket", features = ["client"] }
+# Pinned to the same 0.3 git rev as rust-mpc and the authsocket crate so one
+# bsv-sdk package (AuthMessage/Peer/WalletInterface) is shared across the graph.
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

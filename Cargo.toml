@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-client"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 rust-version = "1.87"
 description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
@@ -14,12 +14,11 @@ name = "bsv_messagebox_client"
 
 [dependencies]
 # Shared BRC-103 Socket.IO transport (extracted from this crate's websocket.rs
-# + socket_transport.rs). Published on crates.io; the [patch.crates-io] bsv-sdk
-# pin below redirects its bsv-sdk 0.3.1 to the graph's git rev (one copy).
+# + socket_transport.rs).
 authsocket = { version = "0.1.0", features = ["client"] }
-# Pinned to the same 0.3 git rev as rust-mpc and the authsocket crate so one
-# bsv-sdk package (AuthMessage/Peer/WalletInterface) is shared across the graph.
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5", features = ["network"] }
+# crates.io 0.3.2: TS-parity auth session recovery + the p-prefix fix. authsocket
+# declares bsv-sdk ^0.3.1, so both resolve to one shared 0.3.2 copy — no patch.
+bsv-sdk = { version = "0.3.2", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,11 +34,3 @@ tracing = "0.1"
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
-
-
-# authsocket (crates.io) declares bsv-sdk = "0.3.1"; this crate depends on the
-# git rev directly. Without this patch the two resolve as separate copies and
-# their WalletInterface/AuthMessage/Peer types don't unify. Redirect the
-# crates.io bsv-sdk to the same git rev the whole graph pins → one shared copy.
-[patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5" }

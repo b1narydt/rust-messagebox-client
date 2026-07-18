@@ -19,7 +19,7 @@ name = "bsv_messagebox_client"
 authsocket = { version = "0.1.0", features = ["client"] }
 # Pinned to the same 0.3 git rev as rust-mpc and the authsocket crate so one
 # bsv-sdk package (AuthMessage/Peer/WalletInterface) is shared across the graph.
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5", features = ["network"] }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "2fcd15b56fe61acf4f63f76becf45e7182b33dc5", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -42,4 +42,4 @@ tokio-test = "0.4"
 # their WalletInterface/AuthMessage/Peer types don't unify. Redirect the
 # crates.io bsv-sdk to the same git rev the whole graph pins → one shared copy.
 [patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "2fcd15b56fe61acf4f63f76becf45e7182b33dc5" }

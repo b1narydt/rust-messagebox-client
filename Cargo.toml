@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-client"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.87"
 description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
@@ -15,10 +15,10 @@ name = "bsv_messagebox_client"
 [dependencies]
 # Shared BRC-103 Socket.IO transport (extracted from this crate's websocket.rs
 # + socket_transport.rs).
-authsocket = { version = "0.1.0", features = ["client"] }
+authsocket = { version = "0.1.2", features = ["client"] }
 # crates.io 0.3.2: TS-parity auth session recovery + the p-prefix fix. authsocket
 # declares bsv-sdk ^0.3.1, so both resolve to one shared 0.3.2 copy — no patch.
-bsv-sdk = { version = "0.3.2", features = ["network"] }
+bsv-sdk = { version = "0.4.0", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 
+use bsv::primitives::hash::sha256;
 use bsv::script::locking_script::LockingScript;
 use bsv::script::op::Op;
 use bsv::script::script::Script;
@@ -59,6 +60,57 @@ fn make_data_push(data: &[u8]) -> ScriptChunk {
     } else {
         ScriptChunk::new_raw(Op::OpPushData4.to_byte(), Some(data.to_vec()))
     }
+}
+
+/// Build the unlocking script that spends a `messagebox advertisement` PushDrop
+/// output: a single data push of `<DER signature || sighash byte>`.
+///
+/// The digest convention is the load-bearing part. `create_signature` hashes its
+/// `data` with SHA-256 exactly ONCE and signs that (`ProtoWallet::create_signature_sync`),
+/// while a BSV sighash is `sha256d(preimage)` — so the caller supplies the FIRST
+/// hash and the wallet applies the second. Handing over the raw preimage signs
+/// `sha256(preimage)`, which no script engine will accept. Same convention as the
+/// SDK's own `PushDrop::unlock` and ts-sdk's `PushDrop.unlock`.
+async fn build_advertisement_unlock_script<W: WalletInterface + ?Sized>(
+    wallet: &W,
+    originator: Option<&str>,
+    partial_tx: &Transaction,
+    input_index: usize,
+    sighash_type: u32,
+    source_satoshis: u64,
+    lock_script: &LockingScript,
+) -> Result<Script, MessageBoxError> {
+    let preimage = partial_tx
+        .sighash_preimage(input_index, sighash_type, source_satoshis, lock_script)
+        .map_err(|e| MessageBoxError::Overlay(format!("sighash_preimage: {e}")))?;
+
+    let sig_result = wallet
+        .create_signature(
+            bsv::wallet::interfaces::CreateSignatureArgs {
+                protocol_id: Protocol {
+                    security_level: 1,
+                    protocol: "messagebox advertisement".to_string(),
+                },
+                key_id: "1".to_string(),
+                counterparty: Counterparty {
+                    counterparty_type: CounterpartyType::Anyone,
+                    public_key: None,
+                },
+                data: Some(sha256(&preimage).to_vec()),
+                hash_to_directly_sign: None,
+                privileged: false,
+                privileged_reason: None,
+                seek_permission: None,
+            },
+            originator,
+        )
+        .await
+        .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+
+    // One data push of <sig_DER + sighash_byte>.
+    let mut sig_bytes = sig_result.signature;
+    sig_bytes.push(sighash_type as u8);
+    Ok(Script::from_chunks(vec![make_data_push(&sig_bytes)]))
 }
 
 
@@ -382,7 +434,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// 1. `create_action` with `input_beef` + input pointing to the advertisement UTXO.
     ///    Returns a signable transaction with a `reference` for the sign step.
     /// 2. Derive sighash preimage from the partial transaction.
-    /// 3. `create_signature` with the advertisement protocol to produce a DER signature.
+    /// 3. `create_signature` over `sha256(preimage)` with the advertisement protocol
+    ///    (the wallet applies the second hash) to produce a DER signature.
     /// 4. `sign_action` with the DER+sighash-type unlock script.
     /// 5. Broadcast the signed transaction via TopicBroadcaster.
     ///
@@ -437,41 +490,19 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // SIGHASH_ALL | SIGHASH_FORKID = 0x41
         let sighash_type: u32 = 0x41;
 
-        let preimage = partial_tx
-            .sighash_preimage(0, sighash_type, 1, &lock_script)
-            .map_err(|e| MessageBoxError::Overlay(format!("sighash_preimage: {e}")))?;
-
-        // Step 4: Sign via wallet using the advertisement protocol
-        // create_signature takes `data` = the preimage bytes (wallet hashes internally)
-        let sig_result = self
-            .wallet()
-            .create_signature(
-                bsv::wallet::interfaces::CreateSignatureArgs {
-                    protocol_id: Protocol {
-                        security_level: 1,
-                        protocol: "messagebox advertisement".to_string(),
-                    },
-                    key_id: "1".to_string(),
-                    counterparty: Counterparty {
-                        counterparty_type: CounterpartyType::Anyone,
-                        public_key: None,
-                    },
-                    data: Some(preimage),
-                    hash_to_directly_sign: None,
-                    privileged: false,
-                    privileged_reason: None,
-                    seek_permission: None,
-                },
-                self.originator(),
-            )
-            .await
-            .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
-
-        // Step 5: Build the unlock script: one data push of <sig_DER + sighash_byte>
-        let mut sig_bytes = sig_result.signature;
-        sig_bytes.push(sighash_type as u8);
-        let unlock_chunks = vec![make_data_push(&sig_bytes)];
-        let unlock_script = Script::from_chunks(unlock_chunks);
+        // Steps 4+5: sign the sighash through the wallet and wrap the DER signature
+        // in the unlocking script. `build_advertisement_unlock_script` owns the
+        // digest convention (it pre-hashes the preimage — see its docs).
+        let unlock_script = build_advertisement_unlock_script(
+            self.wallet(),
+            self.originator(),
+            &partial_tx,
+            0,
+            sighash_type,
+            1,
+            &lock_script,
+        )
+        .await?;
 
         // Step 6: sign_action finalizes the transaction with our unlock script
         let sign_result = self
@@ -550,6 +581,12 @@ mod tests {
             let key = PrivateKey::from_random().expect("random key");
             ArcWallet(Arc::new(ProtoWallet::new(key)))
         }
+
+        /// Fixed key, so a script-validation failure reproduces byte-for-byte.
+        fn deterministic() -> Self {
+            let key = PrivateKey::from_bytes(&[0x42u8; 32]).expect("fixed key");
+            ArcWallet(Arc::new(ProtoWallet::new(key)))
+        }
     }
 
     #[async_trait::async_trait]
@@ -617,6 +654,102 @@ mod tests {
         assert_eq!(
             outpoint,
             "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab.0"
+        );
+    }
+
+    /// The revocation unlocking script must actually SPEND the advertisement output.
+    ///
+    /// Runs the SDK script interpreter over (unlocking script, locking script) in the
+    /// real transaction context, so OP_CHECKSIG recomputes the BIP-143 sighash itself
+    /// and ECDSA-verifies our DER signature against `sha256d(preimage)` under the
+    /// PushDrop locking key. Nothing else in this crate ever executed the script, which
+    /// is exactly why signing the wrong digest (`sha256(preimage)`) survived — the
+    /// unlocking script was well-FORMED but not VALID. Handing `create_signature` the
+    /// raw preimage again turns this assertion red.
+    #[tokio::test]
+    async fn revocation_unlock_script_validates_against_the_advertisement_lock() {
+        use bsv::script::spend::{Spend, SpendParams};
+        use bsv::script::unlocking_script::UnlockingScript;
+        use bsv::transaction::{TransactionInput, TransactionOutput};
+
+        let wallet = ArcWallet::deterministic();
+        let sighash_type: u32 = 0x41; // SIGHASH_ALL | SIGHASH_FORKID
+
+        // The advertisement output, locked exactly as `anoint_host` locks it:
+        // same protocol/keyID/counterparty/for_self triple, so the key that
+        // `create_signature` derives is the counterpart of the locking key.
+        let locking_script = PushDrop::new(&wallet, None)
+            .lock(
+                vec![vec![0x02u8; 33], b"https://example.com".to_vec()],
+                Protocol {
+                    security_level: 1,
+                    protocol: "messagebox advertisement".to_string(),
+                },
+                "1",
+                Counterparty {
+                    counterparty_type: CounterpartyType::Anyone,
+                    public_key: None,
+                },
+                true, // for_self
+                true, // include_signature
+                LockPosition::Before,
+            )
+            .await
+            .expect("PushDrop lock");
+
+        let mut source = Transaction::new();
+        source.outputs.push(TransactionOutput {
+            satoshis: Some(1),
+            locking_script: locking_script.clone(),
+            change: false,
+        });
+        let source_txid = source.id().expect("source txid");
+
+        // The revocation shape `create_action` hands back: one input, no outputs.
+        let mut partial_tx = Transaction::new();
+        partial_tx.inputs.push(TransactionInput {
+            source_transaction: Some(Box::new(source)),
+            source_txid: Some(source_txid.clone()),
+            source_output_index: 0,
+            unlocking_script: None,
+            sequence: 0xFFFF_FFFF,
+        });
+
+        // The production path under test.
+        let unlock_script = build_advertisement_unlock_script(
+            &wallet,
+            None,
+            &partial_tx,
+            0,
+            sighash_type,
+            1,
+            &locking_script,
+        )
+        .await
+        .expect("build unlock script");
+
+        let mut spend = Spend::new(SpendParams {
+            locking_script: locking_script.clone(),
+            unlocking_script: UnlockingScript::from_binary(&unlock_script.to_binary()),
+            source_txid,
+            source_output_index: 0,
+            source_satoshis: 1,
+            transaction_version: partial_tx.version,
+            transaction_lock_time: partial_tx.lock_time,
+            transaction_sequence: partial_tx.inputs[0].sequence,
+            other_inputs: vec![],
+            other_outputs: partial_tx.outputs.clone(),
+            input_index: 0,
+        });
+
+        let valid = spend
+            .validate()
+            .unwrap_or_else(|e| panic!("script engine errored on the revocation spend: {e:?}"));
+        assert!(
+            valid,
+            "the revocation unlocking script must satisfy the advertisement locking \
+             script; a signature over sha256(preimage) instead of sha256d(preimage) \
+             fails here"
         );
     }
 

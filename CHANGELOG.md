@@ -41,6 +41,44 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (the server ack carries no messageId). Wire format unchanged — TS/Go/Rust
   interop holds.
 
+## [0.2.0] — 2026-08-19
+
+> Housekeeping note: this file was not maintained across 0.1.4–0.1.7. The
+> `[Unreleased]` block above predates those releases and describes work that has
+> already shipped; it is left as written rather than silently re-dated.
+
+### Changed
+
+- **`bsv-sdk` 0.4 → 0.5**, and `authsocket` with it. *(breaking)* This crate's
+  own source is unchanged — `Transaction::sighash_preimage` now returns
+  `SighashPreimage` instead of `Vec<u8>`, but it derefs to `[u8]`, so
+  `sha256(&preimage)` in `build_advertisement_unlock_script` compiles and hashes
+  exactly the same bytes as before. The break is in the *public dependency*:
+  `MessageBoxClient<W>`, `RemittanceAdapter<W>`, and every `encrypt_body` /
+  `decrypt_body` signature are bounded on `bsv::wallet::interfaces::WalletInterface`,
+  so a caller still on bsv-sdk 0.4 cannot supply a wallet this crate will accept.
+  That is a breaking change for every consumer, which is why this is 0.2.0 and
+  not 0.1.8.
+
+  The `authsocket` requirement moves to `0.2.0` for the same reason, and it is
+  not optional: authsocket 0.1.3 declares `bsv-sdk ^0.4.0`, and a `0.1.x`
+  requirement here would happily resolve back to it — putting two `bsv` packages
+  in one graph, at which point `AuthSocketClient::connect` rejects our `W` with
+  *"the trait bound `W: bsv::wallet::interfaces::WalletInterface` is not
+  satisfied"* even though the trait is spelled identically in both copies.
+
+### Fixed
+
+- **`revoke_host_advertisement` signs `sha256(preimage)`, not the raw preimage**
+  (rust-mpc#342). `create_signature` applies SHA-256 to its `data` exactly once
+  and a BSV sighash is `sha256d(preimage)`, so the caller owes the FIRST hash.
+  Passing the preimage itself produced a signature over `sha256(preimage)` — a
+  digest no script engine recomputes. The unlocking script was well-formed and
+  the revocation transaction was simply unspendable.
+  `revocation_unlock_script_validates_against_the_advertisement_lock` now
+  ECDSA-verifies the DER against `sha256d(preimage)` under the advertisement
+  key, so handing over the raw preimage again turns the assertion red.
+
 ## [0.1.3] — 2026-06-16
 
 ### Fixed

@@ -21,22 +21,23 @@ use bsv::script::op::Op;
 use bsv::script::script::Script;
 use bsv::script::script_chunk::ScriptChunk;
 use bsv::script::templates::push_drop::{decode as decode_push_drop, LockPosition, PushDrop};
+use bsv::services::overlay_tools::{LookupAnswer, LookupQuestion};
 use bsv::services::overlay_tools::{
     LookupResolver, LookupResolverConfig, TopicBroadcaster, TopicBroadcasterConfig,
 };
-use bsv::services::overlay_tools::{LookupAnswer, LookupQuestion};
 use bsv::transaction::Transaction;
 use bsv::wallet::interfaces::{
-    CreateActionArgs, CreateActionInput, CreateActionOptions, CreateActionOutput,
-    SignActionArgs, SignActionSpend, WalletInterface,
+    CreateActionArgs, CreateActionInput, CreateActionOptions, CreateActionOutput, SignActionArgs,
+    SignActionSpend, WalletInterface,
 };
-use bsv::wallet::types::{
-    BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol,
-};
+use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
-use crate::types::{AdvertisementToken, ListDevicesResponse, RegisterDeviceRequest, RegisterDeviceResponse, RegisteredDevice};
+use crate::types::{
+    AdvertisementToken, ListDevicesResponse, RegisterDeviceRequest, RegisterDeviceResponse,
+    RegisteredDevice,
+};
 
 // ---------------------------------------------------------------------------
 // Standalone helpers
@@ -112,7 +113,6 @@ async fn build_advertisement_unlock_script<W: WalletInterface + ?Sized>(
     sig_bytes.push(sighash_type as u8);
     Ok(Script::from_chunks(vec![make_data_push(&sig_bytes)]))
 }
-
 
 // ---------------------------------------------------------------------------
 // MessageBoxClient impl — host resolution methods
@@ -268,7 +268,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub async fn anoint_host(&self, host: &str) -> Result<String, MessageBoxError> {
         let identity_key = self.get_identity_key().await?;
 
-
         // fields[0] = raw identity key bytes (hex-decoded per Pitfall 3)
         let id_key_bytes = hex::decode(&identity_key)
             .map_err(|e| MessageBoxError::Overlay(format!("hex decode identity key: {e}")))?;
@@ -310,18 +309,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 CreateActionArgs {
                     description: "Anoint host for overlay routing".to_string(),
                     input_beef: None,
-                    inputs: vec![],
-                    outputs: vec![CreateActionOutput {
+                    inputs: None,
+                    outputs: Some(vec![CreateActionOutput {
                         locking_script: Some(locking_script.to_binary()),
                         satoshis: 1,
                         output_description: "Overlay advertisement output".to_string(),
                         basket: Some("overlay advertisements".to_string()),
                         custom_instructions: None,
-                        tags: vec![],
-                    }],
+                        tags: None,
+                    }]),
                     lock_time: None,
                     version: None,
-                    labels: vec![],
+                    labels: None,
                     options: Some(CreateActionOptions {
                         // randomize_outputs: false — output_index 0 is stable
                         randomize_outputs: BooleanDefaultTrue(Some(false)),
@@ -365,10 +364,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         )
         .map_err(|e| MessageBoxError::Overlay(format!("build broadcaster: {e}")))?;
 
-        broadcaster
-            .broadcast_beef(beef_bytes)
-            .await
-            .map_err(|e| MessageBoxError::Overlay(format!("broadcast failed: {}", e.description)))?;
+        broadcaster.broadcast_beef(beef_bytes).await.map_err(|e| {
+            MessageBoxError::Overlay(format!("broadcast failed: {}", e.description))
+        })?;
 
         Ok(txid)
     }
@@ -395,14 +393,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             platform: platform.map(String::from),
         };
 
-        let body_bytes = serde_json::to_vec(&request)
-            .map_err(|e| MessageBoxError::Overlay(format!("serialize RegisterDeviceRequest: {e}")))?;
+        let body_bytes = serde_json::to_vec(&request).map_err(|e| {
+            MessageBoxError::Overlay(format!("serialize RegisterDeviceRequest: {e}"))
+        })?;
 
         let url = format!("{base}/registerDevice");
         let response = self.post_json(&url, body_bytes).await?;
 
-        let resp: RegisterDeviceResponse = serde_json::from_slice(&response.body)
-            .map_err(|e| MessageBoxError::Overlay(format!("deserialize RegisterDeviceResponse: {e}")))?;
+        let resp: RegisterDeviceResponse = serde_json::from_slice(&response.body).map_err(|e| {
+            MessageBoxError::Overlay(format!("deserialize RegisterDeviceResponse: {e}"))
+        })?;
 
         Ok(resp)
     }
@@ -422,8 +422,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let url = format!("{base}/devices");
         let response = self.get_json(&url).await?;
 
-        let resp: ListDevicesResponse = serde_json::from_slice(&response.body)
-            .map_err(|e| MessageBoxError::Overlay(format!("deserialize ListDevicesResponse: {e}")))?;
+        let resp: ListDevicesResponse = serde_json::from_slice(&response.body).map_err(|e| {
+            MessageBoxError::Overlay(format!("deserialize ListDevicesResponse: {e}"))
+        })?;
 
         Ok(resp.devices)
     }
@@ -452,17 +453,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 CreateActionArgs {
                     description: "Revoke MessageBox host advertisement".to_string(),
                     input_beef: Some(token.beef.clone()),
-                    inputs: vec![CreateActionInput {
+                    inputs: Some(vec![CreateActionInput {
                         outpoint: format!("{}.{}", token.txid, token.output_index),
                         input_description: "Revoking host advertisement token".to_string(),
                         unlocking_script: None,
                         unlocking_script_length: Some(73),
                         sequence_number: None,
-                    }],
-                    outputs: vec![],
+                    }]),
+                    outputs: None,
                     lock_time: None,
                     version: None,
-                    labels: vec![],
+                    labels: None,
                     options: Some(CreateActionOptions {
                         accept_delayed_broadcast: BooleanDefaultTrue(Some(false)),
                         ..Default::default()
@@ -552,7 +553,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         broadcaster
             .broadcast_beef(signed_bytes)
             .await
-            .map_err(|e| MessageBoxError::Overlay(format!("broadcast failed: {}", e.description)))?;
+            .map_err(|e| {
+                MessageBoxError::Overlay(format!("broadcast failed: {}", e.description))
+            })?;
 
         Ok(txid)
     }
@@ -591,34 +594,188 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WalletInterface for ArcWallet {
-        async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-        async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-        async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-        async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-        async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-        async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-        async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-        async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-        async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-        async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-        async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-        async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-        async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-        async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-        async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-        async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-        async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-        async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-        async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-        async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-        async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-        async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-        async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-        async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-        async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+        async fn create_action(
+            &self,
+            args: CreateActionArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            self.0.create_action(args, orig).await
+        }
+        async fn sign_action(
+            &self,
+            args: SignActionArgs,
+            orig: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            self.0.sign_action(args, orig).await
+        }
+        async fn abort_action(
+            &self,
+            args: AbortActionArgs,
+            orig: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            self.0.abort_action(args, orig).await
+        }
+        async fn list_actions(
+            &self,
+            args: ListActionsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            self.0.list_actions(args, orig).await
+        }
+        async fn internalize_action(
+            &self,
+            args: InternalizeActionArgs,
+            orig: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            self.0.internalize_action(args, orig).await
+        }
+        async fn list_outputs(
+            &self,
+            args: ListOutputsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            self.0.list_outputs(args, orig).await
+        }
+        async fn relinquish_output(
+            &self,
+            args: RelinquishOutputArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            self.0.relinquish_output(args, orig).await
+        }
+        async fn get_public_key(
+            &self,
+            args: GetPublicKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            self.0.get_public_key(args, orig).await
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            args: RevealCounterpartyKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            self.0.reveal_counterparty_key_linkage(args, orig).await
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            args: RevealSpecificKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            self.0.reveal_specific_key_linkage(args, orig).await
+        }
+        async fn encrypt(
+            &self,
+            args: EncryptArgs,
+            orig: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            self.0.encrypt(args, orig).await
+        }
+        async fn decrypt(
+            &self,
+            args: DecryptArgs,
+            orig: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            self.0.decrypt(args, orig).await
+        }
+        async fn create_hmac(
+            &self,
+            args: CreateHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            self.0.create_hmac(args, orig).await
+        }
+        async fn verify_hmac(
+            &self,
+            args: VerifyHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            self.0.verify_hmac(args, orig).await
+        }
+        async fn create_signature(
+            &self,
+            args: CreateSignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            self.0.create_signature(args, orig).await
+        }
+        async fn verify_signature(
+            &self,
+            args: VerifySignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            self.0.verify_signature(args, orig).await
+        }
+        async fn acquire_certificate(
+            &self,
+            args: AcquireCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            self.0.acquire_certificate(args, orig).await
+        }
+        async fn list_certificates(
+            &self,
+            args: ListCertificatesArgs,
+            orig: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            self.0.list_certificates(args, orig).await
+        }
+        async fn prove_certificate(
+            &self,
+            args: ProveCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            self.0.prove_certificate(args, orig).await
+        }
+        async fn relinquish_certificate(
+            &self,
+            args: RelinquishCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            self.0.relinquish_certificate(args, orig).await
+        }
+        async fn discover_by_identity_key(
+            &self,
+            args: DiscoverByIdentityKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_identity_key(args, orig).await
+        }
+        async fn discover_by_attributes(
+            &self,
+            args: DiscoverByAttributesArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_attributes(args, orig).await
+        }
+        async fn is_authenticated(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.is_authenticated(orig).await
+        }
+        async fn wait_for_authentication(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.wait_for_authentication(orig).await
+        }
+        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            self.0.get_height(orig).await
+        }
+        async fn get_header_for_height(
+            &self,
+            args: GetHeaderArgs,
+            orig: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            self.0.get_header_for_height(args, orig).await
+        }
+        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            self.0.get_network(orig).await
+        }
+        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            self.0.get_version(orig).await
+        }
     }
 
     fn make_client() -> MessageBoxClient<ArcWallet> {
@@ -767,9 +924,18 @@ mod tests {
             platform: None,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("\"fcmToken\":\"abc\""), "fcmToken must be camelCase: {json}");
-        assert!(json.contains("\"deviceId\":\"d1\""), "deviceId must be camelCase: {json}");
-        assert!(!json.contains("platform"), "platform absent when None: {json}");
+        assert!(
+            json.contains("\"fcmToken\":\"abc\""),
+            "fcmToken must be camelCase: {json}"
+        );
+        assert!(
+            json.contains("\"deviceId\":\"d1\""),
+            "deviceId must be camelCase: {json}"
+        );
+        assert!(
+            !json.contains("platform"),
+            "platform absent when None: {json}"
+        );
         assert!(!json.contains("fcm_token"), "no snake_case leakage: {json}");
         assert!(!json.contains("device_id"), "no snake_case leakage: {json}");
     }

@@ -56,7 +56,10 @@ mod tests {
             "http-msg-002",
             "Persisted variant message_id"
         );
-        assert!(!persisted.is_live(), "Persisted variant is_live() must be false");
+        assert!(
+            !persisted.is_live(),
+            "Persisted variant is_live() must be false"
+        );
     }
 
     /// DeliveryMode implements Clone — both variants clone without panic.
@@ -88,6 +91,9 @@ mod tests {
             message_id: "dbg-persisted".to_string(),
         };
         let s2 = format!("{persisted:?}");
-        assert!(s2.contains("Persisted"), "Debug output must mention variant");
+        assert!(
+            s2.contains("Persisted"),
+            "Debug output must mention variant"
+        );
     }
 }

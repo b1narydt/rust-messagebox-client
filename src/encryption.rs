@@ -1,8 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bsv::primitives::public_key::PublicKey;
-use bsv::wallet::interfaces::{
-    CreateHmacArgs, DecryptArgs, EncryptArgs, WalletInterface,
-};
+use bsv::wallet::interfaces::{CreateHmacArgs, DecryptArgs, EncryptArgs, WalletInterface};
 use bsv::wallet::types::{Counterparty, CounterpartyType, Protocol};
 
 use crate::error::MessageBoxError;
@@ -123,7 +121,13 @@ pub async fn try_decrypt_message<W: WalletInterface>(
                 inner.to_string()
             };
             // Recursively handle the unwrapped inner body
-            return Box::pin(try_decrypt_message(wallet, &inner_str, sender_pubkey_hex, originator)).await;
+            return Box::pin(try_decrypt_message(
+                wallet,
+                &inner_str,
+                sender_pubkey_hex,
+                originator,
+            ))
+            .await;
         }
 
         // Case 2: encrypted body
@@ -313,7 +317,9 @@ mod tests {
             .expect("encrypt_body");
 
         let v: serde_json::Value = serde_json::from_str(&encrypted).expect("valid json");
-        let b64 = v["encryptedMessage"].as_str().expect("encryptedMessage field");
+        let b64 = v["encryptedMessage"]
+            .as_str()
+            .expect("encryptedMessage field");
         // Must be valid STANDARD base64 (with padding)
         STANDARD.decode(b64).expect("valid STANDARD base64");
     }
@@ -431,7 +437,10 @@ mod tests {
 
         let body = r#"{"encryptedMessage":"AAAAbase64ciphertext=="}"#;
         let outcome = try_decrypt_message_typed(&wallet, body, &other_pk, None).await;
-        assert!(!outcome.is_authenticated(), "garbage ciphertext must not authenticate");
+        assert!(
+            !outcome.is_authenticated(),
+            "garbage ciphertext must not authenticate"
+        );
         // String parity with try_decrypt_message (fail-open returns raw body).
         let legacy = try_decrypt_message(&wallet, body, &other_pk, None).await;
         assert_eq!(outcome.into_body(), legacy);
@@ -465,8 +474,8 @@ mod tests {
         let encrypted = encrypt_body(&sender, message, &receiver_pk, None)
             .await
             .expect("encrypt");
-        let wrapped = serde_json::json!({"message": encrypted, "payment": {"txid": "abc"}})
-            .to_string();
+        let wrapped =
+            serde_json::json!({"message": encrypted, "payment": {"txid": "abc"}}).to_string();
 
         let outcome = try_decrypt_message_typed(&receiver, &wrapped, &sender_pk, None).await;
         assert_eq!(outcome, DecryptOutcome::Decrypted(message.to_string()));

@@ -304,7 +304,6 @@ pub struct SendMessageRequest {
     pub payment: Option<MessagePayment>,
 }
 
-
 /// Parameters for listing messages from a specific inbox.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -661,13 +660,28 @@ mod tests {
         };
         let json = serde_json::to_string(&token).unwrap();
         // Verify camelCase field names
-        assert!(json.contains("\"customInstructions\""), "customInstructions field name");
-        assert!(json.contains("\"derivationPrefix\""), "derivationPrefix field name");
-        assert!(json.contains("\"derivationSuffix\""), "derivationSuffix field name");
+        assert!(
+            json.contains("\"customInstructions\""),
+            "customInstructions field name"
+        );
+        assert!(
+            json.contains("\"derivationPrefix\""),
+            "derivationPrefix field name"
+        );
+        assert!(
+            json.contains("\"derivationSuffix\""),
+            "derivationSuffix field name"
+        );
         assert!(json.contains("\"payee\""), "payee present when Some");
-        assert!(json.contains("\"outputIndex\""), "outputIndex present when Some");
+        assert!(
+            json.contains("\"outputIndex\""),
+            "outputIndex present when Some"
+        );
         // No snake_case leakage
-        assert!(!json.contains("custom_instructions"), "no snake_case leakage");
+        assert!(
+            !json.contains("custom_instructions"),
+            "no snake_case leakage"
+        );
         assert!(!json.contains("derivation_prefix"), "no snake_case leakage");
         assert!(!json.contains("output_index"), "no snake_case leakage");
     }
@@ -686,7 +700,10 @@ mod tests {
         };
         let json = serde_json::to_string(&token).unwrap();
         // outputIndex must be absent when None
-        assert!(!json.contains("outputIndex"), "outputIndex absent when None");
+        assert!(
+            !json.contains("outputIndex"),
+            "outputIndex absent when None"
+        );
         // payee must be absent when None
         assert!(!json.contains("payee"), "payee absent when None");
     }

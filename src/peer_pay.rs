@@ -4,7 +4,7 @@ use bsv::auth::utils::create_nonce;
 use bsv::primitives::public_key::PublicKey;
 use bsv::primitives::utils::from_hex;
 use bsv::remittance::types::PeerMessage;
-use bsv::script::templates::{P2PKH, ScriptTemplateLock};
+use bsv::script::templates::{ScriptTemplateLock, P2PKH};
 use bsv::wallet::interfaces::{
     CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
     InternalizeActionArgs, InternalizeOutput, Payment, SignActionArgs, WalletInterface,
@@ -92,8 +92,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 CreateActionArgs {
                     description: "PeerPay payment".to_string(),
                     input_beef: None,
-                    inputs: vec![],
-                    outputs: vec![CreateActionOutput {
+                    inputs: None,
+                    outputs: Some(vec![CreateActionOutput {
                         locking_script: Some(locking_script_bytes),
                         satoshis: amount,
                         output_description: "Payment for PeerPay transaction".to_string(),
@@ -102,11 +102,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             serde_json::to_string(&custom_instructions)
                                 .map_err(MessageBoxError::Json)?,
                         ),
-                        tags: vec![],
-                    }],
+                        tags: None,
+                    }]),
                     lock_time: None,
                     version: None,
-                    labels: vec!["peerpay".to_string()],
+                    labels: Some(vec!["peerpay".to_string()]),
                     options: Some(CreateActionOptions {
                         randomize_outputs: BooleanDefaultTrue(Some(false)),
                         sign_and_process: BooleanDefaultTrue(None),
@@ -166,7 +166,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         let token = self.create_payment_token(recipient, amount).await?;
         let token_json = serde_json::to_string(&token)?;
-        self.send_message(recipient, "payment_inbox", &token_json, false, false, None, None).await
+        self.send_message(
+            recipient,
+            "payment_inbox",
+            &token_json,
+            false,
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Send a payment to `recipient` over WebSocket with HTTP fallback.
@@ -185,7 +194,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<String, MessageBoxError> {
         let token = self.create_payment_token(recipient, amount).await?;
         let token_json = serde_json::to_string(&token)?;
-        let delivery = self.send_live_message(recipient, "payment_inbox", &token_json, false, false, None, None).await?;
+        let delivery = self
+            .send_live_message(
+                recipient,
+                "payment_inbox",
+                &token_json,
+                false,
+                false,
+                None,
+                None,
+            )
+            .await?;
         Ok(delivery.message_id().to_string())
     }
 
@@ -211,7 +230,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             // Silently skip messages that aren't valid payment tokens
         });
 
-        self.listen_for_live_messages("payment_inbox", wrapper, None).await
+        self.listen_for_live_messages("payment_inbox", wrapper, None)
+            .await
     }
 
     /// Internalize a received payment and acknowledge the message.
@@ -237,7 +257,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 InternalizeActionArgs {
                     tx: payment.token.transaction.clone(),
                     description: "PeerPay Payment".to_string(),
-                    labels: vec!["peerpay".to_string()],
+                    labels: Some(vec!["peerpay".to_string()]),
                     seek_permission: BooleanDefaultTrue(Some(true)),
                     outputs: vec![InternalizeOutput::WalletPayment {
                         output_index: payment.token.output_index.unwrap_or(0),
@@ -253,7 +273,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
             .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
 
-        self.acknowledge_message(vec![payment.message_id.clone()], None).await?;
+        self.acknowledge_message(vec![payment.message_id.clone()], None)
+            .await?;
         Ok(())
     }
 
@@ -267,18 +288,30 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// All other errors propagate normally.
     pub async fn reject_payment(&self, payment: &IncomingPayment) -> Result<(), MessageBoxError> {
         if payment.token.amount < 2000 {
-            return self.acknowledge_message(vec![payment.message_id.clone()], None).await;
+            return self
+                .acknowledge_message(vec![payment.message_id.clone()], None)
+                .await;
         }
 
         self.accept_payment(payment).await?;
 
-        if let Err(e) = self.send_payment(&payment.sender, payment.token.amount - 1000).await {
-            if Self::is_401_error(&e) { return Ok(()); }
+        if let Err(e) = self
+            .send_payment(&payment.sender, payment.token.amount - 1000)
+            .await
+        {
+            if Self::is_401_error(&e) {
+                return Ok(());
+            }
             return Err(e);
         }
 
-        if let Err(e) = self.acknowledge_message(vec![payment.message_id.clone()], None).await {
-            if Self::is_401_error(&e) { return Ok(()); }
+        if let Err(e) = self
+            .acknowledge_message(vec![payment.message_id.clone()], None)
+            .await
+        {
+            if Self::is_401_error(&e) {
+                return Ok(());
+            }
             return Err(e);
         }
 
@@ -297,9 +330,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// which calls `this.listMessages`), so payments on all advertised hosts are returned.
     /// Silently skips messages whose bodies are not valid JSON payment tokens
     /// (mirrors TS `safeParse` behavior).
-    pub async fn list_incoming_payments(
-        &self,
-    ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
+    pub async fn list_incoming_payments(&self) -> Result<Vec<IncomingPayment>, MessageBoxError> {
         let messages = self.list_messages("payment_inbox", false, None).await?;
 
         let payments = messages
@@ -330,7 +361,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message: &PeerMessage,
     ) -> Result<bool, MessageBoxError> {
         // Step 1: Acknowledge first — matches TS line 1702
-        self.acknowledge_message(vec![message.message_id.clone()], None).await?;
+        self.acknowledge_message(vec![message.message_id.clone()], None)
+            .await?;
 
         // Step 2: Parse body for delivery-fee wrapper { message, payment }
         let parsed = serde_json::from_str::<crate::http_ops::WrappedMessageBody>(&message.body);
@@ -348,9 +380,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 let internalize_outputs: Vec<InternalizeOutput> = outputs
                     .iter()
                     .filter_map(|o| {
-                        let sender_pk = o.sender_identity_key
-                            .as_deref()
-                            .and_then(|k| bsv::primitives::public_key::PublicKey::from_string(k).ok())?;
+                        let sender_pk = o.sender_identity_key.as_deref().and_then(|k| {
+                            bsv::primitives::public_key::PublicKey::from_string(k).ok()
+                        })?;
                         Some(InternalizeOutput::WalletPayment {
                             output_index: o.output_index.unwrap_or(0),
                             payment: Payment {
@@ -369,12 +401,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 let args = InternalizeActionArgs {
                     tx: tx_bytes.clone(),
                     description,
-                    labels: vec!["notification-payment".to_string()],
+                    labels: Some(vec!["notification-payment".to_string()]),
                     seek_permission: bsv::wallet::types::BooleanDefaultTrue(Some(false)),
                     outputs: internalize_outputs,
                 };
 
-                match self.wallet().internalize_action(args, self.originator()).await {
+                match self
+                    .wallet()
+                    .internalize_action(args, self.originator())
+                    .await
+                {
                     Ok(_) => return Ok(true),
                     Err(_) => return Ok(false),
                 }
@@ -392,7 +428,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{IncomingPayment, PaymentCustomInstructions, PaymentToken, ServerPeerMessage};
+    use crate::types::{
+        IncomingPayment, PaymentCustomInstructions, PaymentToken, ServerPeerMessage,
+    };
     use bsv::primitives::private_key::PrivateKey;
     use bsv::remittance::types::PeerMessage;
     use bsv::wallet::error::WalletError;
@@ -433,34 +471,188 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WalletInterface for ArcWallet {
-        async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-        async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-        async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-        async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-        async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-        async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-        async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-        async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-        async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-        async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-        async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-        async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-        async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-        async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-        async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-        async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-        async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-        async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-        async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-        async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-        async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-        async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-        async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-        async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-        async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+        async fn create_action(
+            &self,
+            args: CreateActionArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            self.0.create_action(args, orig).await
+        }
+        async fn sign_action(
+            &self,
+            args: SignActionArgs,
+            orig: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            self.0.sign_action(args, orig).await
+        }
+        async fn abort_action(
+            &self,
+            args: AbortActionArgs,
+            orig: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            self.0.abort_action(args, orig).await
+        }
+        async fn list_actions(
+            &self,
+            args: ListActionsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            self.0.list_actions(args, orig).await
+        }
+        async fn internalize_action(
+            &self,
+            args: InternalizeActionArgs,
+            orig: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            self.0.internalize_action(args, orig).await
+        }
+        async fn list_outputs(
+            &self,
+            args: ListOutputsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            self.0.list_outputs(args, orig).await
+        }
+        async fn relinquish_output(
+            &self,
+            args: RelinquishOutputArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            self.0.relinquish_output(args, orig).await
+        }
+        async fn get_public_key(
+            &self,
+            args: GetPublicKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            self.0.get_public_key(args, orig).await
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            args: RevealCounterpartyKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            self.0.reveal_counterparty_key_linkage(args, orig).await
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            args: RevealSpecificKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            self.0.reveal_specific_key_linkage(args, orig).await
+        }
+        async fn encrypt(
+            &self,
+            args: EncryptArgs,
+            orig: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            self.0.encrypt(args, orig).await
+        }
+        async fn decrypt(
+            &self,
+            args: DecryptArgs,
+            orig: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            self.0.decrypt(args, orig).await
+        }
+        async fn create_hmac(
+            &self,
+            args: CreateHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            self.0.create_hmac(args, orig).await
+        }
+        async fn verify_hmac(
+            &self,
+            args: VerifyHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            self.0.verify_hmac(args, orig).await
+        }
+        async fn create_signature(
+            &self,
+            args: CreateSignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            self.0.create_signature(args, orig).await
+        }
+        async fn verify_signature(
+            &self,
+            args: VerifySignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            self.0.verify_signature(args, orig).await
+        }
+        async fn acquire_certificate(
+            &self,
+            args: AcquireCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            self.0.acquire_certificate(args, orig).await
+        }
+        async fn list_certificates(
+            &self,
+            args: ListCertificatesArgs,
+            orig: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            self.0.list_certificates(args, orig).await
+        }
+        async fn prove_certificate(
+            &self,
+            args: ProveCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            self.0.prove_certificate(args, orig).await
+        }
+        async fn relinquish_certificate(
+            &self,
+            args: RelinquishCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            self.0.relinquish_certificate(args, orig).await
+        }
+        async fn discover_by_identity_key(
+            &self,
+            args: DiscoverByIdentityKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_identity_key(args, orig).await
+        }
+        async fn discover_by_attributes(
+            &self,
+            args: DiscoverByAttributesArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_attributes(args, orig).await
+        }
+        async fn is_authenticated(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.is_authenticated(orig).await
+        }
+        async fn wait_for_authentication(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.wait_for_authentication(orig).await
+        }
+        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            self.0.get_height(orig).await
+        }
+        async fn get_header_for_height(
+            &self,
+            args: GetHeaderArgs,
+            orig: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            self.0.get_header_for_height(args, orig).await
+        }
+        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            self.0.get_network(orig).await
+        }
+        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            self.0.get_version(orig).await
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -497,7 +689,10 @@ mod tests {
             Err(e) => {
                 let msg = e.to_string();
                 // Should NOT fail at nonce or key derivation steps
-                assert!(!msg.contains("create_nonce prefix:"), "should not fail at nonce step");
+                assert!(
+                    !msg.contains("create_nonce prefix:"),
+                    "should not fail at nonce step"
+                );
                 // It will fail at create_action (wallet error) — acceptable
                 println!("create_payment_token expected error: {msg}");
             }
@@ -590,7 +785,11 @@ mod tests {
             .collect();
 
         // Only msg2 has a valid PaymentToken body
-        assert_eq!(payments.len(), 1, "only valid payment token should be included");
+        assert_eq!(
+            payments.len(),
+            1,
+            "only valid payment token should be included"
+        );
         assert_eq!(payments[0].message_id, "msg2");
         assert_eq!(payments[0].sender, "03sender2");
         assert_eq!(payments[0].token.amount, 1000);
@@ -615,7 +814,10 @@ mod tests {
 
         // SDK's bytes_as_base64 serde would re-encode back to the original strings
         let re_encoded = STANDARD.encode(&prefix_bytes);
-        assert_eq!(re_encoded, prefix, "round-trip must produce original base64");
+        assert_eq!(
+            re_encoded, prefix,
+            "round-trip must produce original base64"
+        );
     }
 
     /// Construct IncomingPayment from a PaymentToken, verify all fields preserved.
@@ -723,6 +925,10 @@ mod tests {
         }
 
         let payments = received.lock().unwrap();
-        assert_eq!(payments.len(), 0, "non-payment message must be silently skipped");
+        assert_eq!(
+            payments.len(),
+            0,
+            "non-payment message must be silently skipped"
+        );
     }
 }

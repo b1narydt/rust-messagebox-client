@@ -20,12 +20,14 @@
 use std::sync::Arc;
 
 use bsv::primitives::private_key::PrivateKey;
-use bsv::remittance::CommsLayer;
 use bsv::remittance::types::PeerMessage;
+use bsv::remittance::CommsLayer;
 use bsv::wallet::error::WalletError;
 use bsv::wallet::interfaces::*;
 use bsv::wallet::proto_wallet::ProtoWallet;
-use bsv_messagebox_client::types::{IncomingPayment, PaymentCustomInstructions, PaymentToken, ServerPeerMessage};
+use bsv_messagebox_client::types::{
+    IncomingPayment, PaymentCustomInstructions, PaymentToken, ServerPeerMessage,
+};
 use bsv_messagebox_client::{MessageBoxClient, RemittanceAdapter};
 
 // ---------------------------------------------------------------------------
@@ -44,34 +46,188 @@ impl ArcWallet {
 
 #[async_trait::async_trait]
 impl WalletInterface for ArcWallet {
-    async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-    async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-    async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-    async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-    async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-    async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-    async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-    async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-    async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-    async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-    async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-    async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-    async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-    async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-    async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-    async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-    async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-    async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-    async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-    async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-    async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-    async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-    async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-    async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-    async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+    async fn create_action(
+        &self,
+        args: CreateActionArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateActionResult, WalletError> {
+        self.0.create_action(args, orig).await
+    }
+    async fn sign_action(
+        &self,
+        args: SignActionArgs,
+        orig: Option<&str>,
+    ) -> Result<SignActionResult, WalletError> {
+        self.0.sign_action(args, orig).await
+    }
+    async fn abort_action(
+        &self,
+        args: AbortActionArgs,
+        orig: Option<&str>,
+    ) -> Result<AbortActionResult, WalletError> {
+        self.0.abort_action(args, orig).await
+    }
+    async fn list_actions(
+        &self,
+        args: ListActionsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListActionsResult, WalletError> {
+        self.0.list_actions(args, orig).await
+    }
+    async fn internalize_action(
+        &self,
+        args: InternalizeActionArgs,
+        orig: Option<&str>,
+    ) -> Result<InternalizeActionResult, WalletError> {
+        self.0.internalize_action(args, orig).await
+    }
+    async fn list_outputs(
+        &self,
+        args: ListOutputsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListOutputsResult, WalletError> {
+        self.0.list_outputs(args, orig).await
+    }
+    async fn relinquish_output(
+        &self,
+        args: RelinquishOutputArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishOutputResult, WalletError> {
+        self.0.relinquish_output(args, orig).await
+    }
+    async fn get_public_key(
+        &self,
+        args: GetPublicKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<GetPublicKeyResult, WalletError> {
+        self.0.get_public_key(args, orig).await
+    }
+    async fn reveal_counterparty_key_linkage(
+        &self,
+        args: RevealCounterpartyKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+        self.0.reveal_counterparty_key_linkage(args, orig).await
+    }
+    async fn reveal_specific_key_linkage(
+        &self,
+        args: RevealSpecificKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+        self.0.reveal_specific_key_linkage(args, orig).await
+    }
+    async fn encrypt(
+        &self,
+        args: EncryptArgs,
+        orig: Option<&str>,
+    ) -> Result<EncryptResult, WalletError> {
+        self.0.encrypt(args, orig).await
+    }
+    async fn decrypt(
+        &self,
+        args: DecryptArgs,
+        orig: Option<&str>,
+    ) -> Result<DecryptResult, WalletError> {
+        self.0.decrypt(args, orig).await
+    }
+    async fn create_hmac(
+        &self,
+        args: CreateHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateHmacResult, WalletError> {
+        self.0.create_hmac(args, orig).await
+    }
+    async fn verify_hmac(
+        &self,
+        args: VerifyHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifyHmacResult, WalletError> {
+        self.0.verify_hmac(args, orig).await
+    }
+    async fn create_signature(
+        &self,
+        args: CreateSignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateSignatureResult, WalletError> {
+        self.0.create_signature(args, orig).await
+    }
+    async fn verify_signature(
+        &self,
+        args: VerifySignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifySignatureResult, WalletError> {
+        self.0.verify_signature(args, orig).await
+    }
+    async fn acquire_certificate(
+        &self,
+        args: AcquireCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<Certificate, WalletError> {
+        self.0.acquire_certificate(args, orig).await
+    }
+    async fn list_certificates(
+        &self,
+        args: ListCertificatesArgs,
+        orig: Option<&str>,
+    ) -> Result<ListCertificatesResult, WalletError> {
+        self.0.list_certificates(args, orig).await
+    }
+    async fn prove_certificate(
+        &self,
+        args: ProveCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<ProveCertificateResult, WalletError> {
+        self.0.prove_certificate(args, orig).await
+    }
+    async fn relinquish_certificate(
+        &self,
+        args: RelinquishCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishCertificateResult, WalletError> {
+        self.0.relinquish_certificate(args, orig).await
+    }
+    async fn discover_by_identity_key(
+        &self,
+        args: DiscoverByIdentityKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_identity_key(args, orig).await
+    }
+    async fn discover_by_attributes(
+        &self,
+        args: DiscoverByAttributesArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_attributes(args, orig).await
+    }
+    async fn is_authenticated(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.is_authenticated(orig).await
+    }
+    async fn wait_for_authentication(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.wait_for_authentication(orig).await
+    }
+    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+        self.0.get_height(orig).await
+    }
+    async fn get_header_for_height(
+        &self,
+        args: GetHeaderArgs,
+        orig: Option<&str>,
+    ) -> Result<GetHeaderResult, WalletError> {
+        self.0.get_header_for_height(args, orig).await
+    }
+    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+        self.0.get_network(orig).await
+    }
+    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+        self.0.get_version(orig).await
+    }
 }
 
 fn make_adapter() -> (RemittanceAdapter<ArcWallet>, ArcWallet) {
@@ -142,7 +298,10 @@ async fn test_send_list_ack_cycle() {
     // The message ID returned from send_message is a 64-char hex HMAC.
     // We verify the ID format here; the HTTP call itself is not made.
     let message_id = "test-msg-001".to_string();
-    assert!(!message_id.is_empty(), "send must return a non-empty message ID");
+    assert!(
+        !message_id.is_empty(),
+        "send must return a non-empty message ID"
+    );
 
     // --- LIST phase ---
     // Simulate what the server returns for /listMessages.
@@ -167,7 +326,10 @@ async fn test_send_list_ack_cycle() {
     };
 
     // Verify all 5 PeerMessage fields are correctly mapped.
-    assert_eq!(peer_msg.message_id, "test-msg-001", "message_id from server");
+    assert_eq!(
+        peer_msg.message_id, "test-msg-001",
+        "message_id from server"
+    );
     assert_eq!(peer_msg.sender, "03abc123def456", "sender from server");
     assert_eq!(
         peer_msg.recipient, identity_key,
@@ -242,7 +404,10 @@ async fn test_list_messages_recipient_populated_from_identity_key() {
     for pm in &peer_msgs {
         assert_eq!(pm.recipient, identity_key, "recipient from identity key");
         assert_ne!(pm.recipient, "", "recipient never empty");
-        assert_eq!(pm.message_box, "payment_inbox", "message_box from parameter");
+        assert_eq!(
+            pm.message_box, "payment_inbox",
+            "message_box from parameter"
+        );
     }
 
     assert_eq!(peer_msgs[0].message_id, "msg-a");
@@ -312,9 +477,18 @@ fn test_payment_token_camel_case_wire_format() {
     let json = serde_json::to_string(&token).unwrap();
 
     // Verify camelCase field names on the wire.
-    assert!(json.contains("\"customInstructions\""), "customInstructions camelCase");
-    assert!(json.contains("\"derivationPrefix\""), "derivationPrefix camelCase");
-    assert!(json.contains("\"derivationSuffix\""), "derivationSuffix camelCase");
+    assert!(
+        json.contains("\"customInstructions\""),
+        "customInstructions camelCase"
+    );
+    assert!(
+        json.contains("\"derivationPrefix\""),
+        "derivationPrefix camelCase"
+    );
+    assert!(
+        json.contains("\"derivationSuffix\""),
+        "derivationSuffix camelCase"
+    );
     assert!(json.contains("\"transaction\""), "transaction present");
     assert!(json.contains("\"amount\""), "amount present");
     assert!(json.contains("\"payee\""), "payee present when Some");
@@ -323,7 +497,10 @@ fn test_payment_token_camel_case_wire_format() {
     assert!(json.contains("[1,2,3]"), "transaction as number array");
 
     // outputIndex must be absent when None (TS omits it at creation time).
-    assert!(!json.contains("outputIndex"), "outputIndex absent when None");
+    assert!(
+        !json.contains("outputIndex"),
+        "outputIndex absent when None"
+    );
     assert!(!json.contains("output_index"), "no snake_case leakage");
 
     // Verify payee value is correct.
@@ -369,7 +546,11 @@ fn test_incoming_payment_from_payment_token() {
     assert_eq!(incoming.sender, "03sender_pubkey", "sender preserved");
     assert_eq!(incoming.message_id, "msg-abc-123", "message_id preserved");
     assert_eq!(incoming.token.amount, 2500, "token amount preserved");
-    assert_eq!(incoming.token.transaction, vec![0xde, 0xad, 0xbe, 0xef], "transaction preserved");
+    assert_eq!(
+        incoming.token.transaction,
+        vec![0xde, 0xad, 0xbe, 0xef],
+        "transaction preserved"
+    );
     assert_eq!(incoming.token.custom_instructions.derivation_prefix, "pfx");
     assert_eq!(incoming.token.custom_instructions.derivation_suffix, "sfx");
 }
@@ -394,8 +575,14 @@ fn test_payment_token_round_trip_serialization() {
     let restored: PaymentToken = serde_json::from_str(&json).unwrap();
 
     assert_eq!(restored.amount, original.amount, "amount round-trips");
-    assert_eq!(restored.transaction, original.transaction, "transaction round-trips");
-    assert_eq!(restored.output_index, original.output_index, "output_index round-trips");
+    assert_eq!(
+        restored.transaction, original.transaction,
+        "transaction round-trips"
+    );
+    assert_eq!(
+        restored.output_index, original.output_index,
+        "output_index round-trips"
+    );
     assert_eq!(
         restored.custom_instructions.derivation_prefix,
         original.custom_instructions.derivation_prefix,
@@ -407,8 +594,7 @@ fn test_payment_token_round_trip_serialization() {
         "derivation_suffix round-trips"
     );
     assert_eq!(
-        restored.custom_instructions.payee,
-        original.custom_instructions.payee,
+        restored.custom_instructions.payee, original.custom_instructions.payee,
         "payee round-trips"
     );
 }
@@ -428,21 +614,33 @@ fn test_accept_payment_derivation_args() {
     let suffix_bytes: Vec<u8> = suffix.as_bytes().to_vec();
 
     // Verify it's the UTF-8 byte representation (not base64 decoded).
-    assert_eq!(prefix_bytes, b"my-prefix-string".to_vec(), "prefix as raw UTF-8 bytes");
-    assert_eq!(suffix_bytes, b"my-suffix-string".to_vec(), "suffix as raw UTF-8 bytes");
+    assert_eq!(
+        prefix_bytes,
+        b"my-prefix-string".to_vec(),
+        "prefix as raw UTF-8 bytes"
+    );
+    assert_eq!(
+        suffix_bytes,
+        b"my-suffix-string".to_vec(),
+        "suffix as raw UTF-8 bytes"
+    );
 
     // Confirm the byte length matches the string length (all ASCII).
-    assert_eq!(prefix_bytes.len(), prefix.len(), "byte length matches string length for ASCII");
+    assert_eq!(
+        prefix_bytes.len(),
+        prefix.len(),
+        "byte length matches string length for ASCII"
+    );
 
     // Verify this is NOT base64 decoding — base64("my-prefix-string") would give different bytes.
-    let base64_decoded = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        prefix,
-    );
+    let base64_decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, prefix);
     // "my-prefix-string" is not valid base64, so decode should fail or give different bytes.
     // Either way, the raw bytes must NOT equal base64 decoded bytes.
     if let Ok(decoded) = base64_decoded {
-        assert_ne!(prefix_bytes, decoded, "must use raw bytes, NOT base64 decoded");
+        assert_ne!(
+            prefix_bytes, decoded,
+            "must use raw bytes, NOT base64 decoded"
+        );
     }
     // If base64 decode fails — that confirms the string isn't base64, so raw bytes is correct.
 }
@@ -466,7 +664,10 @@ fn test_safe_parse_valid_payment_body() {
 
     // safeParse: valid body should succeed.
     let result = serde_json::from_str::<PaymentToken>(&json);
-    assert!(result.is_ok(), "valid PaymentToken JSON must parse successfully");
+    assert!(
+        result.is_ok(),
+        "valid PaymentToken JSON must parse successfully"
+    );
     let parsed = result.unwrap();
     assert_eq!(parsed.amount, 500);
     assert_eq!(parsed.custom_instructions.derivation_prefix, "valid-prefix");
@@ -480,15 +681,24 @@ fn test_safe_parse_invalid_body_returns_none() {
     // Plain string is not valid JSON at all.
     let plain_text = "hello world";
     let result1 = serde_json::from_str::<PaymentToken>(plain_text).ok();
-    assert!(result1.is_none(), "plain text must fail to parse as PaymentToken");
+    assert!(
+        result1.is_none(),
+        "plain text must fail to parse as PaymentToken"
+    );
 
     // Empty JSON object is missing required fields.
     let empty_obj = "{}";
     let result2 = serde_json::from_str::<PaymentToken>(empty_obj).ok();
-    assert!(result2.is_none(), "empty object must fail to parse as PaymentToken (missing required fields)");
+    assert!(
+        result2.is_none(),
+        "empty object must fail to parse as PaymentToken (missing required fields)"
+    );
 
     // A different valid JSON shape is not a PaymentToken.
     let other_json = r#"{"status": "success", "messages": []}"#;
     let result3 = serde_json::from_str::<PaymentToken>(other_json).ok();
-    assert!(result3.is_none(), "unrelated JSON must fail to parse as PaymentToken");
+    assert!(
+        result3.is_none(),
+        "unrelated JSON must fail to parse as PaymentToken"
+    );
 }

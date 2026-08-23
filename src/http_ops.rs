@@ -1,16 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
+use bsv::primitives::public_key::PublicKey;
 use bsv::remittance::types::PeerMessage;
 use bsv::wallet::interfaces::{InternalizeActionArgs, InternalizeOutput, Payment, WalletInterface};
 use bsv::wallet::types::BooleanDefaultTrue;
-use bsv::primitives::public_key::PublicKey;
 use futures_util::future::join_all;
 
 use crate::client::MessageBoxClient;
-use crate::error::MessageBoxError;
 use crate::client::{check_status_error, is_duplicate_message_rejection};
-use crate::types::{AcknowledgeMessageParams, FailedRecipient, ListMessagesParams, ListMessagesResponse, MessagePayment, MessagePaymentOutput, SendListParams, SendListResult, SentRecipient, SendMessageParams, SendMessageRequest, SendMessageResponse, ServerPeerMessage};
 use crate::encryption;
+use crate::error::MessageBoxError;
+use crate::types::{
+    AcknowledgeMessageParams, FailedRecipient, ListMessagesParams, ListMessagesResponse,
+    MessagePayment, MessagePaymentOutput, SendListParams, SendListResult, SendMessageParams,
+    SendMessageRequest, SendMessageResponse, SentRecipient, ServerPeerMessage,
+};
 
 /// Deduplicate messages from multiple hosts by `message_id`, preserving order.
 ///
@@ -131,13 +135,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let wire_body = if skip_encryption {
             body.to_string()
         } else {
-            encryption::encrypt_body(
-                self.wallet(),
-                body,
-                recipient,
-                self.originator(),
-            )
-            .await?
+            encryption::encrypt_body(self.wallet(), body, recipient, self.originator()).await?
         };
 
         // Resolve or generate message ID.
@@ -146,19 +144,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let resolved_message_id = if let Some(id) = message_id {
             id.to_string()
         } else {
-            encryption::generate_message_id(
-                self.wallet(),
-                body,
-                recipient,
-                self.originator(),
-            )
-            .await?
+            encryption::generate_message_id(self.wallet(), body, recipient, self.originator())
+                .await?
         };
 
         // When check_permissions is true and no payment was supplied, obtain a fee quote
         // and create a message payment if any fees are required.
         let payment = if check_permissions && payment.is_none() {
-            let quote = self.get_message_box_quote(recipient, message_box, None).await?;
+            let quote = self
+                .get_message_box_quote(recipient, message_box, None)
+                .await?;
             if quote.delivery_fee > 0 || quote.recipient_fee > 0 {
                 let p = self.create_message_payment(recipient, &quote, None).await?;
                 Some(p)
@@ -237,15 +232,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         quote: &crate::types::MessageBoxQuote,
         description: Option<&str>,
     ) -> Result<MessagePayment, MessageBoxError> {
+        use base64::Engine;
+        use bsv::primitives::public_key::PublicKey;
+        use bsv::primitives::utils::from_hex;
+        use bsv::script::templates::{ScriptTemplateLock, P2PKH};
         use bsv::wallet::interfaces::{
             CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
         };
-        use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
-        use bsv::primitives::public_key::PublicKey;
-        use bsv::primitives::utils::from_hex;
-        use bsv::script::templates::{P2PKH, ScriptTemplateLock};
         use bsv::wallet::proto_wallet::ProtoWallet;
-        use base64::Engine;
+        use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
 
         let desc = description.unwrap_or("MessageBox delivery fee");
         let sender_identity_key = self.get_identity_key().await?;
@@ -305,7 +300,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 output_description: "MessageBox server delivery fee".to_string(),
                 basket: None,
                 custom_instructions: None,
-                tags: vec![],
+                tags: None,
             });
 
             // TS: senderIdentityKey = current user's identity key (NOT agent key)
@@ -372,7 +367,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 output_description: "Recipient message fee".to_string(),
                 basket: None,
                 custom_instructions: None,
-                tags: vec![],
+                tags: None,
             });
 
             // TS: senderIdentityKey = anyoneWallet's identity key (PrivateKey(1).toPublicKey())
@@ -407,11 +402,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 CreateActionArgs {
                     description: desc.to_string(),
                     input_beef: None,
-                    inputs: vec![],
-                    outputs,
+                    inputs: None,
+                    outputs: Some(outputs),
                     lock_time: None,
                     version: None,
-                    labels: vec!["messagebox".to_string()],
+                    labels: Some(vec!["messagebox".to_string()]),
                     options: Some(CreateActionOptions {
                         randomize_outputs: BooleanDefaultTrue(Some(false)),
                         ..Default::default()
@@ -432,7 +427,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             outputs: payment_outputs,
         })
     }
-
 
     /// Send a message to a list of recipients in a single batch operation.
     ///
@@ -468,7 +462,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             let host = if let Some(h) = override_host {
                 h.to_string()
             } else {
-                self.resolve_host_for_recipient(&rq.recipient).await.unwrap_or_else(|_| self.host().to_string())
+                self.resolve_host_for_recipient(&rq.recipient)
+                    .await
+                    .unwrap_or_else(|_| self.host().to_string())
             };
             recipient_hosts.insert(rq.recipient.clone(), host);
         }
@@ -483,13 +479,28 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             let pairs_for_payment: Vec<(String, i64, i64, String)> = sendable
                 .iter()
                 .map(|rq| {
-                    let host = recipient_hosts.get(&rq.recipient).cloned().unwrap_or_else(|| self.host().to_string());
-                    let agent_key = multi_quote.delivery_agent_identity_key_by_host.get(&host).cloned().unwrap_or_default();
-                    (rq.recipient.clone(), rq.delivery_fee, rq.recipient_fee, agent_key)
+                    let host = recipient_hosts
+                        .get(&rq.recipient)
+                        .cloned()
+                        .unwrap_or_else(|| self.host().to_string());
+                    let agent_key = multi_quote
+                        .delivery_agent_identity_key_by_host
+                        .get(&host)
+                        .cloned()
+                        .unwrap_or_default();
+                    (
+                        rq.recipient.clone(),
+                        rq.delivery_fee,
+                        rq.recipient_fee,
+                        agent_key,
+                    )
                 })
                 .collect();
 
-            match self.create_message_payment_batch_from_tuples(&pairs_for_payment, None).await {
+            match self
+                .create_message_payment_batch_from_tuples(&pairs_for_payment, None)
+                .await
+            {
                 Ok(p) => Some(p),
                 Err(e) => {
                     // If batch payment creation fails, all sendable recipients fail.
@@ -570,15 +581,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         tuples: &[(String, i64, i64, String)],
         description: Option<&str>,
     ) -> Result<MessagePayment, MessageBoxError> {
+        use base64::Engine;
+        use bsv::primitives::public_key::PublicKey;
+        use bsv::primitives::utils::from_hex;
+        use bsv::script::templates::{ScriptTemplateLock, P2PKH};
         use bsv::wallet::interfaces::{
             CreateActionArgs, CreateActionOptions, CreateActionOutput, GetPublicKeyArgs,
         };
-        use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
-        use bsv::primitives::public_key::PublicKey;
-        use bsv::primitives::utils::from_hex;
-        use bsv::script::templates::{P2PKH, ScriptTemplateLock};
         use bsv::wallet::proto_wallet::ProtoWallet;
-        use base64::Engine;
+        use bsv::wallet::types::{BooleanDefaultTrue, Counterparty, CounterpartyType, Protocol};
 
         let desc = description.unwrap_or("MessageBox batch delivery fee");
         let sender_identity_key = self.get_identity_key().await?;
@@ -655,7 +666,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     output_description: format!("Delivery fee for {}", recipient),
                     basket: None,
                     custom_instructions: None,
-                    tags: vec![],
+                    tags: None,
                 });
                 payment_outputs.push(MessagePaymentOutput {
                     output_index,
@@ -715,7 +726,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     output_description: format!("Recipient fee for {}", recipient),
                     basket: None,
                     custom_instructions: None,
-                    tags: vec![],
+                    tags: None,
                 });
                 payment_outputs.push(MessagePaymentOutput {
                     output_index,
@@ -727,7 +738,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
 
         if outputs.is_empty() {
-            return Ok(MessagePayment { tx: vec![], outputs: vec![] });
+            return Ok(MessagePayment {
+                tx: vec![],
+                outputs: vec![],
+            });
         }
 
         let create_result = self
@@ -736,11 +750,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 CreateActionArgs {
                     description: desc.to_string(),
                     input_beef: None,
-                    inputs: vec![],
-                    outputs,
+                    inputs: None,
+                    outputs: Some(outputs),
                     lock_time: None,
                     version: None,
-                    labels: vec!["messagebox".to_string()],
+                    labels: Some(vec!["messagebox".to_string()]),
                     options: Some(CreateActionOptions {
                         randomize_outputs: BooleanDefaultTrue(Some(false)),
                         ..Default::default()
@@ -784,8 +798,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let response = self.post_json(&url, body_bytes).await?;
         check_status_error(&response.body)?;
 
-        let mut list_response: ListMessagesResponse =
-            serde_json::from_slice(&response.body)?;
+        let mut list_response: ListMessagesResponse = serde_json::from_slice(&response.body)?;
 
         // Decrypt each message body in-place.
         // PARITY: originator is None here — matches TS listMessagesLite which omits originator
@@ -832,12 +845,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         // When override_host is provided, skip multi-host overlay and use that single host.
         if let Some(host) = override_host {
-            return self.list_messages_from_host(host, message_box, accept_payments).await;
+            return self
+                .list_messages_from_host(host, message_box, accept_payments)
+                .await;
         }
 
         // Discover all known hosts for this identity.
         let identity_key = self.get_identity_key().await?;
-        let ads = self.query_advertisements(Some(&identity_key), None).await.unwrap_or_default();
+        let ads = self
+            .query_advertisements(Some(&identity_key), None)
+            .await
+            .unwrap_or_default();
 
         // Build the set of unique host URLs: ads + self.host (always included).
         let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
@@ -845,7 +863,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         if host_set.len() == 1 {
             // Single-host path — no need for dedup.
-            return self.list_messages_from_host(self.host(), message_box, accept_payments).await;
+            return self
+                .list_messages_from_host(self.host(), message_box, accept_payments)
+                .await;
         }
 
         // Multi-host path: query all concurrently (TS Promise.allSettled semantics).
@@ -855,13 +875,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .collect();
 
         let outcomes = join_all(futures).await;
-        let successful: Vec<Vec<PeerMessage>> = outcomes
-            .into_iter()
-            .filter_map(|r| r.ok())
-            .collect();
+        let successful: Vec<Vec<PeerMessage>> =
+            outcomes.into_iter().filter_map(|r| r.ok()).collect();
 
         if successful.is_empty() {
-            return Err(MessageBoxError::Http(0, format!("list_messages: all {} hosts failed", host_set.len())));
+            return Err(MessageBoxError::Http(
+                0,
+                format!("list_messages: all {} hosts failed", host_set.len()),
+            ));
         }
 
         Ok(dedup_messages(successful))
@@ -893,66 +914,79 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let mut result = Vec::with_capacity(list_response.messages.len());
         for msg in list_response.messages {
             // Try to parse the body as a server-wrapped { message, payment } envelope.
-            let plain_body: String = if let Ok(wrapped) = serde_json::from_str::<WrappedMessageBody>(&msg.body) {
-                // Attempt to internalize the server delivery-fee payment when accept_payments=true.
-                if accept_payments {
-                    if let Some(payment) = &wrapped.payment {
-                        if let Some(tx_bytes) = &payment.tx {
-                            let description = payment
-                                .description
-                                .clone()
-                                .unwrap_or_else(|| "Server delivery fee".to_string());
+            let plain_body: String =
+                if let Ok(wrapped) = serde_json::from_str::<WrappedMessageBody>(&msg.body) {
+                    // Attempt to internalize the server delivery-fee payment when accept_payments=true.
+                    if accept_payments {
+                        if let Some(payment) = &wrapped.payment {
+                            if let Some(tx_bytes) = &payment.tx {
+                                let description = payment
+                                    .description
+                                    .clone()
+                                    .unwrap_or_else(|| "Server delivery fee".to_string());
 
-                            // Build output list from server payment data.
-                            // Errors are intentionally ignored — matches TS try/catch behavior.
-                            let outputs: Vec<InternalizeOutput> = payment
-                                .outputs
-                                .as_deref()
-                                .unwrap_or(&[])
-                                .iter()
-                                .filter_map(|o| {
-                                    // TS: only internalizes outputs where protocol === 'wallet payment'
-                                    if o.protocol.as_deref() != Some("wallet payment") && o.protocol.is_some() {
-                                        return None;
-                                    }
-                                    // Try to parse sender key — skip output if invalid.
-                                    let sender_pk = o.sender_identity_key
-                                        .as_deref()
-                                        .and_then(|k| PublicKey::from_string(k).ok())?;
-                                    Some(InternalizeOutput::WalletPayment {
-                                        output_index: o.output_index.unwrap_or(0),
-                                        payment: Payment {
-                                            derivation_prefix: o.derivation_prefix.clone().unwrap_or_default(),
-                                            derivation_suffix: o.derivation_suffix.clone().unwrap_or_default(),
-                                            sender_identity_key: sender_pk,
-                                        },
+                                // Build output list from server payment data.
+                                // Errors are intentionally ignored — matches TS try/catch behavior.
+                                let outputs: Vec<InternalizeOutput> = payment
+                                    .outputs
+                                    .as_deref()
+                                    .unwrap_or(&[])
+                                    .iter()
+                                    .filter_map(|o| {
+                                        // TS: only internalizes outputs where protocol === 'wallet payment'
+                                        if o.protocol.as_deref() != Some("wallet payment")
+                                            && o.protocol.is_some()
+                                        {
+                                            return None;
+                                        }
+                                        // Try to parse sender key — skip output if invalid.
+                                        let sender_pk = o
+                                            .sender_identity_key
+                                            .as_deref()
+                                            .and_then(|k| PublicKey::from_string(k).ok())?;
+                                        Some(InternalizeOutput::WalletPayment {
+                                            output_index: o.output_index.unwrap_or(0),
+                                            payment: Payment {
+                                                derivation_prefix: o
+                                                    .derivation_prefix
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                derivation_suffix: o
+                                                    .derivation_suffix
+                                                    .clone()
+                                                    .unwrap_or_default(),
+                                                sender_identity_key: sender_pk,
+                                            },
+                                        })
                                     })
-                                })
-                                .collect();
+                                    .collect();
 
-                            let args = InternalizeActionArgs {
-                                tx: tx_bytes.clone(),
-                                description,
-                                labels: vec!["server-delivery-fee".to_string()],
-                                seek_permission: BooleanDefaultTrue(Some(false)),
-                                outputs,
-                            };
-                            // Defensive: ignore internalization errors, continue processing.
-                            let _ = self.wallet().internalize_action(args, self.originator()).await;
+                                let args = InternalizeActionArgs {
+                                    tx: tx_bytes.clone(),
+                                    description,
+                                    labels: Some(vec!["server-delivery-fee".to_string()]),
+                                    seek_permission: BooleanDefaultTrue(Some(false)),
+                                    outputs: outputs,
+                                };
+                                // Defensive: ignore internalization errors, continue processing.
+                                let _ = self
+                                    .wallet()
+                                    .internalize_action(args, self.originator())
+                                    .await;
+                            }
                         }
                     }
-                }
 
-                // Extract the message sub-field from the wrapper regardless of accept_payments.
-                match wrapped.message {
-                    Some(serde_json::Value::String(s)) => s,
-                    Some(v) => v.to_string(),
-                    None => msg.body.clone(),
-                }
-            } else {
-                // Not a wrapped body — pass through as plain text.
-                msg.body.clone()
-            };
+                    // Extract the message sub-field from the wrapper regardless of accept_payments.
+                    match wrapped.message {
+                        Some(serde_json::Value::String(s)) => s,
+                        Some(v) => v.to_string(),
+                        None => msg.body.clone(),
+                    }
+                } else {
+                    // Not a wrapped body — pass through as plain text.
+                    msg.body.clone()
+                };
 
             // Decrypt the extracted body.
             let decrypted = encryption::try_decrypt_message(
@@ -993,13 +1027,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         // Multi-host fan-out: ack on all known hosts concurrently.
         let identity_key = self.get_identity_key().await?;
-        let ads = self.query_advertisements(Some(&identity_key), None).await.unwrap_or_default();
+        let ads = self
+            .query_advertisements(Some(&identity_key), None)
+            .await
+            .unwrap_or_default();
 
         let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
         host_set.insert(self.host().to_string());
 
         if host_set.len() == 1 {
-            return self.acknowledge_message_on_host(self.host(), &message_ids).await;
+            return self
+                .acknowledge_message_on_host(self.host(), &message_ids)
+                .await;
         }
 
         // Fan out in parallel — return Ok if at least one succeeds.
@@ -1014,7 +1053,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         if any_ok {
             Ok(())
         } else {
-            Err(MessageBoxError::Http(0, format!("acknowledge_message: all {} hosts failed", host_set.len())))
+            Err(MessageBoxError::Http(
+                0,
+                format!("acknowledge_message: all {} hosts failed", host_set.len()),
+            ))
         }
     }
 
@@ -1064,34 +1106,188 @@ mod tests {
 
     #[async_trait::async_trait]
     impl WalletInterface for ArcWallet {
-        async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-        async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-        async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-        async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-        async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-        async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-        async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-        async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-        async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-        async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-        async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-        async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-        async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-        async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-        async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-        async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-        async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-        async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-        async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-        async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-        async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-        async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-        async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-        async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-        async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+        async fn create_action(
+            &self,
+            args: CreateActionArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            self.0.create_action(args, orig).await
+        }
+        async fn sign_action(
+            &self,
+            args: SignActionArgs,
+            orig: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            self.0.sign_action(args, orig).await
+        }
+        async fn abort_action(
+            &self,
+            args: AbortActionArgs,
+            orig: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            self.0.abort_action(args, orig).await
+        }
+        async fn list_actions(
+            &self,
+            args: ListActionsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            self.0.list_actions(args, orig).await
+        }
+        async fn internalize_action(
+            &self,
+            args: InternalizeActionArgs,
+            orig: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            self.0.internalize_action(args, orig).await
+        }
+        async fn list_outputs(
+            &self,
+            args: ListOutputsArgs,
+            orig: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            self.0.list_outputs(args, orig).await
+        }
+        async fn relinquish_output(
+            &self,
+            args: RelinquishOutputArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            self.0.relinquish_output(args, orig).await
+        }
+        async fn get_public_key(
+            &self,
+            args: GetPublicKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            self.0.get_public_key(args, orig).await
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            args: RevealCounterpartyKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            self.0.reveal_counterparty_key_linkage(args, orig).await
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            args: RevealSpecificKeyLinkageArgs,
+            orig: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            self.0.reveal_specific_key_linkage(args, orig).await
+        }
+        async fn encrypt(
+            &self,
+            args: EncryptArgs,
+            orig: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            self.0.encrypt(args, orig).await
+        }
+        async fn decrypt(
+            &self,
+            args: DecryptArgs,
+            orig: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            self.0.decrypt(args, orig).await
+        }
+        async fn create_hmac(
+            &self,
+            args: CreateHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            self.0.create_hmac(args, orig).await
+        }
+        async fn verify_hmac(
+            &self,
+            args: VerifyHmacArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            self.0.verify_hmac(args, orig).await
+        }
+        async fn create_signature(
+            &self,
+            args: CreateSignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            self.0.create_signature(args, orig).await
+        }
+        async fn verify_signature(
+            &self,
+            args: VerifySignatureArgs,
+            orig: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            self.0.verify_signature(args, orig).await
+        }
+        async fn acquire_certificate(
+            &self,
+            args: AcquireCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            self.0.acquire_certificate(args, orig).await
+        }
+        async fn list_certificates(
+            &self,
+            args: ListCertificatesArgs,
+            orig: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            self.0.list_certificates(args, orig).await
+        }
+        async fn prove_certificate(
+            &self,
+            args: ProveCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            self.0.prove_certificate(args, orig).await
+        }
+        async fn relinquish_certificate(
+            &self,
+            args: RelinquishCertificateArgs,
+            orig: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            self.0.relinquish_certificate(args, orig).await
+        }
+        async fn discover_by_identity_key(
+            &self,
+            args: DiscoverByIdentityKeyArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_identity_key(args, orig).await
+        }
+        async fn discover_by_attributes(
+            &self,
+            args: DiscoverByAttributesArgs,
+            orig: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            self.0.discover_by_attributes(args, orig).await
+        }
+        async fn is_authenticated(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.is_authenticated(orig).await
+        }
+        async fn wait_for_authentication(
+            &self,
+            orig: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            self.0.wait_for_authentication(orig).await
+        }
+        async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            self.0.get_height(orig).await
+        }
+        async fn get_header_for_height(
+            &self,
+            args: GetHeaderArgs,
+            orig: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            self.0.get_header_for_height(args, orig).await
+        }
+        async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            self.0.get_network(orig).await
+        }
+        async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            self.0.get_version(orig).await
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1112,11 +1308,17 @@ mod tests {
         };
         let json = serde_json::to_string(&req).unwrap();
         // Must be wrapped as {"message": {...}}
-        assert!(json.starts_with(r#"{"message":"#), "must have message wrapper");
+        assert!(
+            json.starts_with(r#"{"message":"#),
+            "must have message wrapper"
+        );
         assert!(json.contains("\"recipient\""), "camelCase recipient");
         assert!(json.contains("\"messageBox\""), "camelCase messageBox");
         assert!(json.contains("\"messageId\""), "camelCase messageId");
-        assert!(json.contains("\"payment_inbox\""), "messageBox value preserved");
+        assert!(
+            json.contains("\"payment_inbox\""),
+            "messageBox value preserved"
+        );
         assert!(!json.contains("message_box"), "no snake_case leakage");
         assert!(!json.contains("message_id"), "no snake_case leakage");
     }
@@ -1208,8 +1410,14 @@ mod tests {
         use super::WrappedMessageBody;
         let raw = r#"{"message": "hello world", "payment": {"tx": [1,2,3]}}"#;
         let wrapped: WrappedMessageBody = serde_json::from_str(raw).unwrap();
-        assert!(wrapped.message.is_some(), "message sub-field must be present");
-        assert!(wrapped.payment.is_some(), "payment sub-field must be present");
+        assert!(
+            wrapped.message.is_some(),
+            "message sub-field must be present"
+        );
+        assert!(
+            wrapped.payment.is_some(),
+            "payment sub-field must be present"
+        );
         // The message value is a JSON string
         let msg_val = wrapped.message.unwrap();
         assert_eq!(msg_val.as_str().unwrap(), "hello world");

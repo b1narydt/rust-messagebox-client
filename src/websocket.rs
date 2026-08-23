@@ -462,7 +462,11 @@ mod tests {
         let acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
         let key = "sendMessageAck-03abc-inbox".to_string();
         let (tx, _rx) = oneshot::channel::<bool>();
-        acks.lock().await.entry(key.clone()).or_default().push_back(tx);
+        acks.lock()
+            .await
+            .entry(key.clone())
+            .or_default()
+            .push_back(tx);
 
         {
             let mut g = acks.lock().await;
@@ -498,7 +502,10 @@ mod tests {
             }
         }
         assert!(rx_a.await.unwrap(), "room A resolved");
-        assert!(acks.lock().await.contains_key(&key_b), "room B still pending");
+        assert!(
+            acks.lock().await.contains_key(&key_b),
+            "room B still pending"
+        );
         drop(rx_b);
     }
 }

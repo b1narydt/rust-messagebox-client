@@ -78,9 +78,8 @@ use bsv::wallet::error::WalletError;
 use bsv::wallet::interfaces::*;
 use bsv::wallet::proto_wallet::ProtoWallet;
 use bsv_messagebox_client::{
-    MessageBoxClient, MessageBoxMultiQuote, PaymentToken,
-    PaymentCustomInstructions, SendListParams, SendListResult, SentRecipient, FailedRecipient,
-    SendListTotals, RecipientQuote,
+    FailedRecipient, MessageBoxClient, MessageBoxMultiQuote, PaymentCustomInstructions,
+    PaymentToken, RecipientQuote, SendListParams, SendListResult, SendListTotals, SentRecipient,
 };
 
 // ---------------------------------------------------------------------------
@@ -99,34 +98,188 @@ impl ArcWallet {
 
 #[async_trait::async_trait]
 impl WalletInterface for ArcWallet {
-    async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-    async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-    async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-    async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-    async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-    async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-    async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-    async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-    async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-    async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-    async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-    async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-    async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-    async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-    async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-    async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-    async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-    async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-    async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-    async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-    async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-    async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-    async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-    async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-    async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+    async fn create_action(
+        &self,
+        args: CreateActionArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateActionResult, WalletError> {
+        self.0.create_action(args, orig).await
+    }
+    async fn sign_action(
+        &self,
+        args: SignActionArgs,
+        orig: Option<&str>,
+    ) -> Result<SignActionResult, WalletError> {
+        self.0.sign_action(args, orig).await
+    }
+    async fn abort_action(
+        &self,
+        args: AbortActionArgs,
+        orig: Option<&str>,
+    ) -> Result<AbortActionResult, WalletError> {
+        self.0.abort_action(args, orig).await
+    }
+    async fn list_actions(
+        &self,
+        args: ListActionsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListActionsResult, WalletError> {
+        self.0.list_actions(args, orig).await
+    }
+    async fn internalize_action(
+        &self,
+        args: InternalizeActionArgs,
+        orig: Option<&str>,
+    ) -> Result<InternalizeActionResult, WalletError> {
+        self.0.internalize_action(args, orig).await
+    }
+    async fn list_outputs(
+        &self,
+        args: ListOutputsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListOutputsResult, WalletError> {
+        self.0.list_outputs(args, orig).await
+    }
+    async fn relinquish_output(
+        &self,
+        args: RelinquishOutputArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishOutputResult, WalletError> {
+        self.0.relinquish_output(args, orig).await
+    }
+    async fn get_public_key(
+        &self,
+        args: GetPublicKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<GetPublicKeyResult, WalletError> {
+        self.0.get_public_key(args, orig).await
+    }
+    async fn reveal_counterparty_key_linkage(
+        &self,
+        args: RevealCounterpartyKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+        self.0.reveal_counterparty_key_linkage(args, orig).await
+    }
+    async fn reveal_specific_key_linkage(
+        &self,
+        args: RevealSpecificKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+        self.0.reveal_specific_key_linkage(args, orig).await
+    }
+    async fn encrypt(
+        &self,
+        args: EncryptArgs,
+        orig: Option<&str>,
+    ) -> Result<EncryptResult, WalletError> {
+        self.0.encrypt(args, orig).await
+    }
+    async fn decrypt(
+        &self,
+        args: DecryptArgs,
+        orig: Option<&str>,
+    ) -> Result<DecryptResult, WalletError> {
+        self.0.decrypt(args, orig).await
+    }
+    async fn create_hmac(
+        &self,
+        args: CreateHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateHmacResult, WalletError> {
+        self.0.create_hmac(args, orig).await
+    }
+    async fn verify_hmac(
+        &self,
+        args: VerifyHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifyHmacResult, WalletError> {
+        self.0.verify_hmac(args, orig).await
+    }
+    async fn create_signature(
+        &self,
+        args: CreateSignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateSignatureResult, WalletError> {
+        self.0.create_signature(args, orig).await
+    }
+    async fn verify_signature(
+        &self,
+        args: VerifySignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifySignatureResult, WalletError> {
+        self.0.verify_signature(args, orig).await
+    }
+    async fn acquire_certificate(
+        &self,
+        args: AcquireCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<Certificate, WalletError> {
+        self.0.acquire_certificate(args, orig).await
+    }
+    async fn list_certificates(
+        &self,
+        args: ListCertificatesArgs,
+        orig: Option<&str>,
+    ) -> Result<ListCertificatesResult, WalletError> {
+        self.0.list_certificates(args, orig).await
+    }
+    async fn prove_certificate(
+        &self,
+        args: ProveCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<ProveCertificateResult, WalletError> {
+        self.0.prove_certificate(args, orig).await
+    }
+    async fn relinquish_certificate(
+        &self,
+        args: RelinquishCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishCertificateResult, WalletError> {
+        self.0.relinquish_certificate(args, orig).await
+    }
+    async fn discover_by_identity_key(
+        &self,
+        args: DiscoverByIdentityKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_identity_key(args, orig).await
+    }
+    async fn discover_by_attributes(
+        &self,
+        args: DiscoverByAttributesArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_attributes(args, orig).await
+    }
+    async fn is_authenticated(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.is_authenticated(orig).await
+    }
+    async fn wait_for_authentication(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.wait_for_authentication(orig).await
+    }
+    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+        self.0.get_height(orig).await
+    }
+    async fn get_header_for_height(
+        &self,
+        args: GetHeaderArgs,
+        orig: Option<&str>,
+    ) -> Result<GetHeaderResult, WalletError> {
+        self.0.get_header_for_height(args, orig).await
+    }
+    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+        self.0.get_network(orig).await
+    }
+    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+        self.0.get_version(orig).await
+    }
 }
 
 fn make_client() -> (MessageBoxClient<ArcWallet>, ArcWallet) {
@@ -171,8 +324,14 @@ async fn parity_01_all_public_methods_exist() {
 
     // -- Async identity getter --
     let identity_key = client.get_identity_key().await.expect("get_identity_key");
-    assert!(!identity_key.is_empty(), "get_identity_key() must return non-empty key");
-    assert!(identity_key.chars().all(|c| c.is_ascii_hexdigit()), "key must be hex");
+    assert!(
+        !identity_key.is_empty(),
+        "get_identity_key() must return non-empty key"
+    );
+    assert!(
+        identity_key.chars().all(|c| c.is_ascii_hexdigit()),
+        "key must be hex"
+    );
 
     // -- Initialization methods (compile-check via size_of_val) --
     // init(target_host: Option<&str>) -> Result<(), MessageBoxError>
@@ -236,8 +395,7 @@ async fn parity_01_all_public_methods_exist() {
     // send_notification(to, mb, body, override_host)
     let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::send_notification);
     // send_notification_to_recipients(recipients, mb, body, override_host)
-    let _ =
-        std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::send_notification_to_recipients);
+    let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::send_notification_to_recipients);
 
     // -- Overlay / Device Registration --
     // query_advertisements(identity_key, host)
@@ -295,10 +453,10 @@ async fn parity_01_all_public_methods_exist() {
 /// 4. try_decrypt_message handles the real encrypted output correctly
 #[tokio::test]
 async fn parity_02_encryption_round_trip() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
     use bsv::primitives::private_key::PrivateKey;
     use bsv::wallet::interfaces::GetPublicKeyArgs;
     use bsv::wallet::proto_wallet::ProtoWallet;
-    use base64::{engine::general_purpose::STANDARD, Engine};
 
     let sender_key = PrivateKey::from_random().expect("random sender key");
     let recipient_key = PrivateKey::from_random().expect("random recipient key");
@@ -309,23 +467,24 @@ async fn parity_02_encryption_round_trip() {
     // Obtain identity keys (DER hex) for each wallet.
     // Using a standalone async function avoids closure lifetime issues.
     async fn wallet_identity_hex(wallet: &ProtoWallet) -> String {
-        wallet.get_public_key(
-            GetPublicKeyArgs {
-                identity_key: true,
-                protocol_id: None,
-                key_id: None,
-                counterparty: None,
-                privileged: false,
-                privileged_reason: None,
-                for_self: None,
-                seek_permission: None,
-            },
-            None,
-        )
-        .await
-        .expect("get_public_key")
-        .public_key
-        .to_der_hex()
+        wallet
+            .get_public_key(
+                GetPublicKeyArgs {
+                    identity_key: true,
+                    protocol_id: None,
+                    key_id: None,
+                    counterparty: None,
+                    privileged: false,
+                    privileged_reason: None,
+                    for_self: None,
+                    seek_permission: None,
+                },
+                None,
+            )
+            .await
+            .expect("get_public_key")
+            .public_key
+            .to_der_hex()
     }
 
     let sender_pk = wallet_identity_hex(&sender_wallet).await;
@@ -344,8 +503,8 @@ async fn parity_02_encryption_round_trip() {
     .expect("encrypt_body must succeed");
 
     // Verify wire format: must be JSON with "encryptedMessage" field
-    let v: serde_json::Value = serde_json::from_str(&encrypted_json)
-        .expect("encrypted output must be valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(&encrypted_json).expect("encrypted output must be valid JSON");
     let b64 = v
         .get("encryptedMessage")
         .and_then(|f| f.as_str())
@@ -371,7 +530,10 @@ async fn parity_02_encryption_round_trip() {
     .await
     .expect("decrypt_body must succeed");
 
-    assert_eq!(decrypted, plaintext, "decrypt must recover original plaintext exactly");
+    assert_eq!(
+        decrypted, plaintext,
+        "decrypt must recover original plaintext exactly"
+    );
 
     // Verify try_decrypt_message also handles the encrypted format correctly
     let try_decrypted = bsv_messagebox_client::encryption::try_decrypt_message(
@@ -394,7 +556,10 @@ async fn parity_02_encryption_round_trip() {
         None,
     )
     .await;
-    assert_eq!(passthrough, "plain text body", "plaintext must pass through unchanged");
+    assert_eq!(
+        passthrough, "plain text body",
+        "plaintext must pass through unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -429,31 +594,65 @@ fn parity_03_payment_token_json_shape() {
     let json = serde_json::to_value(&token).expect("PaymentToken must serialize to JSON");
 
     // Verify top-level camelCase fields
-    assert!(json.get("customInstructions").is_some(), "must have customInstructions (camelCase)");
+    assert!(
+        json.get("customInstructions").is_some(),
+        "must have customInstructions (camelCase)"
+    );
     assert!(json.get("transaction").is_some(), "must have transaction");
     assert!(json.get("amount").is_some(), "must have amount");
-    assert!(json.get("outputIndex").is_some(), "must have outputIndex when Some");
+    assert!(
+        json.get("outputIndex").is_some(),
+        "must have outputIndex when Some"
+    );
 
     // Verify no snake_case leakage
-    assert!(json.get("custom_instructions").is_none(), "no snake_case: custom_instructions");
-    assert!(json.get("output_index").is_none(), "no snake_case: output_index");
+    assert!(
+        json.get("custom_instructions").is_none(),
+        "no snake_case: custom_instructions"
+    );
+    assert!(
+        json.get("output_index").is_none(),
+        "no snake_case: output_index"
+    );
 
     // Verify nested customInstructions fields
     let ci = json.get("customInstructions").unwrap();
-    assert!(ci.get("derivationPrefix").is_some(), "must have derivationPrefix (camelCase)");
-    assert!(ci.get("derivationSuffix").is_some(), "must have derivationSuffix (camelCase)");
+    assert!(
+        ci.get("derivationPrefix").is_some(),
+        "must have derivationPrefix (camelCase)"
+    );
+    assert!(
+        ci.get("derivationSuffix").is_some(),
+        "must have derivationSuffix (camelCase)"
+    );
     assert!(ci.get("payee").is_some(), "must have payee when Some");
-    assert!(ci.get("derivation_prefix").is_none(), "no snake_case: derivation_prefix");
-    assert!(ci.get("derivation_suffix").is_none(), "no snake_case: derivation_suffix");
+    assert!(
+        ci.get("derivation_prefix").is_none(),
+        "no snake_case: derivation_prefix"
+    );
+    assert!(
+        ci.get("derivation_suffix").is_none(),
+        "no snake_case: derivation_suffix"
+    );
 
     // Verify values
-    assert_eq!(ci.get("derivationPrefix").unwrap().as_str(), Some("test-prefix-abc"));
-    assert_eq!(ci.get("derivationSuffix").unwrap().as_str(), Some("test-suffix-xyz"));
+    assert_eq!(
+        ci.get("derivationPrefix").unwrap().as_str(),
+        Some("test-prefix-abc")
+    );
+    assert_eq!(
+        ci.get("derivationSuffix").unwrap().as_str(),
+        Some("test-suffix-xyz")
+    );
     assert_eq!(json.get("amount").unwrap().as_u64(), Some(2500));
     assert_eq!(json.get("outputIndex").unwrap().as_u64(), Some(1));
 
     // Verify transaction serializes as number array (not base64 string)
-    let tx_arr = json.get("transaction").unwrap().as_array().expect("transaction must be array");
+    let tx_arr = json
+        .get("transaction")
+        .unwrap()
+        .as_array()
+        .expect("transaction must be array");
     assert_eq!(tx_arr.len(), 5, "transaction array must have all bytes");
     assert_eq!(tx_arr[0].as_u64(), Some(0xde));
     assert_eq!(tx_arr[3].as_u64(), Some(0xef));
@@ -471,9 +670,16 @@ fn parity_03_payment_token_json_shape() {
     };
 
     let json_none = serde_json::to_value(&token_none).expect("must serialize");
-    assert!(json_none.get("outputIndex").is_none(), "outputIndex must be absent when None");
     assert!(
-        json_none.get("customInstructions").unwrap().get("payee").is_none(),
+        json_none.get("outputIndex").is_none(),
+        "outputIndex must be absent when None"
+    );
+    assert!(
+        json_none
+            .get("customInstructions")
+            .unwrap()
+            .get("payee")
+            .is_none(),
         "payee must be absent when None"
     );
 
@@ -481,16 +687,20 @@ fn parity_03_payment_token_json_shape() {
     let json_str = serde_json::to_string(&token).expect("serialize");
     let restored: PaymentToken = serde_json::from_str(&json_str).expect("deserialize");
     assert_eq!(restored.amount, token.amount, "amount survives round-trip");
-    assert_eq!(restored.transaction, token.transaction, "transaction survives round-trip");
-    assert_eq!(restored.output_index, token.output_index, "output_index survives round-trip");
     assert_eq!(
-        restored.custom_instructions.derivation_prefix,
-        token.custom_instructions.derivation_prefix,
+        restored.transaction, token.transaction,
+        "transaction survives round-trip"
+    );
+    assert_eq!(
+        restored.output_index, token.output_index,
+        "output_index survives round-trip"
+    );
+    assert_eq!(
+        restored.custom_instructions.derivation_prefix, token.custom_instructions.derivation_prefix,
         "derivation_prefix survives round-trip"
     );
     assert_eq!(
-        restored.custom_instructions.payee,
-        token.custom_instructions.payee,
+        restored.custom_instructions.payee, token.custom_instructions.payee,
         "payee survives round-trip"
     );
 }
@@ -520,17 +730,30 @@ async fn parity_04_smoke_all_methods_callable() {
     );
 
     // Synchronous getters — all callable without panic
-    assert_eq!(client.host(), "https://test.example.com", "host() returns trimmed URL");
-    assert!(client.originator().is_none(), "originator() is None when not set");
+    assert_eq!(
+        client.host(),
+        "https://test.example.com",
+        "host() returns trimmed URL"
+    );
+    assert!(
+        client.originator().is_none(),
+        "originator() is None when not set"
+    );
 
     // get_identity_key — async but doesn't need a server
-    let identity_key = client.get_identity_key().await.expect("get_identity_key must succeed");
+    let identity_key = client
+        .get_identity_key()
+        .await
+        .expect("get_identity_key must succeed");
     assert!(!identity_key.is_empty(), "identity_key must be non-empty");
     assert_eq!(identity_key.len(), 66, "compressed pubkey is 66 hex chars");
 
     // get_identity_key is cached — second call must return same value
     let identity_key2 = client.get_identity_key().await.expect("second call");
-    assert_eq!(identity_key, identity_key2, "get_identity_key must be deterministic (cached)");
+    assert_eq!(
+        identity_key, identity_key2,
+        "get_identity_key must be deterministic (cached)"
+    );
 
     // get_joined_rooms() uses blocking_lock — must be called from sync context only.
     // The runtime behavior is verified in parity_04_get_joined_rooms_empty below.
@@ -540,12 +763,13 @@ async fn parity_04_smoke_all_methods_callable() {
 
     // -- new_mainnet() convenience constructor --
     let wallet2 = ArcWallet::new();
-    let client2 = MessageBoxClient::new_mainnet(
-        "https://mainnet.example.com".into(),
-        wallet2,
-        None,
+    let client2 =
+        MessageBoxClient::new_mainnet("https://mainnet.example.com".into(), wallet2, None);
+    assert_eq!(
+        client2.host(),
+        "https://mainnet.example.com",
+        "new_mainnet() sets host correctly"
     );
-    assert_eq!(client2.host(), "https://mainnet.example.com", "new_mainnet() sets host correctly");
 
     // -- Host trimming: new() trims whitespace --
     let wallet3 = ArcWallet::new();
@@ -555,7 +779,11 @@ async fn parity_04_smoke_all_methods_callable() {
         None,
         Network::Mainnet,
     );
-    assert_eq!(client3.host(), "https://trimmed.example.com", "host must be trimmed");
+    assert_eq!(
+        client3.host(),
+        "https://trimmed.example.com",
+        "host must be trimmed"
+    );
 
     // -- originator passthrough --
     let wallet4 = ArcWallet::new();
@@ -565,10 +793,17 @@ async fn parity_04_smoke_all_methods_callable() {
         Some("my-app".to_string()),
         Network::Mainnet,
     );
-    assert_eq!(client4.originator(), Some("my-app"), "originator must be passed through");
+    assert_eq!(
+        client4.originator(),
+        Some("my-app"),
+        "originator must be passed through"
+    );
 
     // -- disconnect_web_socket on fresh client is a no-op (not a panic) --
-    client.disconnect_web_socket().await.expect("disconnect on fresh client must not error");
+    client
+        .disconnect_web_socket()
+        .await
+        .expect("disconnect on fresh client must not error");
 }
 
 /// PARITY-04b: get_joined_rooms returns empty HashSet from synchronous context.
@@ -585,7 +820,10 @@ fn parity_04_get_joined_rooms_empty() {
         Network::Mainnet,
     );
     let rooms = client.get_joined_rooms();
-    assert!(rooms.is_empty(), "get_joined_rooms() must return empty HashSet before any joins");
+    assert!(
+        rooms.is_empty(),
+        "get_joined_rooms() must return empty HashSet before any joins"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -604,8 +842,8 @@ fn parity_04_get_joined_rooms_empty() {
 #[test]
 fn parity_05_wire_format_json() {
     use bsv_messagebox_client::{
-        AcknowledgeMessageParams, MessageBoxPermission, RegisterDeviceRequest,
-        SendMessageParams, ServerPeerMessage,
+        AcknowledgeMessageParams, MessageBoxPermission, RegisterDeviceRequest, SendMessageParams,
+        ServerPeerMessage,
     };
     use std::collections::HashMap;
 
@@ -617,22 +855,50 @@ fn parity_05_wire_format_json() {
         message_id: "id1".to_string(),
     };
     let json = serde_json::to_value(&params).unwrap();
-    assert!(json.get("messageBox").is_some(), "SendMessageParams: must use camelCase messageBox");
-    assert!(json.get("messageId").is_some(), "SendMessageParams: must use camelCase messageId");
-    assert!(json.get("recipient").is_some(), "SendMessageParams: recipient present");
-    assert!(json.get("body").is_some(), "SendMessageParams: body present");
-    assert!(json.get("message_box").is_none(), "SendMessageParams: no snake_case message_box");
-    assert!(json.get("message_id").is_none(), "SendMessageParams: no snake_case message_id");
+    assert!(
+        json.get("messageBox").is_some(),
+        "SendMessageParams: must use camelCase messageBox"
+    );
+    assert!(
+        json.get("messageId").is_some(),
+        "SendMessageParams: must use camelCase messageId"
+    );
+    assert!(
+        json.get("recipient").is_some(),
+        "SendMessageParams: recipient present"
+    );
+    assert!(
+        json.get("body").is_some(),
+        "SendMessageParams: body present"
+    );
+    assert!(
+        json.get("message_box").is_none(),
+        "SendMessageParams: no snake_case message_box"
+    );
+    assert!(
+        json.get("message_id").is_none(),
+        "SendMessageParams: no snake_case message_id"
+    );
 
     // --- AcknowledgeMessageParams ---
     let ack = AcknowledgeMessageParams {
         message_ids: vec!["msg-a".to_string(), "msg-b".to_string()],
     };
     let json = serde_json::to_value(&ack).unwrap();
-    assert!(json.get("messageIds").is_some(), "AcknowledgeMessageParams: camelCase messageIds");
-    assert!(json.get("message_ids").is_none(), "AcknowledgeMessageParams: no snake_case");
+    assert!(
+        json.get("messageIds").is_some(),
+        "AcknowledgeMessageParams: camelCase messageIds"
+    );
+    assert!(
+        json.get("message_ids").is_none(),
+        "AcknowledgeMessageParams: no snake_case"
+    );
     let ids_arr = json.get("messageIds").unwrap().as_array().unwrap();
-    assert_eq!(ids_arr.len(), 2, "AcknowledgeMessageParams: both IDs preserved");
+    assert_eq!(
+        ids_arr.len(),
+        2,
+        "AcknowledgeMessageParams: both IDs preserved"
+    );
 
     // --- SendListParams ---
     let slp = SendListParams {
@@ -642,10 +908,22 @@ fn parity_05_wire_format_json() {
         skip_encryption: None,
     };
     let json = serde_json::to_value(&slp).unwrap();
-    assert!(json.get("messageBox").is_some(), "SendListParams: camelCase messageBox");
-    assert!(json.get("recipients").is_some(), "SendListParams: recipients present");
-    assert!(json.get("skipEncryption").is_none(), "SendListParams: None must be omitted");
-    assert!(json.get("message_box").is_none(), "SendListParams: no snake_case message_box");
+    assert!(
+        json.get("messageBox").is_some(),
+        "SendListParams: camelCase messageBox"
+    );
+    assert!(
+        json.get("recipients").is_some(),
+        "SendListParams: recipients present"
+    );
+    assert!(
+        json.get("skipEncryption").is_none(),
+        "SendListParams: None must be omitted"
+    );
+    assert!(
+        json.get("message_box").is_none(),
+        "SendListParams: no snake_case message_box"
+    );
 
     let slp_with_enc = SendListParams {
         recipients: vec!["03abc".to_string()],
@@ -654,7 +932,10 @@ fn parity_05_wire_format_json() {
         skip_encryption: Some(true),
     };
     let json = serde_json::to_value(&slp_with_enc).unwrap();
-    assert!(json.get("skipEncryption").is_some(), "SendListParams: skipEncryption present when Some");
+    assert!(
+        json.get("skipEncryption").is_some(),
+        "SendListParams: skipEncryption present when Some"
+    );
     assert_eq!(json.get("skipEncryption").unwrap().as_bool(), Some(true));
 
     // --- SendListResult ---
@@ -673,16 +954,37 @@ fn parity_05_wire_format_json() {
         totals: None,
     };
     let json = serde_json::to_value(&slr).unwrap();
-    assert!(json.get("status").is_some(), "SendListResult: status present");
-    assert!(json.get("description").is_some(), "SendListResult: description present");
+    assert!(
+        json.get("status").is_some(),
+        "SendListResult: status present"
+    );
+    assert!(
+        json.get("description").is_some(),
+        "SendListResult: description present"
+    );
     assert!(json.get("sent").is_some(), "SendListResult: sent present");
-    assert!(json.get("blocked").is_some(), "SendListResult: blocked present");
-    assert!(json.get("failed").is_some(), "SendListResult: failed present");
-    assert!(json.get("totals").is_none(), "SendListResult: totals absent when None");
+    assert!(
+        json.get("blocked").is_some(),
+        "SendListResult: blocked present"
+    );
+    assert!(
+        json.get("failed").is_some(),
+        "SendListResult: failed present"
+    );
+    assert!(
+        json.get("totals").is_none(),
+        "SendListResult: totals absent when None"
+    );
     // SentRecipient camelCase
     let first_sent = &json.get("sent").unwrap().as_array().unwrap()[0];
-    assert!(first_sent.get("messageId").is_some(), "SentRecipient: camelCase messageId");
-    assert!(first_sent.get("message_id").is_none(), "SentRecipient: no snake_case");
+    assert!(
+        first_sent.get("messageId").is_some(),
+        "SentRecipient: camelCase messageId"
+    );
+    assert!(
+        first_sent.get("message_id").is_none(),
+        "SentRecipient: no snake_case"
+    );
 
     // SendListTotals when present
     let slr_with_totals = SendListResult {
@@ -699,13 +1001,22 @@ fn parity_05_wire_format_json() {
     };
     let json = serde_json::to_value(&slr_with_totals).unwrap();
     let totals = json.get("totals").unwrap();
-    assert!(totals.get("deliveryFees").is_some(), "SendListTotals: camelCase deliveryFees");
-    assert!(totals.get("recipientFees").is_some(), "SendListTotals: camelCase recipientFees");
+    assert!(
+        totals.get("deliveryFees").is_some(),
+        "SendListTotals: camelCase deliveryFees"
+    );
+    assert!(
+        totals.get("recipientFees").is_some(),
+        "SendListTotals: camelCase recipientFees"
+    );
     assert!(
         totals.get("totalForPayableRecipients").is_some(),
         "SendListTotals: camelCase totalForPayableRecipients"
     );
-    assert!(totals.get("delivery_fees").is_none(), "SendListTotals: no snake_case");
+    assert!(
+        totals.get("delivery_fees").is_none(),
+        "SendListTotals: no snake_case"
+    );
 
     // --- MessageBoxMultiQuote ---
     let mq = MessageBoxMultiQuote {
@@ -720,24 +1031,48 @@ fn parity_05_wire_format_json() {
         blocked_recipients: vec!["03xyz".to_string()],
         delivery_agent_identity_key_by_host: {
             let mut m = HashMap::new();
-            m.insert("https://host.example.com".to_string(), "03agent".to_string());
+            m.insert(
+                "https://host.example.com".to_string(),
+                "03agent".to_string(),
+            );
             m
         },
     };
     let json = serde_json::to_value(&mq).unwrap();
-    assert!(json.get("quotesByRecipient").is_some(), "MessageBoxMultiQuote: camelCase quotesByRecipient");
-    assert!(json.get("blockedRecipients").is_some(), "MessageBoxMultiQuote: camelCase blockedRecipients");
+    assert!(
+        json.get("quotesByRecipient").is_some(),
+        "MessageBoxMultiQuote: camelCase quotesByRecipient"
+    );
+    assert!(
+        json.get("blockedRecipients").is_some(),
+        "MessageBoxMultiQuote: camelCase blockedRecipients"
+    );
     assert!(
         json.get("deliveryAgentIdentityKeyByHost").is_some(),
         "MessageBoxMultiQuote: camelCase deliveryAgentIdentityKeyByHost"
     );
-    assert!(json.get("totals").is_none(), "MessageBoxMultiQuote: totals absent when None");
-    assert!(json.get("quotes_by_recipient").is_none(), "MessageBoxMultiQuote: no snake_case");
+    assert!(
+        json.get("totals").is_none(),
+        "MessageBoxMultiQuote: totals absent when None"
+    );
+    assert!(
+        json.get("quotes_by_recipient").is_none(),
+        "MessageBoxMultiQuote: no snake_case"
+    );
     // RecipientQuote camelCase
     let rq = &json.get("quotesByRecipient").unwrap().as_array().unwrap()[0];
-    assert!(rq.get("messageBox").is_some(), "RecipientQuote: camelCase messageBox");
-    assert!(rq.get("deliveryFee").is_some(), "RecipientQuote: camelCase deliveryFee");
-    assert!(rq.get("recipientFee").is_some(), "RecipientQuote: camelCase recipientFee");
+    assert!(
+        rq.get("messageBox").is_some(),
+        "RecipientQuote: camelCase messageBox"
+    );
+    assert!(
+        rq.get("deliveryFee").is_some(),
+        "RecipientQuote: camelCase deliveryFee"
+    );
+    assert!(
+        rq.get("recipientFee").is_some(),
+        "RecipientQuote: camelCase recipientFee"
+    );
 
     // --- MessageBoxPermission ---
     let perm = MessageBoxPermission {
@@ -748,9 +1083,18 @@ fn parity_05_wire_format_json() {
         updated_at: "2024-01-02T00:00:00Z".to_string(),
     };
     let json = serde_json::to_value(&perm).unwrap();
-    assert!(json.get("sender").is_some(), "MessageBoxPermission: sender present");
-    assert!(json.get("message_box").is_some(), "MessageBoxPermission: message_box (snake_case — dual-format struct)");
-    assert!(json.get("recipient_fee").is_some(), "MessageBoxPermission: recipient_fee (snake_case — dual-format struct)");
+    assert!(
+        json.get("sender").is_some(),
+        "MessageBoxPermission: sender present"
+    );
+    assert!(
+        json.get("message_box").is_some(),
+        "MessageBoxPermission: message_box (snake_case — dual-format struct)"
+    );
+    assert!(
+        json.get("recipient_fee").is_some(),
+        "MessageBoxPermission: recipient_fee (snake_case — dual-format struct)"
+    );
     // Note: MessageBoxPermission uses per-field serde(alias) not rename_all,
     // so it serializes in snake_case but deserializes from both snake_case and camelCase.
     // This matches the server's dual-format behavior (Pitfall 1 from research).
@@ -776,11 +1120,26 @@ fn parity_05_wire_format_json() {
         platform: Some("ios".to_string()),
     };
     let json = serde_json::to_value(&req).unwrap();
-    assert!(json.get("fcmToken").is_some(), "RegisterDeviceRequest: camelCase fcmToken");
-    assert!(json.get("deviceId").is_some(), "RegisterDeviceRequest: camelCase deviceId");
-    assert!(json.get("platform").is_some(), "RegisterDeviceRequest: platform present");
-    assert!(json.get("fcm_token").is_none(), "RegisterDeviceRequest: no snake_case fcm_token");
-    assert!(json.get("device_id").is_none(), "RegisterDeviceRequest: no snake_case device_id");
+    assert!(
+        json.get("fcmToken").is_some(),
+        "RegisterDeviceRequest: camelCase fcmToken"
+    );
+    assert!(
+        json.get("deviceId").is_some(),
+        "RegisterDeviceRequest: camelCase deviceId"
+    );
+    assert!(
+        json.get("platform").is_some(),
+        "RegisterDeviceRequest: platform present"
+    );
+    assert!(
+        json.get("fcm_token").is_none(),
+        "RegisterDeviceRequest: no snake_case fcm_token"
+    );
+    assert!(
+        json.get("device_id").is_none(),
+        "RegisterDeviceRequest: no snake_case device_id"
+    );
 
     let req_minimal = RegisterDeviceRequest {
         fcm_token: "tok456".to_string(),
@@ -788,8 +1147,14 @@ fn parity_05_wire_format_json() {
         platform: None,
     };
     let json = serde_json::to_value(&req_minimal).unwrap();
-    assert!(json.get("deviceId").is_none(), "RegisterDeviceRequest: deviceId absent when None");
-    assert!(json.get("platform").is_none(), "RegisterDeviceRequest: platform absent when None");
+    assert!(
+        json.get("deviceId").is_none(),
+        "RegisterDeviceRequest: deviceId absent when None"
+    );
+    assert!(
+        json.get("platform").is_none(),
+        "RegisterDeviceRequest: platform absent when None"
+    );
 
     // --- ServerPeerMessage deserialization (server response type) ---
     let raw = r#"{
@@ -799,11 +1164,14 @@ fn parity_05_wire_format_json() {
         "created_at": "2024-01-01T00:00:00Z",
         "updated_at": "2024-01-01T00:00:00Z"
     }"#;
-    let msg: ServerPeerMessage = serde_json::from_str(raw)
-        .expect("ServerPeerMessage must deserialize from server format");
+    let msg: ServerPeerMessage =
+        serde_json::from_str(raw).expect("ServerPeerMessage must deserialize from server format");
     assert_eq!(msg.message_id, "abc123", "messageId deserialized correctly");
     assert_eq!(msg.sender, "03xyz", "sender deserialized correctly");
-    assert!(msg.acknowledged.is_none(), "acknowledged is None when absent");
+    assert!(
+        msg.acknowledged.is_none(),
+        "acknowledged is None when absent"
+    );
 
     // Verify unknown fields are tolerated (server may add fields)
     let raw_with_extra = r#"{

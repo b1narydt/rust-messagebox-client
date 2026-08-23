@@ -44,8 +44,9 @@ async fn reconnect_ws<W>(
 where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
-    let ws = crate::websocket::MessageBoxWebSocket::connect(ws_url, identity_key, wallet, originator)
-        .await?;
+    let ws =
+        crate::websocket::MessageBoxWebSocket::connect(ws_url, identity_key, wallet, originator)
+            .await?;
 
     // Replay subscriptions on the fresh socket so the general_msg_dispatcher
     // has callbacks registered for every active room. Without this, events
@@ -515,7 +516,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             let jitter = rand::random::<f64>() * 0.5 - 0.25; // [-0.25, +0.25)
                             let millis = backoff.as_millis() as f64 * (1.0 + jitter);
                             tokio::time::sleep(std::time::Duration::from_millis(
-                                millis.max(1.0) as u64,
+                                millis.max(1.0) as u64
                             ))
                             .await;
                             backoff = (backoff * 2).min(RECONNECT_MAX_BACKOFF);
@@ -614,7 +615,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         // Register in the subscription registry so ensure_ws_connected can replay
         // this subscription (with its dedup + activity wrappers) on any reconnect.
-        self.subscriptions.lock().await.insert(room_id.clone(), ws_callback.clone());
+        self.subscriptions
+            .lock()
+            .await
+            .insert(room_id.clone(), ws_callback.clone());
 
         self.joined_rooms.lock().await.insert(room_id.clone());
 
@@ -761,7 +765,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 drop(guard);
                 // Stale connection — tear down and reconnect
                 if let Err(e) = self.disconnect_web_socket().await {
-                    eprintln!("Warning: stale WebSocket disconnect failed (proceeding to reconnect): {e}");
+                    eprintln!(
+                        "Warning: stale WebSocket disconnect failed (proceeding to reconnect): {e}"
+                    );
                 }
             }
         }
@@ -958,7 +964,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                         .await?
                     }
                 };
-                Ok(DeliveryMode::Persisted { message_id: http_id })
+                Ok(DeliveryMode::Persisted {
+                    message_id: http_id,
+                })
             }
         }
     }
@@ -1140,8 +1148,11 @@ impl BoundedIdSet {
         }
         self.set.insert(id.clone());
         self.order.push_back(id);
-        debug_assert_eq!(self.set.len(), self.order.len(),
-            "BoundedIdSet internal invariant violated: set/deque size mismatch");
+        debug_assert_eq!(
+            self.set.len(),
+            self.order.len(),
+            "BoundedIdSet internal invariant violated: set/deque size mismatch"
+        );
         true
     }
 
@@ -1621,7 +1632,10 @@ mod tests {
             body: "hello".to_string(),
             authenticated_decrypt: true,
         });
-        assert!(fired.load(Ordering::SeqCst), "callback must have been invoked");
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "callback must have been invoked"
+        );
     }
 
     /// Subscription registry entry is removed when leave_room is called — compile check.
@@ -1643,7 +1657,11 @@ mod tests {
         // Insert a dummy callback
         let cb: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
             Arc::new(|_| {});
-        client.subscriptions.lock().await.insert(room_id.clone(), cb);
+        client
+            .subscriptions
+            .lock()
+            .await
+            .insert(room_id.clone(), cb);
         assert_eq!(client.subscriptions.lock().await.len(), 1, "inserted");
 
         // Remove it directly (simulates what leave_room does)
@@ -1675,23 +1693,43 @@ mod tests {
         use super::is_duplicate_message_rejection;
         // The exact body the relay returns (HTTP 400) for a duplicate messageId.
         let dup = br#"{"status":"error","code":"ERR_DUPLICATE_MESSAGE","description":"Duplicate message."}"#;
-        assert!(is_duplicate_message_rejection(dup), "must match ERR_DUPLICATE_MESSAGE");
+        assert!(
+            is_duplicate_message_rejection(dup),
+            "must match ERR_DUPLICATE_MESSAGE"
+        );
     }
 
     /// Genuine validation / auth errors must NOT be treated as duplicates.
     #[test]
     fn is_duplicate_message_rejection_rejects_other_errors() {
         use super::is_duplicate_message_rejection;
-        let invalid = br#"{"status":"error","code":"ERR_INVALID_RECIPIENT_KEY","description":"bad key"}"#;
-        let missing = br#"{"status":"error","code":"ERR_MESSAGE_REQUIRED","description":"no body"}"#;
+        let invalid =
+            br#"{"status":"error","code":"ERR_INVALID_RECIPIENT_KEY","description":"bad key"}"#;
+        let missing =
+            br#"{"status":"error","code":"ERR_MESSAGE_REQUIRED","description":"no body"}"#;
         // An error body with no `code` field (e.g. a raw BRC-31 auth failure).
         let no_code = br#"{"status":"error","description":"permission denied"}"#;
         let success = br#"{"status":"success","messageId":"abc"}"#;
-        assert!(!is_duplicate_message_rejection(invalid), "ERR_INVALID_RECIPIENT_KEY is not a duplicate");
-        assert!(!is_duplicate_message_rejection(missing), "ERR_MESSAGE_REQUIRED is not a duplicate");
-        assert!(!is_duplicate_message_rejection(no_code), "no-code error is not a duplicate");
-        assert!(!is_duplicate_message_rejection(success), "success is not a duplicate");
-        assert!(!is_duplicate_message_rejection(b"not json"), "malformed body is not a duplicate");
+        assert!(
+            !is_duplicate_message_rejection(invalid),
+            "ERR_INVALID_RECIPIENT_KEY is not a duplicate"
+        );
+        assert!(
+            !is_duplicate_message_rejection(missing),
+            "ERR_MESSAGE_REQUIRED is not a duplicate"
+        );
+        assert!(
+            !is_duplicate_message_rejection(no_code),
+            "no-code error is not a duplicate"
+        );
+        assert!(
+            !is_duplicate_message_rejection(success),
+            "success is not a duplicate"
+        );
+        assert!(
+            !is_duplicate_message_rejection(b"not json"),
+            "malformed body is not a duplicate"
+        );
     }
 
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).
@@ -1817,8 +1855,16 @@ mod tests {
         wrapped(peer_msg("m1"));
         wrapped(peer_msg("m2"));
 
-        assert_eq!(activity.load(Ordering::Relaxed), 2, "counter bumped per delivery");
-        assert_eq!(count.load(Ordering::SeqCst), 2, "inner callback forwarded each time");
+        assert_eq!(
+            activity.load(Ordering::Relaxed),
+            2,
+            "counter bumped per delivery"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "inner callback forwarded each time"
+        );
     }
 
     #[test]
@@ -1855,7 +1901,10 @@ mod tests {
         }
         // Over 3*MAX_POLL_SKIPS always-active intervals, the forced poll fires
         // roughly every (MAX_POLL_SKIPS+1) intervals — at least twice.
-        assert!(runs >= 2, "forced catch-up must fire periodically, got {runs}");
+        assert!(
+            runs >= 2,
+            "forced catch-up must fire periodically, got {runs}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1909,7 +1958,15 @@ mod tests {
         ws_path(peer_msg("m1")); // delivered via WS, stamps activity
         poll_path(peer_msg("m1")); // poll re-sees the same id → suppressed
 
-        assert_eq!(count.load(Ordering::SeqCst), 1, "delivered exactly once across paths");
-        assert_eq!(activity.load(Ordering::Relaxed), 1, "only the WS path stamps activity");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "delivered exactly once across paths"
+        );
+        assert_eq!(
+            activity.load(Ordering::Relaxed),
+            1,
+            "only the WS path stamps activity"
+        );
     }
 }

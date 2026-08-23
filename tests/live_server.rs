@@ -35,34 +35,188 @@ impl ArcWallet {
 
 #[async_trait::async_trait]
 impl WalletInterface for ArcWallet {
-    async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-    async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-    async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-    async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-    async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-    async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-    async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-    async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-    async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-    async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-    async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-    async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-    async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-    async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-    async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-    async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-    async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-    async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-    async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-    async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-    async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-    async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-    async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-    async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-    async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+    async fn create_action(
+        &self,
+        args: CreateActionArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateActionResult, WalletError> {
+        self.0.create_action(args, orig).await
+    }
+    async fn sign_action(
+        &self,
+        args: SignActionArgs,
+        orig: Option<&str>,
+    ) -> Result<SignActionResult, WalletError> {
+        self.0.sign_action(args, orig).await
+    }
+    async fn abort_action(
+        &self,
+        args: AbortActionArgs,
+        orig: Option<&str>,
+    ) -> Result<AbortActionResult, WalletError> {
+        self.0.abort_action(args, orig).await
+    }
+    async fn list_actions(
+        &self,
+        args: ListActionsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListActionsResult, WalletError> {
+        self.0.list_actions(args, orig).await
+    }
+    async fn internalize_action(
+        &self,
+        args: InternalizeActionArgs,
+        orig: Option<&str>,
+    ) -> Result<InternalizeActionResult, WalletError> {
+        self.0.internalize_action(args, orig).await
+    }
+    async fn list_outputs(
+        &self,
+        args: ListOutputsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListOutputsResult, WalletError> {
+        self.0.list_outputs(args, orig).await
+    }
+    async fn relinquish_output(
+        &self,
+        args: RelinquishOutputArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishOutputResult, WalletError> {
+        self.0.relinquish_output(args, orig).await
+    }
+    async fn get_public_key(
+        &self,
+        args: GetPublicKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<GetPublicKeyResult, WalletError> {
+        self.0.get_public_key(args, orig).await
+    }
+    async fn reveal_counterparty_key_linkage(
+        &self,
+        args: RevealCounterpartyKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+        self.0.reveal_counterparty_key_linkage(args, orig).await
+    }
+    async fn reveal_specific_key_linkage(
+        &self,
+        args: RevealSpecificKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+        self.0.reveal_specific_key_linkage(args, orig).await
+    }
+    async fn encrypt(
+        &self,
+        args: EncryptArgs,
+        orig: Option<&str>,
+    ) -> Result<EncryptResult, WalletError> {
+        self.0.encrypt(args, orig).await
+    }
+    async fn decrypt(
+        &self,
+        args: DecryptArgs,
+        orig: Option<&str>,
+    ) -> Result<DecryptResult, WalletError> {
+        self.0.decrypt(args, orig).await
+    }
+    async fn create_hmac(
+        &self,
+        args: CreateHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateHmacResult, WalletError> {
+        self.0.create_hmac(args, orig).await
+    }
+    async fn verify_hmac(
+        &self,
+        args: VerifyHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifyHmacResult, WalletError> {
+        self.0.verify_hmac(args, orig).await
+    }
+    async fn create_signature(
+        &self,
+        args: CreateSignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateSignatureResult, WalletError> {
+        self.0.create_signature(args, orig).await
+    }
+    async fn verify_signature(
+        &self,
+        args: VerifySignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifySignatureResult, WalletError> {
+        self.0.verify_signature(args, orig).await
+    }
+    async fn acquire_certificate(
+        &self,
+        args: AcquireCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<Certificate, WalletError> {
+        self.0.acquire_certificate(args, orig).await
+    }
+    async fn list_certificates(
+        &self,
+        args: ListCertificatesArgs,
+        orig: Option<&str>,
+    ) -> Result<ListCertificatesResult, WalletError> {
+        self.0.list_certificates(args, orig).await
+    }
+    async fn prove_certificate(
+        &self,
+        args: ProveCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<ProveCertificateResult, WalletError> {
+        self.0.prove_certificate(args, orig).await
+    }
+    async fn relinquish_certificate(
+        &self,
+        args: RelinquishCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishCertificateResult, WalletError> {
+        self.0.relinquish_certificate(args, orig).await
+    }
+    async fn discover_by_identity_key(
+        &self,
+        args: DiscoverByIdentityKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_identity_key(args, orig).await
+    }
+    async fn discover_by_attributes(
+        &self,
+        args: DiscoverByAttributesArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_attributes(args, orig).await
+    }
+    async fn is_authenticated(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.is_authenticated(orig).await
+    }
+    async fn wait_for_authentication(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.wait_for_authentication(orig).await
+    }
+    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+        self.0.get_height(orig).await
+    }
+    async fn get_header_for_height(
+        &self,
+        args: GetHeaderArgs,
+        orig: Option<&str>,
+    ) -> Result<GetHeaderResult, WalletError> {
+        self.0.get_header_for_height(args, orig).await
+    }
+    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+        self.0.get_network(orig).await
+    }
+    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+        self.0.get_version(orig).await
+    }
 }
 
 fn make_live_client() -> Arc<MessageBoxClient<ArcWallet>> {
@@ -92,34 +246,188 @@ impl ArcHttpWallet {
 
 #[async_trait::async_trait]
 impl WalletInterface for ArcHttpWallet {
-    async fn create_action(&self, args: CreateActionArgs, orig: Option<&str>) -> Result<CreateActionResult, WalletError> { self.0.create_action(args, orig).await }
-    async fn sign_action(&self, args: SignActionArgs, orig: Option<&str>) -> Result<SignActionResult, WalletError> { self.0.sign_action(args, orig).await }
-    async fn abort_action(&self, args: AbortActionArgs, orig: Option<&str>) -> Result<AbortActionResult, WalletError> { self.0.abort_action(args, orig).await }
-    async fn list_actions(&self, args: ListActionsArgs, orig: Option<&str>) -> Result<ListActionsResult, WalletError> { self.0.list_actions(args, orig).await }
-    async fn internalize_action(&self, args: InternalizeActionArgs, orig: Option<&str>) -> Result<InternalizeActionResult, WalletError> { self.0.internalize_action(args, orig).await }
-    async fn list_outputs(&self, args: ListOutputsArgs, orig: Option<&str>) -> Result<ListOutputsResult, WalletError> { self.0.list_outputs(args, orig).await }
-    async fn relinquish_output(&self, args: RelinquishOutputArgs, orig: Option<&str>) -> Result<RelinquishOutputResult, WalletError> { self.0.relinquish_output(args, orig).await }
-    async fn get_public_key(&self, args: GetPublicKeyArgs, orig: Option<&str>) -> Result<GetPublicKeyResult, WalletError> { self.0.get_public_key(args, orig).await }
-    async fn reveal_counterparty_key_linkage(&self, args: RevealCounterpartyKeyLinkageArgs, orig: Option<&str>) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> { self.0.reveal_counterparty_key_linkage(args, orig).await }
-    async fn reveal_specific_key_linkage(&self, args: RevealSpecificKeyLinkageArgs, orig: Option<&str>) -> Result<RevealSpecificKeyLinkageResult, WalletError> { self.0.reveal_specific_key_linkage(args, orig).await }
-    async fn encrypt(&self, args: EncryptArgs, orig: Option<&str>) -> Result<EncryptResult, WalletError> { self.0.encrypt(args, orig).await }
-    async fn decrypt(&self, args: DecryptArgs, orig: Option<&str>) -> Result<DecryptResult, WalletError> { self.0.decrypt(args, orig).await }
-    async fn create_hmac(&self, args: CreateHmacArgs, orig: Option<&str>) -> Result<CreateHmacResult, WalletError> { self.0.create_hmac(args, orig).await }
-    async fn verify_hmac(&self, args: VerifyHmacArgs, orig: Option<&str>) -> Result<VerifyHmacResult, WalletError> { self.0.verify_hmac(args, orig).await }
-    async fn create_signature(&self, args: CreateSignatureArgs, orig: Option<&str>) -> Result<CreateSignatureResult, WalletError> { self.0.create_signature(args, orig).await }
-    async fn verify_signature(&self, args: VerifySignatureArgs, orig: Option<&str>) -> Result<VerifySignatureResult, WalletError> { self.0.verify_signature(args, orig).await }
-    async fn acquire_certificate(&self, args: AcquireCertificateArgs, orig: Option<&str>) -> Result<Certificate, WalletError> { self.0.acquire_certificate(args, orig).await }
-    async fn list_certificates(&self, args: ListCertificatesArgs, orig: Option<&str>) -> Result<ListCertificatesResult, WalletError> { self.0.list_certificates(args, orig).await }
-    async fn prove_certificate(&self, args: ProveCertificateArgs, orig: Option<&str>) -> Result<ProveCertificateResult, WalletError> { self.0.prove_certificate(args, orig).await }
-    async fn relinquish_certificate(&self, args: RelinquishCertificateArgs, orig: Option<&str>) -> Result<RelinquishCertificateResult, WalletError> { self.0.relinquish_certificate(args, orig).await }
-    async fn discover_by_identity_key(&self, args: DiscoverByIdentityKeyArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_identity_key(args, orig).await }
-    async fn discover_by_attributes(&self, args: DiscoverByAttributesArgs, orig: Option<&str>) -> Result<DiscoverCertificatesResult, WalletError> { self.0.discover_by_attributes(args, orig).await }
-    async fn is_authenticated(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.is_authenticated(orig).await }
-    async fn wait_for_authentication(&self, orig: Option<&str>) -> Result<AuthenticatedResult, WalletError> { self.0.wait_for_authentication(orig).await }
-    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> { self.0.get_height(orig).await }
-    async fn get_header_for_height(&self, args: GetHeaderArgs, orig: Option<&str>) -> Result<GetHeaderResult, WalletError> { self.0.get_header_for_height(args, orig).await }
-    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> { self.0.get_network(orig).await }
-    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> { self.0.get_version(orig).await }
+    async fn create_action(
+        &self,
+        args: CreateActionArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateActionResult, WalletError> {
+        self.0.create_action(args, orig).await
+    }
+    async fn sign_action(
+        &self,
+        args: SignActionArgs,
+        orig: Option<&str>,
+    ) -> Result<SignActionResult, WalletError> {
+        self.0.sign_action(args, orig).await
+    }
+    async fn abort_action(
+        &self,
+        args: AbortActionArgs,
+        orig: Option<&str>,
+    ) -> Result<AbortActionResult, WalletError> {
+        self.0.abort_action(args, orig).await
+    }
+    async fn list_actions(
+        &self,
+        args: ListActionsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListActionsResult, WalletError> {
+        self.0.list_actions(args, orig).await
+    }
+    async fn internalize_action(
+        &self,
+        args: InternalizeActionArgs,
+        orig: Option<&str>,
+    ) -> Result<InternalizeActionResult, WalletError> {
+        self.0.internalize_action(args, orig).await
+    }
+    async fn list_outputs(
+        &self,
+        args: ListOutputsArgs,
+        orig: Option<&str>,
+    ) -> Result<ListOutputsResult, WalletError> {
+        self.0.list_outputs(args, orig).await
+    }
+    async fn relinquish_output(
+        &self,
+        args: RelinquishOutputArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishOutputResult, WalletError> {
+        self.0.relinquish_output(args, orig).await
+    }
+    async fn get_public_key(
+        &self,
+        args: GetPublicKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<GetPublicKeyResult, WalletError> {
+        self.0.get_public_key(args, orig).await
+    }
+    async fn reveal_counterparty_key_linkage(
+        &self,
+        args: RevealCounterpartyKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+        self.0.reveal_counterparty_key_linkage(args, orig).await
+    }
+    async fn reveal_specific_key_linkage(
+        &self,
+        args: RevealSpecificKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+        self.0.reveal_specific_key_linkage(args, orig).await
+    }
+    async fn encrypt(
+        &self,
+        args: EncryptArgs,
+        orig: Option<&str>,
+    ) -> Result<EncryptResult, WalletError> {
+        self.0.encrypt(args, orig).await
+    }
+    async fn decrypt(
+        &self,
+        args: DecryptArgs,
+        orig: Option<&str>,
+    ) -> Result<DecryptResult, WalletError> {
+        self.0.decrypt(args, orig).await
+    }
+    async fn create_hmac(
+        &self,
+        args: CreateHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateHmacResult, WalletError> {
+        self.0.create_hmac(args, orig).await
+    }
+    async fn verify_hmac(
+        &self,
+        args: VerifyHmacArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifyHmacResult, WalletError> {
+        self.0.verify_hmac(args, orig).await
+    }
+    async fn create_signature(
+        &self,
+        args: CreateSignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateSignatureResult, WalletError> {
+        self.0.create_signature(args, orig).await
+    }
+    async fn verify_signature(
+        &self,
+        args: VerifySignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<VerifySignatureResult, WalletError> {
+        self.0.verify_signature(args, orig).await
+    }
+    async fn acquire_certificate(
+        &self,
+        args: AcquireCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<Certificate, WalletError> {
+        self.0.acquire_certificate(args, orig).await
+    }
+    async fn list_certificates(
+        &self,
+        args: ListCertificatesArgs,
+        orig: Option<&str>,
+    ) -> Result<ListCertificatesResult, WalletError> {
+        self.0.list_certificates(args, orig).await
+    }
+    async fn prove_certificate(
+        &self,
+        args: ProveCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<ProveCertificateResult, WalletError> {
+        self.0.prove_certificate(args, orig).await
+    }
+    async fn relinquish_certificate(
+        &self,
+        args: RelinquishCertificateArgs,
+        orig: Option<&str>,
+    ) -> Result<RelinquishCertificateResult, WalletError> {
+        self.0.relinquish_certificate(args, orig).await
+    }
+    async fn discover_by_identity_key(
+        &self,
+        args: DiscoverByIdentityKeyArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_identity_key(args, orig).await
+    }
+    async fn discover_by_attributes(
+        &self,
+        args: DiscoverByAttributesArgs,
+        orig: Option<&str>,
+    ) -> Result<DiscoverCertificatesResult, WalletError> {
+        self.0.discover_by_attributes(args, orig).await
+    }
+    async fn is_authenticated(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.is_authenticated(orig).await
+    }
+    async fn wait_for_authentication(
+        &self,
+        orig: Option<&str>,
+    ) -> Result<AuthenticatedResult, WalletError> {
+        self.0.wait_for_authentication(orig).await
+    }
+    async fn get_height(&self, orig: Option<&str>) -> Result<GetHeightResult, WalletError> {
+        self.0.get_height(orig).await
+    }
+    async fn get_header_for_height(
+        &self,
+        args: GetHeaderArgs,
+        orig: Option<&str>,
+    ) -> Result<GetHeaderResult, WalletError> {
+        self.0.get_header_for_height(args, orig).await
+    }
+    async fn get_network(&self, orig: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+        self.0.get_network(orig).await
+    }
+    async fn get_version(&self, orig: Option<&str>) -> Result<GetVersionResult, WalletError> {
+        self.0.get_version(orig).await
+    }
 }
 
 /// Create a funded MessageBoxClient backed by BSV Desktop wallet on localhost:3321.
@@ -151,7 +459,10 @@ async fn test_init_against_live_server() {
     let result = client.init(None).await;
     // Even if anoint fails, init should succeed (TS parity: catches and continues).
     println!("init result: {result:?}");
-    assert!(result.is_ok(), "init() should not return an error: {result:?}");
+    assert!(
+        result.is_ok(),
+        "init() should not return an error: {result:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -164,9 +475,17 @@ async fn test_init_against_live_server() {
 #[ignore]
 async fn test_get_identity_key_live() {
     let client = make_live_client();
-    let key = client.get_identity_key().await.expect("get_identity_key should succeed");
+    let key = client
+        .get_identity_key()
+        .await
+        .expect("get_identity_key should succeed");
     println!("identity key: {key}");
-    assert_eq!(key.len(), 66, "compressed pubkey is 66 hex chars, got {}", key.len());
+    assert_eq!(
+        key.len(),
+        66,
+        "compressed pubkey is 66 hex chars, got {}",
+        key.len()
+    );
     assert!(
         key.chars().all(|c| c.is_ascii_hexdigit()),
         "identity key must be all hex digits"
@@ -224,10 +543,10 @@ async fn test_send_message_to_self() {
             &identity_key,
             "test_inbox",
             "hello from rust live test",
-            false,  // skip_encryption
-            false,  // check_permissions
-            None,   // message_id
-            None,   // override_host
+            false, // skip_encryption
+            false, // check_permissions
+            None,  // message_id
+            None,  // override_host
         )
         .await;
 
@@ -284,7 +603,10 @@ async fn test_list_and_acknowledge() {
                 println!("acknowledging message IDs: {ids:?}");
                 let ack_result = client.acknowledge_message(ids, None).await;
                 println!("acknowledge result: {ack_result:?}");
-                assert!(ack_result.is_ok(), "acknowledge should succeed: {ack_result:?}");
+                assert!(
+                    ack_result.is_ok(),
+                    "acknowledge should succeed: {ack_result:?}"
+                );
             } else {
                 println!("no messages to acknowledge (send may not have completed yet)");
             }
@@ -337,7 +659,7 @@ async fn test_send_message_encrypted() {
             &identity_key,
             "test_inbox",
             "encrypted live test payload",
-            false,  // skip_encryption = false => encrypted
+            false, // skip_encryption = false => encrypted
             false,
             None,
             None,
@@ -361,7 +683,7 @@ async fn test_send_message_unencrypted() {
             &identity_key,
             "test_inbox",
             "unencrypted live test payload",
-            true,   // skip_encryption
+            true, // skip_encryption
             false,
             None,
             None,
@@ -537,7 +859,10 @@ async fn test_set_and_get_permission() {
         Ok(Some(perm)) => {
             assert_eq!(perm.message_box, "test_inbox");
             assert_eq!(perm.recipient_fee, 0);
-            println!("permission fields match: message_box={}, fee={}", perm.message_box, perm.recipient_fee);
+            println!(
+                "permission fields match: message_box={}, fee={}",
+                perm.message_box, perm.recipient_fee
+            );
         }
         Ok(None) => {
             println!("permission returned None — server may not echo it back for self");
@@ -606,15 +931,11 @@ async fn test_deny_and_check_notification() {
     // Use a valid-format but fake public key (starts with 02, 64 hex chars)
     let fake_peer = "0200000000000000000000000000000000000000000000000000000000000000ff";
 
-    let deny_result = client
-        .deny_notifications_from_peer(fake_peer, None)
-        .await;
+    let deny_result = client.deny_notifications_from_peer(fake_peer, None).await;
     println!("deny_notifications result: {deny_result:?}");
     // May succeed or fail — either is acceptable.
 
-    let check_result = client
-        .check_peer_notification_status(fake_peer, None)
-        .await;
+    let check_result = client.check_peer_notification_status(fake_peer, None).await;
     println!("check_peer_notification_status result: {check_result:?}");
     // May return Some(perm with fee=-1), None, or Err — all acceptable.
 }
@@ -635,10 +956,17 @@ async fn test_create_payment_token() {
     match result {
         Ok(token) => {
             assert_eq!(token.amount, 1000);
-            assert!(!token.transaction.is_empty(), "transaction bytes must be non-empty");
+            assert!(
+                !token.transaction.is_empty(),
+                "transaction bytes must be non-empty"
+            );
             assert!(!token.custom_instructions.derivation_prefix.is_empty());
             assert!(!token.custom_instructions.derivation_suffix.is_empty());
-            println!("token created: amount={}, tx_len={}", token.amount, token.transaction.len());
+            println!(
+                "token created: amount={}, tx_len={}",
+                token.amount,
+                token.transaction.len()
+            );
         }
         Err(e) => {
             // ProtoWallet has no funded wallet — create_action will fail.
@@ -718,7 +1046,10 @@ async fn test_init_with_target_host() {
     let client = make_live_client();
     let result = client.init(Some(LIVE_HOST)).await;
     println!("init(Some(LIVE_HOST)) result: {result:?}");
-    assert!(result.is_ok(), "init with target host should succeed: {result:?}");
+    assert!(
+        result.is_ok(),
+        "init with target host should succeed: {result:?}"
+    );
 }
 
 /// 17. Query overlay advertisements for own identity key.
@@ -728,9 +1059,7 @@ async fn test_query_advertisements() {
     let client = make_live_client();
     let identity_key = client.get_identity_key().await.expect("get_identity_key");
 
-    let result = client
-        .query_advertisements(Some(&identity_key), None)
-        .await;
+    let result = client.query_advertisements(Some(&identity_key), None).await;
     println!("query_advertisements result: {result:?}");
     // query_advertisements always returns Ok (wraps errors to empty vec).
     let ads = result.expect("query_advertisements always returns Ok");
@@ -745,9 +1074,7 @@ async fn test_resolve_host() {
     let client = make_live_client();
     let identity_key = client.get_identity_key().await.expect("get_identity_key");
 
-    let result = client
-        .resolve_host_for_recipient(&identity_key)
-        .await;
+    let result = client.resolve_host_for_recipient(&identity_key).await;
     println!("resolve_host result: {result:?}");
     let host = result.expect("resolve_host should succeed");
     assert!(!host.is_empty(), "resolved host must be non-empty");
@@ -767,7 +1094,12 @@ async fn test_resolve_host() {
 async fn test_register_device() {
     let client = make_live_client();
     let result = client
-        .register_device("fake-fcm-token-live-test", Some("test-device"), Some("web"), None)
+        .register_device(
+            "fake-fcm-token-live-test",
+            Some("test-device"),
+            Some("web"),
+            None,
+        )
         .await;
     println!("register_device result: {result:?}");
     // Server may accept or reject — no panic is the key assertion.
@@ -865,7 +1197,10 @@ async fn test_send_to_invalid_recipient() {
         )
         .await;
     println!("send to invalid recipient result: {result:?}");
-    assert!(result.is_err(), "sending to invalid recipient must return an error");
+    assert!(
+        result.is_err(),
+        "sending to invalid recipient must return an error"
+    );
 }
 
 /// 23. Acknowledge with empty vec — verify no crash.
@@ -873,9 +1208,7 @@ async fn test_send_to_invalid_recipient() {
 #[ignore]
 async fn test_acknowledge_empty_ids() {
     let client = make_live_client();
-    let result = client
-        .acknowledge_message(vec![], None)
-        .await;
+    let result = client.acknowledge_message(vec![], None).await;
     println!("acknowledge empty ids result: {result:?}");
     // Either Ok or Err is acceptable — no panic is the key assertion.
 }
@@ -897,7 +1230,10 @@ async fn test_send_notification_to_self() {
     println!("send_notification result: {result:?}");
     match result {
         Ok(msg_id) => {
-            assert!(!msg_id.is_empty(), "notification message_id must be non-empty");
+            assert!(
+                !msg_id.is_empty(),
+                "notification message_id must be non-empty"
+            );
             println!("notification sent: {msg_id}");
         }
         Err(e) => {
@@ -938,17 +1274,15 @@ async fn test_brc103_websocket_auth() {
         .expect("get_identity_key should succeed");
 
     // Connect and complete BRC-103 handshake against live server
-    let ws = MessageBoxWebSocket::connect(
-        LIVE_HOST,
-        &identity_key,
-        wallet,
-        None,
-    )
-    .await
-    .expect("BRC-103 connect should succeed against live server");
+    let ws = MessageBoxWebSocket::connect(LIVE_HOST, &identity_key, wallet, None)
+        .await
+        .expect("BRC-103 connect should succeed against live server");
 
     // Verify authenticationSuccess was received
-    assert!(ws.is_connected(), "is_connected() must return true after successful BRC-103 auth");
+    assert!(
+        ws.is_connected(),
+        "is_connected() must return true after successful BRC-103 auth"
+    );
 
     // Verify server identity key was captured during handshake
     let server_key = ws.server_identity_key();
@@ -1008,8 +1342,14 @@ async fn test_two_client_live_messaging() {
     let client_a = make_live_client();
     let client_b = make_live_client();
 
-    let key_a = client_a.get_identity_key().await.expect("client A identity key");
-    let key_b = client_b.get_identity_key().await.expect("client B identity key");
+    let key_a = client_a
+        .get_identity_key()
+        .await
+        .expect("client A identity key");
+    let key_b = client_b
+        .get_identity_key()
+        .await
+        .expect("client B identity key");
     println!("[Phase 1] Client A key: {}...", &key_a[..12]);
     println!("[Phase 1] Client B key: {}...", &key_b[..12]);
 
@@ -1024,7 +1364,10 @@ async fn test_two_client_live_messaging() {
             "e2e_test_inbox",
             Arc::new(move |msg| {
                 let prefix = msg.sender.get(..12).unwrap_or(&msg.sender);
-                println!("[Callback] Client A received: sender={}..., body={}", prefix, &msg.body);
+                println!(
+                    "[Callback] Client A received: sender={}..., body={}",
+                    prefix, &msg.body
+                );
                 // try_send works from both sync and async contexts; blocking_send panics inside Tokio.
                 let _ = tx.try_send(msg);
             }),
@@ -1045,27 +1388,41 @@ async fn test_two_client_live_messaging() {
 
     // skip_encryption=true so body passes through as-is for diagnostic clarity
     let send_result = client_b
-        .send_live_message(&key_a, "e2e_test_inbox", &test_body, true, false, None, None)
+        .send_live_message(
+            &key_a,
+            "e2e_test_inbox",
+            &test_body,
+            true,
+            false,
+            None,
+            None,
+        )
         .await;
 
     match &send_result {
-        Ok(d) => println!("[Phase 2] Message sent OK, id={}, live={}", d.message_id(), d.is_live()),
+        Ok(d) => println!(
+            "[Phase 2] Message sent OK, id={}, live={}",
+            d.message_id(),
+            d.is_live()
+        ),
         Err(e) => println!("[Phase 2] Send error: {e}"),
     }
-    assert!(send_result.is_ok(), "send_live_message should succeed: {send_result:?}");
+    assert!(
+        send_result.is_ok(),
+        "send_live_message should succeed: {send_result:?}"
+    );
 
     // Phase 3: Wait for Client A's callback to fire (up to 15s — generous for CI)
     println!("[Phase 3] Waiting up to 15s for Client A to receive the message...");
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        msg_rx.recv(),
-    )
-    .await;
+    let received = tokio::time::timeout(std::time::Duration::from_secs(15), msg_rx.recv()).await;
 
     match received {
         Ok(Some(msg)) => {
             let prefix = msg.sender.get(..12).unwrap_or(&msg.sender);
-            println!("[Phase 3] Client A received: sender={}..., body={}", prefix, &msg.body);
+            println!(
+                "[Phase 3] Client A received: sender={}..., body={}",
+                prefix, &msg.body
+            );
             assert_eq!(msg.sender, key_b, "sender must be Client B's identity key");
             assert_eq!(msg.body, test_body, "body must match what Client B sent");
             assert_eq!(msg.message_box, "e2e_test_inbox", "message_box must match");
@@ -1095,8 +1452,14 @@ async fn test_bidirectional_live_messaging() {
     let client_a = make_live_client();
     let client_b = make_live_client();
 
-    let key_a = client_a.get_identity_key().await.expect("client A identity key");
-    let key_b = client_b.get_identity_key().await.expect("client B identity key");
+    let key_a = client_a
+        .get_identity_key()
+        .await
+        .expect("client A identity key");
+    let key_b = client_b
+        .get_identity_key()
+        .await
+        .expect("client B identity key");
     println!("Client A key: {}...", &key_a[..12]);
     println!("Client B key: {}...", &key_b[..12]);
 
@@ -1109,7 +1472,11 @@ async fn test_bidirectional_live_messaging() {
         .listen_for_live_messages(
             "e2e_bidir_inbox",
             Arc::new(move |msg| {
-                println!("[A callback] sender={}..., body={}", &msg.sender[..12.min(msg.sender.len())], &msg.body);
+                println!(
+                    "[A callback] sender={}..., body={}",
+                    &msg.sender[..12.min(msg.sender.len())],
+                    &msg.body
+                );
                 let _ = tx_a2.try_send(msg);
             }),
             None,
@@ -1122,7 +1489,11 @@ async fn test_bidirectional_live_messaging() {
         .listen_for_live_messages(
             "e2e_bidir_inbox",
             Arc::new(move |msg| {
-                println!("[B callback] sender={}..., body={}", &msg.sender[..12.min(msg.sender.len())], &msg.body);
+                println!(
+                    "[B callback] sender={}..., body={}",
+                    &msg.sender[..12.min(msg.sender.len())],
+                    &msg.body
+                );
                 let _ = tx_b2.try_send(msg);
             }),
             None,
@@ -1141,14 +1512,30 @@ async fn test_bidirectional_live_messaging() {
     // Client A sends to Client B
     println!("Client A sending to B: {body_a_to_b}");
     client_a
-        .send_live_message(&key_b, "e2e_bidir_inbox", &body_a_to_b, true, false, None, None)
+        .send_live_message(
+            &key_b,
+            "e2e_bidir_inbox",
+            &body_a_to_b,
+            true,
+            false,
+            None,
+            None,
+        )
         .await
         .expect("Client A send_live_message should succeed");
 
     // Client B sends to Client A
     println!("Client B sending to A: {body_b_to_a}");
     client_b
-        .send_live_message(&key_a, "e2e_bidir_inbox", &body_b_to_a, true, false, None, None)
+        .send_live_message(
+            &key_a,
+            "e2e_bidir_inbox",
+            &body_b_to_a,
+            true,
+            false,
+            None,
+            None,
+        )
         .await
         .expect("Client B send_live_message should succeed");
 
@@ -1208,7 +1595,10 @@ async fn test_join_leave_room() {
     let client_a = make_live_client();
     let client_b = make_live_client();
 
-    let key_a = client_a.get_identity_key().await.expect("client A identity key");
+    let key_a = client_a
+        .get_identity_key()
+        .await
+        .expect("client A identity key");
     println!("Client A key: {}...", &key_a[..12]);
 
     let (msg_tx, mut msg_rx) = mpsc::channel::<bsv::remittance::PeerMessage>(8);
@@ -1236,7 +1626,15 @@ async fn test_join_leave_room() {
     let body1 = format!("msg1-{uid}");
     println!("Phase 1: Client B sending message 1: {body1}");
     client_b
-        .send_live_message(&key_a, "e2e_joinleave_inbox", &body1, true, false, None, None)
+        .send_live_message(
+            &key_a,
+            "e2e_joinleave_inbox",
+            &body1,
+            true,
+            false,
+            None,
+            None,
+        )
         .await
         .expect("Client B send message 1 should succeed");
 
@@ -1268,24 +1666,29 @@ async fn test_join_leave_room() {
     let body2 = format!("msg2-{uid}");
     println!("Phase 3: Client B sending message 2: {body2}");
     client_b
-        .send_live_message(&key_a, "e2e_joinleave_inbox", &body2, true, false, None, None)
+        .send_live_message(
+            &key_a,
+            "e2e_joinleave_inbox",
+            &body2,
+            true,
+            false,
+            None,
+            None,
+        )
         .await
         .expect("Client B send message 2 should succeed");
 
     // Expect timeout — no message should arrive after leave_room
-    let maybe_received2 = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        async {
-            loop {
-                if let Some(msg) = msg_rx.recv().await {
-                    // Only count messages from this test run (with our uid)
-                    if msg.body.contains(&uid) && msg.body != body1 {
-                        return Some(msg);
-                    }
+    let maybe_received2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(msg) = msg_rx.recv().await {
+                // Only count messages from this test run (with our uid)
+                if msg.body.contains(&uid) && msg.body != body1 {
+                    return Some(msg);
                 }
             }
         }
-    )
+    })
     .await;
 
     assert!(
@@ -1293,7 +1696,9 @@ async fn test_join_leave_room() {
         "Client A must NOT receive message 2 after leave_room, but got: {:?}",
         maybe_received2
     );
-    println!("Phase 3 PASSED: Client A did not receive message 2 after leave_room (timeout as expected)");
+    println!(
+        "Phase 3 PASSED: Client A did not receive message 2 after leave_room (timeout as expected)"
+    );
 
     println!("test_join_leave_room PASSED");
 
@@ -1344,7 +1749,10 @@ async fn test_rapid_sequential_sends() {
             )
             .await;
         println!("send {i}: {result:?}");
-        assert!(result.is_ok(), "send_message {i} should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "send_message {i} should succeed: {result:?}"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 
@@ -1374,10 +1782,7 @@ async fn test_rapid_sequential_sends() {
     );
 
     // Acknowledge all messages from this run to clean up
-    let ids: Vec<String> = our_messages
-        .iter()
-        .map(|m| m.message_id.clone())
-        .collect();
+    let ids: Vec<String> = our_messages.iter().map(|m| m.message_id.clone()).collect();
     receiver
         .acknowledge_message(ids, None)
         .await
@@ -1411,7 +1816,11 @@ async fn test_large_message_body() {
         body.push_str(chunk);
     }
     body.truncate(TARGET_SIZE);
-    assert_eq!(body.len(), TARGET_SIZE, "body must be exactly {TARGET_SIZE} bytes before send");
+    assert_eq!(
+        body.len(),
+        TARGET_SIZE,
+        "body must be exactly {TARGET_SIZE} bytes before send"
+    );
 
     println!(
         "Sending {TARGET_SIZE}-byte body to receiver {}, inbox={inbox}",
@@ -1423,7 +1832,7 @@ async fn test_large_message_body() {
             &key_receiver,
             inbox,
             &body,
-            true,  // skip_encryption — verify body length is preserved verbatim
+            true, // skip_encryption — verify body length is preserved verbatim
             false,
             None,
             None,
@@ -1441,7 +1850,10 @@ async fn test_large_message_body() {
         .iter()
         .find(|m| m.body.starts_with(&format!("LARGE-{uid}")));
 
-    assert!(our_msg.is_some(), "large message must appear in list (uid={uid})");
+    assert!(
+        our_msg.is_some(),
+        "large message must appear in list (uid={uid})"
+    );
 
     let received_body = &our_msg.unwrap().body;
     println!(
@@ -1565,11 +1977,7 @@ async fn test_connect_disconnect_cycle() {
         .expect("send_live_message after reconnect should succeed");
 
     // Wait for the message to arrive via the reconnected subscription
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        rx2.recv(),
-    )
-    .await;
+    let received = tokio::time::timeout(std::time::Duration::from_secs(15), rx2.recv()).await;
 
     match received {
         Ok(Some(msg)) => {
@@ -1632,7 +2040,10 @@ async fn test_funded_payment_round_trip() {
     let send_result = client.send_payment(&identity_key, 1000).await;
     println!("send_payment result: {send_result:?}");
     let msg_id = send_result.expect("send_payment must succeed with funded wallet");
-    assert!(!msg_id.is_empty(), "send_payment must return a non-empty message ID");
+    assert!(
+        !msg_id.is_empty(),
+        "send_payment must return a non-empty message ID"
+    );
     println!("Payment sent, message_id={msg_id}");
 
     // Phase 2: list_incoming_payments — reads payment_inbox and deserializes
@@ -1643,7 +2054,10 @@ async fn test_funded_payment_round_trip() {
         .await
         .expect("list_incoming_payments must succeed");
     println!("Incoming payments count: {}", incoming.len());
-    assert!(!incoming.is_empty(), "must have at least one incoming payment");
+    assert!(
+        !incoming.is_empty(),
+        "must have at least one incoming payment"
+    );
 
     // Phase 3: verify token structure — find our payment and check fields.
     let payment = incoming
@@ -1661,17 +2075,28 @@ async fn test_funded_payment_round_trip() {
         payment.token.amount,
         &payment.sender[..12]
     );
-    assert_eq!(payment.token.amount, 1000, "payment amount must be 1000 sats");
+    assert_eq!(
+        payment.token.amount, 1000,
+        "payment amount must be 1000 sats"
+    );
     assert!(
         !payment.token.transaction.is_empty(),
         "payment must contain BEEF transaction bytes"
     );
     assert!(
-        !payment.token.custom_instructions.derivation_prefix.is_empty(),
+        !payment
+            .token
+            .custom_instructions
+            .derivation_prefix
+            .is_empty(),
         "derivation_prefix must be present"
     );
     assert!(
-        !payment.token.custom_instructions.derivation_suffix.is_empty(),
+        !payment
+            .token
+            .custom_instructions
+            .derivation_suffix
+            .is_empty(),
         "derivation_suffix must be present"
     );
 

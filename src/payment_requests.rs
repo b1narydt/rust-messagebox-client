@@ -11,19 +11,16 @@
 use std::sync::Arc;
 
 use bsv::auth::utils::create_nonce;
-use bsv::wallet::interfaces::{
-    CreateHmacArgs, VerifyHmacArgs, WalletInterface,
-};
-use bsv::wallet::types::{Counterparty, CounterpartyType, Protocol};
 use bsv::primitives::public_key::PublicKey;
 use bsv::remittance::types::PeerMessage;
+use bsv::wallet::interfaces::{CreateHmacArgs, VerifyHmacArgs, WalletInterface};
+use bsv::wallet::types::{Counterparty, CounterpartyType, Protocol};
 
 use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
 use crate::types::{
-    IncomingPaymentRequest, PaymentRequestLimits, PaymentRequestMessage,
-    PaymentRequestResponse, PaymentRequestResult, PAYMENT_REQUESTS_MESSAGEBOX,
-    PAYMENT_REQUEST_RESPONSES_MESSAGEBOX,
+    IncomingPaymentRequest, PaymentRequestLimits, PaymentRequestMessage, PaymentRequestResponse,
+    PaymentRequestResult, PAYMENT_REQUESTS_MESSAGEBOX, PAYMENT_REQUEST_RESPONSES_MESSAGEBOX,
 };
 
 /// Build the protocol for payment request auth HMACs.
@@ -87,10 +84,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     key_id: request_id.clone(),
                     counterparty: Counterparty {
                         counterparty_type: CounterpartyType::Other,
-                        public_key: Some(
-                            PublicKey::from_string(recipient)
-                                .map_err(|e| MessageBoxError::Auth(format!("invalid recipient key: {e}")))?,
-                        ),
+                        public_key: Some(PublicKey::from_string(recipient).map_err(|e| {
+                            MessageBoxError::Auth(format!("invalid recipient key: {e}"))
+                        })?),
                     },
                     privileged: false,
                     privileged_reason: None,
@@ -116,13 +112,22 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let body = serde_json::to_string(&message)?;
 
         match self
-            .send_message(recipient, PAYMENT_REQUESTS_MESSAGEBOX, &body, false, false, None, None)
+            .send_message(
+                recipient,
+                PAYMENT_REQUESTS_MESSAGEBOX,
+                &body,
+                false,
+                false,
+                None,
+                None,
+            )
             .await
         {
             Ok(_) => {}
             Err(MessageBoxError::Http(403, _)) => {
                 return Err(MessageBoxError::Validation(
-                    "Payment request blocked — you are not on the recipient's whitelist.".to_string(),
+                    "Payment request blocked — you are not on the recipient's whitelist."
+                        .to_string(),
                 ));
             }
             Err(e) => return Err(e),
@@ -254,8 +259,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
                 match verify_result {
                     Ok(r) if r.valid => {
-                        cancelled_requests
-                            .insert(body.request_id.clone(), msg.sender.clone());
+                        cancelled_requests.insert(body.request_id.clone(), msg.sender.clone());
                         cancellation_ids.push(msg.message_id.clone());
                     }
                     _ => {
@@ -547,12 +551,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         });
 
-        self.listen_for_live_messages(
-            PAYMENT_REQUEST_RESPONSES_MESSAGEBOX,
-            wrapper,
-            override_host,
-        )
-        .await
+        self.listen_for_live_messages(PAYMENT_REQUEST_RESPONSES_MESSAGEBOX, wrapper, override_host)
+            .await
     }
 
     // -----------------------------------------------------------------------
@@ -612,7 +612,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         host_override: Option<&str>,
     ) -> Result<Vec<(String, bool)>, MessageBoxError> {
         let permissions = self
-            .list_message_box_permissions(Some(PAYMENT_REQUESTS_MESSAGEBOX), None, None, host_override)
+            .list_message_box_permissions(
+                Some(PAYMENT_REQUESTS_MESSAGEBOX),
+                None,
+                None,
+                host_override,
+            )
             .await?;
 
         let result = permissions

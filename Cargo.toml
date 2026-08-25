@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-client"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.87"
 description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
@@ -15,12 +15,12 @@ name = "bsv_messagebox_client"
 [dependencies]
 # Shared BRC-103 Socket.IO transport (extracted from this crate's websocket.rs
 # + socket_transport.rs).
-authsocket = { version = "0.4.1", features = ["client"] }
+authsocket = { version = "0.5.0", features = ["client"] }
 # authsocket must declare the SAME bsv-sdk major as this crate does, or the graph
 # splits into two `bsv` packages and every `W: WalletInterface` bound stops
 # matching. authsocket 0.1.3 declares ^0.4.0, so 0.2.0 (bsv-sdk 0.5) is required
 # here — a `0.1.x` req would happily resolve back to 0.1.3 and split the graph.
-bsv-sdk = { version = "0.7.1", features = ["network"] }
+bsv-sdk = { version = "0.8.0", features = ["network"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

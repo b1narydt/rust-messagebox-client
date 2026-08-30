@@ -351,73 +351,108 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Acknowledge a notification message, internalizing any embedded delivery-fee payment.
     ///
-    /// Matches TS `acknowledgeNotification` exactly:
-    /// 1. Acknowledges the message FIRST (removes from server queue).
-    /// 2. Parses body for a `{ message, payment }` delivery-fee wrapper (NOT a PeerPay token).
-    /// 3. If a delivery-fee payment exists with `wallet payment` outputs, internalizes it.
-    /// 4. Returns true if payment was internalized, false otherwise.
+    /// Exceeds the TS `@bsv/message-box-client` spec rather than mirroring it. TS
+    /// acknowledges before internalizing and admits only `protocol == "wallet payment"`;
+    /// both lose the payment on a crash or a failed internalize, and the TS defect is
+    /// upstream. Wire compatibility is unaffected — the same requests are issued to the
+    /// same endpoints, in a safer order — so a TS server or peer cannot observe the
+    /// difference. Divergence is deliberate and durability-led (ruling 2026-08-29).
+    ///
+    /// The relay is the durability backstop: a notification carrying internalizable
+    /// outputs may leave the relay only after the payment is durably stored.
+    /// Notifications with no payment, or no qualifying outputs, are still acknowledged
+    /// and return `false` — otherwise they accumulate in the queue forever.
+    ///
+    /// Returns `Err` if internalization fails, leaving the message unacknowledged and
+    /// therefore re-fetchable. Callers polling this in a loop should note that a payment
+    /// which can never internalize will never be acknowledged; at-least-once is the
+    /// intended contract (a replayed internalize collides on outpoint uniqueness rather
+    /// than double-crediting), but a permanently malformed payment needs its own escape
+    /// hatch, which this function does not provide.
     pub async fn acknowledge_notification(
         &self,
         message: &PeerMessage,
     ) -> Result<bool, MessageBoxError> {
-        // Step 1: Acknowledge first — matches TS line 1702
-        self.acknowledge_message(vec![message.message_id.clone()], None)
-            .await?;
+        let message_id = message.message_id.clone();
+        self.acknowledge_notification_with_ack(message, || async move {
+            self.acknowledge_message(vec![message_id], None).await
+        })
+        .await
+    }
 
-        // Step 2: Parse body for delivery-fee wrapper { message, payment }
+    async fn acknowledge_notification_with_ack<F, Fut>(
+        &self,
+        message: &PeerMessage,
+        acknowledge: F,
+    ) -> Result<bool, MessageBoxError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), MessageBoxError>>,
+    {
+        // Parse the delivery-fee wrapper before deciding whether internalization is needed.
         let parsed = serde_json::from_str::<crate::http_ops::WrappedMessageBody>(&message.body);
         let payment_data = parsed.ok().and_then(|w| w.payment);
 
-        // Step 3: Internalize delivery-fee payment if present
-        if let Some(payment) = payment_data {
-            if let (Some(tx_bytes), Some(outputs)) = (&payment.tx, &payment.outputs) {
-                let description = payment
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| "MessageBox recipient payment".to_string());
+        let internalize_args: Option<InternalizeActionArgs> = payment_data.and_then(|payment| {
+            let tx_bytes = payment.tx?;
+            let outputs = payment.outputs?;
+            let description = payment
+                .description
+                .unwrap_or_else(|| "MessageBox recipient payment".to_string());
 
-                // Filter to wallet payment outputs (TS: output.protocol === 'wallet payment')
-                let internalize_outputs: Vec<InternalizeOutput> = outputs
-                    .iter()
-                    .filter_map(|o| {
-                        let sender_pk = o.sender_identity_key.as_deref().and_then(|k| {
-                            bsv::primitives::public_key::PublicKey::from_string(k).ok()
-                        })?;
-                        Some(InternalizeOutput::WalletPayment {
-                            output_index: o.output_index.unwrap_or(0),
-                            payment: Payment {
-                                derivation_prefix: o.derivation_prefix.clone().unwrap_or_default(),
-                                derivation_suffix: o.derivation_suffix.clone().unwrap_or_default(),
-                                sender_identity_key: sender_pk,
-                            },
-                        })
+            // Only wallet-payment outputs carry derivation data the wallet can internalize.
+            let internalize_outputs: Vec<InternalizeOutput> = outputs
+                .into_iter()
+                .filter_map(|o| {
+                    // Admits `protocol: "wallet payment"` AND an absent `protocol`, matching
+                    // the sibling internalize path in `http_ops.rs`. Absent must be admitted:
+                    // a stricter `!= Some("wallet payment")` test drops the output, which
+                    // leaves nothing to internalize and therefore acknowledges and discards
+                    // the payment — reintroducing the loss this function was fixed to close.
+                    // TS filters absent out; that divergence is deliberate and durability-led.
+                    if o.protocol.as_deref() != Some("wallet payment") && o.protocol.is_some() {
+                        return None;
+                    }
+                    let sender_pk = o.sender_identity_key.as_deref().and_then(|k| {
+                        bsv::primitives::public_key::PublicKey::from_string(k).ok()
+                    })?;
+                    Some(InternalizeOutput::WalletPayment {
+                        output_index: o.output_index.unwrap_or(0),
+                        payment: Payment {
+                            derivation_prefix: o.derivation_prefix.unwrap_or_default(),
+                            derivation_suffix: o.derivation_suffix.unwrap_or_default(),
+                            sender_identity_key: sender_pk,
+                        },
                     })
-                    .collect();
+                })
+                .collect();
 
-                if internalize_outputs.is_empty() {
-                    return Ok(false);
-                }
-
-                let args = InternalizeActionArgs {
-                    tx: tx_bytes.clone(),
-                    description,
-                    labels: Some(vec!["notification-payment".to_string()]),
-                    seek_permission: bsv::wallet::types::BooleanDefaultTrue(Some(false)),
-                    outputs: internalize_outputs,
-                };
-
-                match self
-                    .wallet()
-                    .internalize_action(args, self.originator())
-                    .await
-                {
-                    Ok(_) => return Ok(true),
-                    Err(_) => return Ok(false),
-                }
+            if internalize_outputs.is_empty() {
+                return None;
             }
-        }
 
-        Ok(false)
+            Some(InternalizeActionArgs {
+                tx: tx_bytes,
+                description,
+                labels: Some(vec!["notification-payment".to_string()]),
+                seek_permission: bsv::wallet::types::BooleanDefaultTrue(Some(false)),
+                outputs: internalize_outputs,
+            })
+        });
+
+        let internalized = if let Some(args) = internalize_args {
+            self.wallet()
+                .internalize_action(args, self.originator())
+                .await
+                .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
+            true
+        } else {
+            false
+        };
+
+        // Intentionally unlike TS: acknowledge only after durable internalization succeeds.
+        acknowledge().await?;
+        Ok(internalized)
     }
 }
 
@@ -440,12 +475,17 @@ mod tests {
 
     // Thin Arc wrapper so ProtoWallet satisfies W: Clone bound on MessageBoxClient
     #[derive(Clone)]
-    struct ArcWallet(Arc<ProtoWallet>);
+    struct ArcWallet(Arc<ProtoWallet>, Option<&'static str>);
 
     impl ArcWallet {
         fn new() -> Self {
             let key = PrivateKey::from_random().expect("random key");
-            ArcWallet(Arc::new(ProtoWallet::new(key)))
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None)
+        }
+
+        fn failing_internalize(message: &'static str) -> Self {
+            let key = PrivateKey::from_random().expect("random key");
+            ArcWallet(Arc::new(ProtoWallet::new(key)), Some(message))
         }
 
         async fn identity_hex(&self) -> String {
@@ -504,6 +544,9 @@ mod tests {
             args: InternalizeActionArgs,
             orig: Option<&str>,
         ) -> Result<InternalizeActionResult, WalletError> {
+            if let Some(message) = self.1 {
+                return Err(WalletError::Internal(message.to_string()));
+            }
             self.0.internalize_action(args, orig).await
         }
         async fn list_outputs(
@@ -929,6 +972,175 @@ mod tests {
             payments.len(),
             0,
             "non-payment message must be silently skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_does_not_ack_when_internalize_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::failing_internalize("injected internalize failure");
+        let sender_identity_key = wallet.identity_hex().await;
+        let client = crate::client::MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            None,
+            bsv::services::overlay_tools::Network::Mainnet,
+        );
+        let message = PeerMessage {
+            message_id: "notification-with-payment".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": {
+                    "tx": [1, 2, 3],
+                    "outputs": [{
+                        "outputIndex": 0,
+                        "protocol": "wallet payment",
+                        "derivationPrefix": [4, 5],
+                        "derivationSuffix": [6, 7],
+                        "senderIdentityKey": sender_identity_key,
+                    }],
+                },
+            })
+            .to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            !acknowledged.load(Ordering::SeqCst),
+            "relay message must remain unacknowledged when internalization fails"
+        );
+        assert!(
+            matches!(result, Err(MessageBoxError::Wallet(ref message)) if message.contains("injected internalize failure")),
+            "internalize error must propagate, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_acks_when_no_wallet_payment_exists() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wallet = ArcWallet::failing_internalize("internalize must not be called");
+        let sender_identity_key = wallet.identity_hex().await;
+        let client = crate::client::MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            None,
+            bsv::services::overlay_tools::Network::Mainnet,
+        );
+        let messages = [
+            PeerMessage {
+                message_id: "notification-without-payment".to_string(),
+                sender: sender_identity_key.clone(),
+                recipient: "recipient".to_string(),
+                message_box: "notifications".to_string(),
+                body: serde_json::json!({ "message": {} }).to_string(),
+            },
+            PeerMessage {
+                message_id: "notification-with-non-wallet-output".to_string(),
+                sender: sender_identity_key.clone(),
+                recipient: "recipient".to_string(),
+                message_box: "notifications".to_string(),
+                body: serde_json::json!({
+                    "message": {},
+                    "payment": {
+                        "tx": [1, 2, 3],
+                        "outputs": [{
+                            "outputIndex": 0,
+                            "protocol": "basket insertion",
+                            "derivationPrefix": [4, 5],
+                            "derivationSuffix": [6, 7],
+                            "senderIdentityKey": sender_identity_key,
+                        }],
+                    },
+                })
+                .to_string(),
+            },
+        ];
+        let acknowledgement_count = Arc::new(AtomicUsize::new(0));
+
+        for message in &messages {
+            let acknowledgement_count = Arc::clone(&acknowledgement_count);
+            let result = client
+                .acknowledge_notification_with_ack(message, move || async move {
+                    acknowledgement_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert_eq!(result.unwrap(), false);
+        }
+
+        assert_eq!(
+            acknowledgement_count.load(Ordering::SeqCst),
+            messages.len(),
+            "every notification without a wallet payment must be acknowledged"
+        );
+    }
+
+    /// #279 regression: an output whose `protocol` field is ABSENT must still be
+    /// internalized, and must NOT be acknowledged if internalization fails.
+    ///
+    /// A stricter `protocol != Some("wallet payment")` filter silently drops these and
+    /// then acks, which reintroduces exactly the loss #279 closes. `http_ops.rs`'s
+    /// sibling internalize path admits absent-protocol outputs for the same reason.
+    #[tokio::test]
+    async fn acknowledge_notification_internalizes_output_with_absent_protocol() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::failing_internalize("injected internalize failure");
+        let sender_identity_key = wallet.identity_hex().await;
+        let client = crate::client::MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            None,
+            bsv::services::overlay_tools::Network::Mainnet,
+        );
+        // `protocol` deliberately omitted — serde yields None.
+        let message = PeerMessage {
+            message_id: "absent-protocol".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": { "tx": [1, 2, 3], "outputs": [{
+                    "outputIndex": 0,
+                    "derivationPrefix": [4, 5],
+                    "derivationSuffix": [6, 7],
+                    "senderIdentityKey": sender_identity_key,
+                }]},
+            })
+            .to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Wallet(ref m)) if m.contains("injected internalize failure")),
+            "an absent-protocol output must be internalized, not skipped; got {result:?}"
+        );
+        assert!(
+            !acknowledged.load(Ordering::SeqCst),
+            "relay message must remain unacknowledged when internalization fails"
         );
     }
 }

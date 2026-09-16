@@ -3,14 +3,13 @@
 //! Verifies API surface parity with TypeScript @bsv/message-box-client v2.0.4
 //!
 //! Scope is the API SURFACE — names, arity, signatures. It does not assert behavioural
-//! parity, and in one place behaviour deliberately exceeds the TS spec:
-//!
-//!   `acknowledge_notification` internalizes the delivery-fee payment BEFORE
-//!   acknowledging, and admits outputs whose `protocol` field is absent. TS does the
-//!   reverse on both counts and loses the payment on a crash or failed internalize
-//!   (the defect is upstream in @bsv/message-box-client, still unfixed there).
-//!   Wire-compatible: same requests, same endpoints, safer order.
-//!   See src/peer_pay.rs and Atlas-Documentation#279.
+//! parity. Payment ordering follows TS @bsv/message-box-client 2.5.1 (ts-stack #534):
+//! `accept_payment`, `reject_payment` and `acknowledge_notification` all internalize
+//! and require `accepted: true` before the relay message is acknowledged, and
+//! `reject_payment` refunds before acknowledging. One deliberate divergence remains:
+//! `acknowledge_notification` admits outputs whose `protocol` field is absent (TS
+//! drops them). Wire-compatible: same requests, same endpoints.
+//! See src/peer_pay.rs and Atlas-Documentation#279.
 //!
 //! Method count: 33 MessageBoxClient + 7 PeerPayClient = 40 total
 //! (TS reference: 33 MessageBoxClient + 7 PeerPayClient = 40 total)

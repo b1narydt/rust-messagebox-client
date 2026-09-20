@@ -1299,6 +1299,22 @@ pub(crate) fn is_duplicate_message_rejection(body: &[u8]) -> bool {
     false
 }
 
+/// Match the relay's precise signal for an acknowledgement that raced ahead of
+/// asynchronous message persistence.
+///
+/// Atlas broadcasts a live message before it enqueues the durable INSERT. A
+/// recipient can therefore receive and acknowledge the message while the row is
+/// not visible yet. The relay reports that narrow window as HTTP 400 with
+/// `ERR_INVALID_ACKNOWLEDGMENT`; callers may retry it briefly, but must never
+/// treat it as success because the row can still appear later.
+pub(crate) fn is_acknowledgment_not_found(body: &[u8]) -> bool {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return v.get("status").and_then(|s| s.as_str()) == Some("error")
+            && v.get("code").and_then(|c| c.as_str()) == Some("ERR_INVALID_ACKNOWLEDGMENT");
+    }
+    false
+}
+
 /// Check if a successful (2xx) HTTP response body contains a server-level
 /// error indicator (`{"status": "error", "description": "..."}`).
 ///
@@ -1739,6 +1755,21 @@ mod tests {
             !is_duplicate_message_rejection(b"not json"),
             "malformed body is not a duplicate"
         );
+    }
+
+    #[test]
+    fn acknowledgment_not_found_matches_only_the_precise_relay_code() {
+        use super::is_acknowledgment_not_found;
+
+        let not_found = br#"{"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"}"#;
+        let invalid_id =
+            br#"{"status":"error","code":"ERR_INVALID_MESSAGE_ID","description":"bad id"}"#;
+        let success = br#"{"status":"success"}"#;
+
+        assert!(is_acknowledgment_not_found(not_found));
+        assert!(!is_acknowledgment_not_found(invalid_id));
+        assert!(!is_acknowledgment_not_found(success));
+        assert!(!is_acknowledgment_not_found(b"not json"));
     }
 
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).

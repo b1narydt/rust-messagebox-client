@@ -7,7 +7,9 @@ use bsv::wallet::types::BooleanDefaultTrue;
 use futures_util::future::join_all;
 
 use crate::client::MessageBoxClient;
-use crate::client::{check_status_error, is_duplicate_message_rejection};
+use crate::client::{
+    check_status_error, is_acknowledgment_not_found, is_duplicate_message_rejection,
+};
 use crate::encryption;
 use crate::error::MessageBoxError;
 use crate::types::{
@@ -1066,14 +1068,39 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         host: &str,
         message_ids: &[String],
     ) -> Result<(), MessageBoxError> {
+        const PERSISTENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+        const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+        const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
         let params = AcknowledgeMessageParams {
             message_ids: message_ids.to_vec(),
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/acknowledgeMessage");
-        let response = self.post_json(&url, body_bytes).await?;
-        check_status_error(&response.body)?;
-        Ok(())
+        let deadline = tokio::time::Instant::now() + PERSISTENCE_GRACE;
+        let mut delay = INITIAL_RETRY_DELAY;
+
+        loop {
+            // Atlas uses push-live-first + persist-async. Inspect the structured
+            // 400 response so only the exact "row is not visible yet" outcome is
+            // retried. Other validation, auth, and server failures remain fatal.
+            let response = self.post_json_raw(&url, body_bytes.clone()).await?;
+            if (200..300).contains(&response.status) {
+                check_status_error(&response.body)?;
+                return Ok(());
+            }
+
+            if response.status != 400 || !is_acknowledgment_not_found(&response.body) {
+                return Err(MessageBoxError::Http(response.status, url));
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(MessageBoxError::Http(response.status, url));
+            }
+            tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))).await;
+            delay = (delay * 2).min(MAX_RETRY_DELAY);
+        }
     }
 }
 

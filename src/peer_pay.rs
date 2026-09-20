@@ -240,6 +240,27 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// bytes_as_base64 serde re-encodes them to the original base64 strings
     /// that BSV Desktop expects.
     pub async fn accept_payment(&self, payment: &IncomingPayment) -> Result<(), MessageBoxError> {
+        self.accept_payment_inner(payment, None).await
+    }
+
+    /// Internalize a payment received from one explicitly selected host and
+    /// acknowledge it only on that host.
+    ///
+    /// This keeps a pinned-relay workflow from fanning the acknowledgement out
+    /// to every host advertised for the wallet identity.
+    pub async fn accept_payment_from_host(
+        &self,
+        payment: &IncomingPayment,
+        host: &str,
+    ) -> Result<(), MessageBoxError> {
+        self.accept_payment_inner(payment, Some(host)).await
+    }
+
+    async fn accept_payment_inner(
+        &self,
+        payment: &IncomingPayment,
+        host_override: Option<&str>,
+    ) -> Result<(), MessageBoxError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
         let sender_pk = PublicKey::from_string(&payment.sender)
@@ -273,7 +294,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
             .map_err(|e| MessageBoxError::Wallet(e.to_string()))?;
 
-        self.acknowledge_message(vec![payment.message_id.clone()], None)
+        self.acknowledge_message(vec![payment.message_id.clone()], host_override)
             .await?;
         Ok(())
     }
@@ -331,7 +352,26 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Silently skips messages whose bodies are not valid JSON payment tokens
     /// (mirrors TS `safeParse` behavior).
     pub async fn list_incoming_payments(&self) -> Result<Vec<IncomingPayment>, MessageBoxError> {
-        let messages = self.list_messages("payment_inbox", false, None).await?;
+        self.list_incoming_payments_inner(None).await
+    }
+
+    /// List incoming payments from one explicitly selected MessageBox host.
+    ///
+    /// No advertisement lookup or multi-host fallback is performed.
+    pub async fn list_incoming_payments_from_host(
+        &self,
+        host: &str,
+    ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
+        self.list_incoming_payments_inner(Some(host)).await
+    }
+
+    async fn list_incoming_payments_inner(
+        &self,
+        host_override: Option<&str>,
+    ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
+        let messages = self
+            .list_messages("payment_inbox", false, host_override)
+            .await?;
 
         let payments = messages
             .into_iter()

@@ -935,8 +935,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 tracing::debug!(
                     "send_live_message: WS ack timed out or failed; falling back to HTTP"
                 );
-                // Fall back to HTTP — pass through all feature params.
-                // The HTTP path generates a fresh message ID; use that for the Persisted ID.
+                // Fall back to HTTP with the EXACT id already emitted over the
+                // WebSocket. The live delivery may have succeeded even when its
+                // acknowledgement was lost; changing ids here would persist a
+                // second logical copy that exactly-once dedup cannot suppress.
                 let http_id = match override_host {
                     Some(host) => {
                         self.send_message_to_host(
@@ -946,7 +948,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             body,
                             skip_encryption,
                             check_permissions,
-                            None,
+                            fallback_message_id(&message_id),
                             None,
                         )
                         .await?
@@ -958,7 +960,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             body,
                             skip_encryption,
                             check_permissions,
-                            None,
+                            fallback_message_id(&message_id),
                             None,
                         )
                         .await?
@@ -1050,6 +1052,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 /// chatty room that keeps WS *activity* alive can never permanently suppress the
 /// backstop even if *individual* pushes are being lost.
 const MAX_POLL_SKIPS: u32 = 7;
+
+/// Preserve the id emitted on the live path when its acknowledgement is lost.
+/// This is a named seam so a regression to `None` (fresh fallback id) is pinned
+/// without needing a ten-second WebSocket timeout in every unit-test run.
+fn fallback_message_id(message_id: &str) -> Option<&str> {
+    Some(message_id)
+}
 
 /// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
 /// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
@@ -1967,6 +1976,14 @@ mod tests {
             activity.load(Ordering::Relaxed),
             1,
             "only the WS path stamps activity"
+        );
+    }
+
+    #[test]
+    fn http_fallback_reuses_the_live_message_id() {
+        assert_eq!(
+            super::fallback_message_id("caller-selected-id"),
+            Some("caller-selected-id")
         );
     }
 }

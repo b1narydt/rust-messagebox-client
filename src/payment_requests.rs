@@ -60,6 +60,36 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         description: &str,
         expires_at: u64,
     ) -> Result<PaymentRequestResult, MessageBoxError> {
+        self.request_payment_inner(recipient, amount, description, expires_at, None)
+            .await
+    }
+
+    /// Send a payment request through one explicitly selected MessageBox host.
+    ///
+    /// Unlike [`Self::request_payment`], this does not resolve the recipient's
+    /// advertised host. This is intended for deployments that pin a particular
+    /// relay and must fail closed instead of silently routing through another
+    /// advertised MessageBox host.
+    pub async fn request_payment_to_host(
+        &self,
+        recipient: &str,
+        amount: u64,
+        description: &str,
+        expires_at: u64,
+        host: &str,
+    ) -> Result<PaymentRequestResult, MessageBoxError> {
+        self.request_payment_inner(recipient, amount, description, expires_at, Some(host))
+            .await
+    }
+
+    async fn request_payment_inner(
+        &self,
+        recipient: &str,
+        amount: u64,
+        description: &str,
+        expires_at: u64,
+        host_override: Option<&str>,
+    ) -> Result<PaymentRequestResult, MessageBoxError> {
         if amount == 0 {
             return Err(MessageBoxError::Validation(
                 "Payment request amount must be greater than 0".to_string(),
@@ -119,7 +149,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 false,
                 false,
                 None,
-                None,
+                host_override,
             )
             .await
         {

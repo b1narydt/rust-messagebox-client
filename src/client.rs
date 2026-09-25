@@ -935,8 +935,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 tracing::debug!(
                     "send_live_message: WS ack timed out or failed; falling back to HTTP"
                 );
-                // Fall back to HTTP — pass through all feature params.
-                // The HTTP path generates a fresh message ID; use that for the Persisted ID.
+                // Fall back to HTTP with the EXACT id already emitted over the
+                // WebSocket. The live delivery may have succeeded even when its
+                // acknowledgement was lost; changing ids here would persist a
+                // second logical copy that exactly-once dedup cannot suppress.
                 let http_id = match override_host {
                     Some(host) => {
                         self.send_message_to_host(
@@ -946,7 +948,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             body,
                             skip_encryption,
                             check_permissions,
-                            None,
+                            fallback_message_id(&message_id),
                             None,
                         )
                         .await?
@@ -958,7 +960,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             body,
                             skip_encryption,
                             check_permissions,
-                            None,
+                            fallback_message_id(&message_id),
                             None,
                         )
                         .await?
@@ -1050,6 +1052,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 /// chatty room that keeps WS *activity* alive can never permanently suppress the
 /// backstop even if *individual* pushes are being lost.
 const MAX_POLL_SKIPS: u32 = 7;
+
+/// Preserve the id emitted on the live path when its acknowledgement is lost.
+/// This is a named seam so a regression to `None` (fresh fallback id) is pinned
+/// without needing a ten-second WebSocket timeout in every unit-test run.
+fn fallback_message_id(message_id: &str) -> Option<&str> {
+    Some(message_id)
+}
 
 /// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
 /// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
@@ -1286,6 +1295,22 @@ pub(crate) fn is_duplicate_message_rejection(body: &[u8]) -> bool {
         {
             return true;
         }
+    }
+    false
+}
+
+/// Match the relay's precise signal for an acknowledgement that raced ahead of
+/// asynchronous message persistence.
+///
+/// Atlas broadcasts a live message before it enqueues the durable INSERT. A
+/// recipient can therefore receive and acknowledge the message while the row is
+/// not visible yet. The relay reports that narrow window as HTTP 400 with
+/// `ERR_INVALID_ACKNOWLEDGMENT`; callers may retry it briefly, but must never
+/// treat it as success because the row can still appear later.
+pub(crate) fn is_acknowledgment_not_found(body: &[u8]) -> bool {
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
+        return v.get("status").and_then(|s| s.as_str()) == Some("error")
+            && v.get("code").and_then(|c| c.as_str()) == Some("ERR_INVALID_ACKNOWLEDGMENT");
     }
     false
 }
@@ -1732,6 +1757,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acknowledgment_not_found_matches_only_the_precise_relay_code() {
+        use super::is_acknowledgment_not_found;
+
+        let not_found = br#"{"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"}"#;
+        let invalid_id =
+            br#"{"status":"error","code":"ERR_INVALID_MESSAGE_ID","description":"bad id"}"#;
+        let success = br#"{"status":"success"}"#;
+
+        assert!(is_acknowledgment_not_found(not_found));
+        assert!(!is_acknowledgment_not_found(invalid_id));
+        assert!(!is_acknowledgment_not_found(success));
+        assert!(!is_acknowledgment_not_found(b"not json"));
+    }
+
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).
     #[tokio::test]
     async fn get_identity_key_caches_result() {
@@ -1967,6 +2007,14 @@ mod tests {
             activity.load(Ordering::Relaxed),
             1,
             "only the WS path stamps activity"
+        );
+    }
+
+    #[test]
+    fn http_fallback_reuses_the_live_message_id() {
+        assert_eq!(
+            super::fallback_message_id("caller-selected-id"),
+            Some("caller-selected-id")
         );
     }
 }

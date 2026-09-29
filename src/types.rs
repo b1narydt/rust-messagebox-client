@@ -354,7 +354,8 @@ pub struct ServerPeerMessage {
 /// details that should not become part of a long-lived message receipt. Callers
 /// can distinguish a wallet error from a validation failure and retry using the
 /// byte-exact [`PaymentAwarePeerMessage::raw_payment_envelope`] (or lite
-/// equivalent).
+/// equivalent). An outer body above the protocol's 4 MiB message limit is the
+/// sole exception: it is reported as `Unprocessable` with no retained raw copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListMessagePaymentOutcome {
     /// The stored body did not contain a non-null payment.
@@ -383,7 +384,9 @@ impl ListMessagePaymentOutcome {
 /// `message.body` is the normal decrypted (or fail-open plaintext) inner body.
 /// Whenever `payment_outcome` is not `NoPayment` or `Internalized`,
 /// `raw_payment_envelope` contains the exact server body so a caller can retain
-/// and retry every payment field, including fields unknown to this crate.
+/// and retry every payment field, including fields unknown to this crate. It is
+/// `None` for an oversized outer body, which is replaced by a bounded marker to
+/// avoid retaining attacker-controlled data above the 4 MiB protocol limit.
 #[derive(Clone, Debug)]
 pub struct PaymentAwarePeerMessage {
     pub message: PeerMessage,

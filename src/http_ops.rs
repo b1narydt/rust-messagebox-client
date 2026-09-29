@@ -76,6 +76,7 @@ struct SplitMessageBody {
     inner_body: String,
     payment: Option<Result<ServerPayment, ()>>,
     raw_payment_envelope: Option<String>,
+    oversized: bool,
 }
 
 struct ProcessedMessageBody {
@@ -88,6 +89,14 @@ struct ProcessedMessageBody {
 const MAX_PAYMENT_TX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PAYMENT_OUTPUTS: usize = 101;
 const MAX_PAYMENT_DESCRIPTION_BYTES: usize = 50;
+/// Matches the MessageBox protocol's 4 MiB body limit. Apply it before JSON
+/// parsing so a hostile stored body cannot trigger an unbounded parse tree or a
+/// second retained copy. Oversized bodies are represented by a bounded marker.
+const MAX_LIST_MESSAGE_BODY_BYTES: usize = 4 * 1024 * 1024;
+const OVERSIZED_MESSAGE_BODY: &str = "[Message body exceeds the 4 MiB processing limit]";
+/// Send-side derivation nonces are 32 bytes, whose padded base64 form is 44 bytes.
+const MAX_DERIVATION_BYTES: usize = 32;
+const MAX_DERIVATION_BASE64_BYTES: usize = 44;
 const MAX_BASKET_FIELD_BYTES: usize = 300;
 const MAX_CUSTOM_INSTRUCTIONS_BYTES: usize = 1000;
 const MAX_BASKET_TAGS: usize = 10_000;
@@ -114,18 +123,29 @@ fn into_legacy_server_message(receipt: PaymentAwareServerPeerMessage) -> ServerP
 }
 
 fn split_message_body(raw_body: &str) -> SplitMessageBody {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_body) else {
+    if raw_body.len() > MAX_LIST_MESSAGE_BODY_BYTES {
+        return SplitMessageBody {
+            inner_body: OVERSIZED_MESSAGE_BODY.to_string(),
+            payment: None,
+            raw_payment_envelope: None,
+            oversized: true,
+        };
+    }
+
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw_body) else {
         return SplitMessageBody {
             inner_body: raw_body.to_string(),
             payment: None,
             raw_payment_envelope: None,
+            oversized: false,
         };
     };
-    let Some(object) = value.as_object() else {
+    let Some(object) = value.as_object_mut() else {
         return SplitMessageBody {
             inner_body: raw_body.to_string(),
             payment: None,
             raw_payment_envelope: None,
+            oversized: false,
         };
     };
 
@@ -134,18 +154,20 @@ fn split_message_body(raw_body: &str) -> SplitMessageBody {
         Some(message) => message.to_string(),
         None => raw_body.to_string(),
     };
-    let Some(payment_value) = object.get("payment").filter(|value| !value.is_null()) else {
+    let Some(payment_value) = object.remove("payment").filter(|value| !value.is_null()) else {
         return SplitMessageBody {
             inner_body,
             payment: None,
             raw_payment_envelope: None,
+            oversized: false,
         };
     };
 
     SplitMessageBody {
         inner_body,
-        payment: Some(serde_json::from_value(payment_value.clone()).map_err(|_| ())),
+        payment: Some(serde_json::from_value(payment_value).map_err(|_| ())),
         raw_payment_envelope: Some(raw_body.to_string()),
+        oversized: false,
     }
 }
 
@@ -200,11 +222,22 @@ fn build_internalize_args(payment: ServerPayment) -> Result<InternalizeActionArg
                 let suffix = remittance.derivation_suffix.ok_or(())?;
                 let prefix = prefix.trim();
                 let suffix = suffix.trim();
-                if prefix.is_empty() || suffix.is_empty() {
+                if prefix.is_empty()
+                    || suffix.is_empty()
+                    || prefix.len() > MAX_DERIVATION_BASE64_BYTES
+                    || suffix.len() > MAX_DERIVATION_BASE64_BYTES
+                {
                     return Err(());
                 }
                 let derivation_prefix = STANDARD.decode(prefix).map_err(|_| ())?;
                 let derivation_suffix = STANDARD.decode(suffix).map_err(|_| ())?;
+                if derivation_prefix.is_empty()
+                    || derivation_suffix.is_empty()
+                    || derivation_prefix.len() > MAX_DERIVATION_BYTES
+                    || derivation_suffix.len() > MAX_DERIVATION_BYTES
+                {
+                    return Err(());
+                }
                 let sender_identity_key = remittance.sender_identity_key.ok_or(())?;
                 if sender_identity_key.len() != 66
                     || (!sender_identity_key.starts_with("02")
@@ -1171,18 +1204,22 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         originator: Option<&str>,
     ) -> ProcessedMessageBody {
         let split = split_message_body(raw_body);
-        let payment_outcome = match split.payment {
-            None => ListMessagePaymentOutcome::NoPayment,
-            Some(_) if !accept_payments => ListMessagePaymentOutcome::Skipped,
-            Some(Err(())) => ListMessagePaymentOutcome::Unprocessable,
-            Some(Ok(payment)) => match build_internalize_args(payment) {
-                Err(()) => ListMessagePaymentOutcome::Unprocessable,
-                Ok(args) => match self.wallet().internalize_action(args, originator).await {
-                    Ok(result) if result.accepted => ListMessagePaymentOutcome::Internalized,
-                    Ok(_) => ListMessagePaymentOutcome::Declined,
-                    Err(_) => ListMessagePaymentOutcome::Failed,
+        let payment_outcome = if split.oversized {
+            ListMessagePaymentOutcome::Unprocessable
+        } else {
+            match split.payment {
+                None => ListMessagePaymentOutcome::NoPayment,
+                Some(_) if !accept_payments => ListMessagePaymentOutcome::Skipped,
+                Some(Err(())) => ListMessagePaymentOutcome::Unprocessable,
+                Some(Ok(payment)) => match build_internalize_args(payment) {
+                    Err(()) => ListMessagePaymentOutcome::Unprocessable,
+                    Ok(args) => match self.wallet().internalize_action(args, originator).await {
+                        Ok(result) if result.accepted => ListMessagePaymentOutcome::Internalized,
+                        Ok(_) => ListMessagePaymentOutcome::Declined,
+                        Err(_) => ListMessagePaymentOutcome::Failed,
+                    },
                 },
-            },
+            }
         };
         let decrypt_outcome = encryption::try_decrypt_message_typed(
             self.wallet(),
@@ -2041,6 +2078,98 @@ mod tests {
         );
         assert_eq!(paid.inner_body, "paid inner");
         assert!(paid.raw_payment_envelope.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_outer_body_is_bounded_unprocessable_for_detailed_and_legacy() {
+        let wallet = ArcWallet::internalize_answering(true);
+        let client = payment_client(wallet.clone(), None);
+        let raw = "x".repeat(super::MAX_LIST_MESSAGE_BODY_BYTES + 1);
+
+        for accept_payments in [false, true] {
+            let processed = client
+                .process_listed_body(&raw, "not-used-for-bounded-marker", accept_payments, None)
+                .await;
+            assert_eq!(
+                processed.payment_outcome,
+                crate::ListMessagePaymentOutcome::Unprocessable
+            );
+            assert_eq!(processed.inner_body, super::OVERSIZED_MESSAGE_BODY);
+            assert!(processed.raw_payment_envelope.is_none());
+            assert!(processed.inner_body.len() < 100);
+        }
+        assert!(wallet.internalize_observations().is_empty());
+
+        let legacy = super::into_legacy_peer_message(crate::PaymentAwarePeerMessage {
+            message: PeerMessage {
+                message_id: "oversized".into(),
+                sender: "sender".into(),
+                recipient: "recipient".into(),
+                message_box: "inbox".into(),
+                body: super::OVERSIZED_MESSAGE_BODY.into(),
+            },
+            payment_outcome: crate::ListMessagePaymentOutcome::Unprocessable,
+            raw_payment_envelope: None,
+        });
+        assert_eq!(legacy.body, super::OVERSIZED_MESSAGE_BODY);
+
+        let legacy_lite = super::into_legacy_server_message(crate::PaymentAwareServerPeerMessage {
+            message: crate::ServerPeerMessage {
+                message_id: "oversized".into(),
+                body: super::OVERSIZED_MESSAGE_BODY.into(),
+                sender: "sender".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+                acknowledged: None,
+                authenticated_decrypt: false,
+            },
+            payment_outcome: crate::ListMessagePaymentOutcome::Unprocessable,
+            raw_payment_envelope: None,
+        });
+        assert_eq!(legacy_lite.body, super::OVERSIZED_MESSAGE_BODY);
+        assert!(!legacy_lite.authenticated_decrypt);
+    }
+
+    #[tokio::test]
+    async fn oversized_derivation_fields_fail_before_wallet_internalization() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender = wallet.identity_hex().await;
+        let client = payment_client(wallet.clone(), None);
+        let too_many_decoded_bytes = STANDARD.encode(vec![7_u8; super::MAX_DERIVATION_BYTES + 1]);
+        assert!(too_many_decoded_bytes.len() <= super::MAX_DERIVATION_BASE64_BYTES);
+
+        for (prefix, suffix) in [
+            (
+                "A".repeat(super::MAX_DERIVATION_BASE64_BYTES + 1),
+                "Bgc=".to_string(),
+            ),
+            ("BAU=".to_string(), too_many_decoded_bytes.clone()),
+            (too_many_decoded_bytes, "Bgc=".to_string()),
+        ] {
+            let payment = payment_value(vec![serde_json::json!({
+                "outputIndex": 0,
+                "protocol": "wallet payment",
+                "paymentRemittance": {
+                    "derivationPrefix": prefix,
+                    "derivationSuffix": suffix,
+                    "senderIdentityKey": sender,
+                }
+            })]);
+            let raw = payment_envelope(serde_json::json!("inner"), payment);
+            let processed = client.process_listed_body(&raw, &sender, true, None).await;
+            assert_eq!(
+                processed.payment_outcome,
+                crate::ListMessagePaymentOutcome::Unprocessable
+            );
+            assert_eq!(processed.inner_body, "inner");
+            assert_eq!(
+                processed.raw_payment_envelope.as_deref(),
+                Some(raw.as_str())
+            );
+        }
+        assert!(wallet.internalize_observations().is_empty());
     }
 
     #[test]

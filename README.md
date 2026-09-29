@@ -92,6 +92,9 @@ client.acknowledge_message(ids, None).await?;
 `Unprocessable`, `raw_payment_envelope` is the byte-exact outer body returned by
 the relay, suitable for durable retention and retry. The lite detailed API uses
 `PaymentAwareServerPeerMessage` and reports every present payment as `Skipped`.
+An outer stored body above the protocol's 4 MiB MessageBox limit is instead
+`Unprocessable` with a short marker body and no retained raw copy, preventing an
+oversized hostile envelope from being parsed or duplicated in memory.
 
 The legacy `list_messages` and `list_messages_lite` signatures remain available.
 They preserve their historical inner-body result for messages with no payment or

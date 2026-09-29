@@ -29,8 +29,48 @@ struct NotificationPayment {
 #[serde(rename_all = "camelCase")]
 struct NotificationPaymentOutput {
     output_index: Option<u32>,
-    protocol: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_notification_output_protocol")]
+    protocol: NotificationOutputProtocol,
     payment_remittance: Option<NotificationPaymentRemittance>,
+}
+
+#[derive(Default)]
+enum NotificationOutputProtocol {
+    #[default]
+    Missing,
+    ExplicitNull,
+    Value(String),
+}
+
+impl NotificationOutputProtocol {
+    fn is_wallet_payment_compatible(&self) -> bool {
+        match self {
+            Self::Missing => true,
+            Self::Value(protocol) => protocol == "wallet payment",
+            Self::ExplicitNull => false,
+        }
+    }
+
+    fn unsupported_label(&self) -> Option<&str> {
+        match self {
+            Self::ExplicitNull => Some("null"),
+            Self::Value(protocol) if protocol != "wallet payment" => Some(protocol),
+            Self::Missing | Self::Value(_) => None,
+        }
+    }
+}
+
+fn deserialize_notification_output_protocol<'de, D>(
+    deserializer: D,
+) -> Result<NotificationOutputProtocol, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let protocol = <Option<String> as serde::Deserialize>::deserialize(deserializer)?;
+    Ok(match protocol {
+        Some(protocol) => NotificationOutputProtocol::Value(protocol),
+        None => NotificationOutputProtocol::ExplicitNull,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -514,16 +554,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             None => "MessageBox recipient payment".to_string(),
         };
 
-        let has_supported_output = outputs.iter().any(|output| {
-            output.protocol.as_deref() == Some("wallet payment") || output.protocol.is_none()
-        });
+        let has_supported_output = outputs
+            .iter()
+            .any(|output| output.protocol.is_wallet_payment_compatible());
         if has_supported_output {
-            if let Some(protocol) = outputs.iter().find_map(|output| {
-                output
-                    .protocol
-                    .as_deref()
-                    .filter(|protocol| *protocol != "wallet payment")
-            }) {
+            if let Some(protocol) = outputs
+                .iter()
+                .find_map(|output| output.protocol.unsupported_label())
+            {
                 return Err(MessageBoxError::Validation(format!(
                     "notification payment mixes wallet-payment outputs with unsupported protocol `{protocol}`"
                 )));
@@ -534,9 +572,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let mut internalize_outputs = Vec::with_capacity(outputs.len());
         for o in outputs {
-            // Admit `protocol: "wallet payment"` AND an absent `protocol`; skip
-            // anything else (e.g. `basket insertion`, not yet supported here).
-            if o.protocol.as_deref() != Some("wallet payment") && o.protocol.is_some() {
+            // Admit `protocol: "wallet payment"` AND a genuinely absent
+            // `protocol`; explicit null and other protocols stay unsupported.
+            if !o.protocol.is_wallet_payment_compatible() {
                 continue;
             }
             let output_index = o.output_index.ok_or_else(|| {
@@ -1507,6 +1545,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acknowledge_notification_keeps_explicit_null_protocol_queued() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let mut output = notification_wallet_output(&sender_identity_key);
+        output["protocol"] = serde_json::Value::Null;
+        let message = notification_message(
+            "notification-null-protocol",
+            &sender_identity_key,
+            serde_json::json!({ "tx": [1, 2, 3], "outputs": [output] }),
+        );
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(!result.unwrap(), "null protocol is unsupported");
+        assert!(observed_wallet.internalize_originators().is_empty());
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_mixed_wallet_and_null_protocols() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let wallet_output = notification_wallet_output(&sender_identity_key);
+        let mut null_output = notification_wallet_output(&sender_identity_key);
+        null_output["protocol"] = serde_json::Value::Null;
+        let message = notification_message(
+            "notification-mixed-wallet-null-protocol",
+            &sender_identity_key,
+            serde_json::json!({
+                "tx": [1, 2, 3],
+                "outputs": [wallet_output, null_output],
+            }),
+        );
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("null")),
+            "mixed null protocol must surface clearly, got {result:?}"
+        );
+        assert!(observed_wallet.internalize_originators().is_empty());
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn acknowledge_notification_rejects_missing_required_output_fields() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -2384,9 +2489,9 @@ mod tests {
     /// #279 regression: an output whose `protocol` field is ABSENT must still be
     /// internalized, and must NOT be acknowledged if internalization fails.
     ///
-    /// A stricter `protocol != Some("wallet payment")` filter silently drops these and
-    /// then acks, which reintroduces exactly the loss #279 closes. `http_ops.rs`'s
-    /// sibling internalize path admits absent-protocol outputs for the same reason.
+    /// A strict `protocol == Some("wallet payment")` filter would drop this output
+    /// and return `Ok(false)` without acknowledging. `http_ops.rs`'s sibling
+    /// internalize path also admits absent-protocol outputs.
     #[tokio::test]
     async fn acknowledge_notification_internalizes_output_with_absent_protocol() {
         use std::sync::atomic::{AtomicBool, Ordering};

@@ -409,15 +409,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// is the durability backstop, so a notification carrying a payment may leave the
     /// relay only after the wallet has reported `accepted: true`.
     ///
-    /// - No payment envelope: acknowledged, returns `Ok(false)`.
+    /// - Body is not an object, lacks its own `message` member, or has no payment:
+    ///   acknowledged without inspecting `payment`, returns `Ok(false)`.
     /// - Payment present but nothing internalizable (missing `tx`/`outputs`, or only
     ///   unsupported output protocols such as `basket insertion`): **not** acknowledged,
     ///   returns `Ok(false)`. Acknowledging would discard the payment.
-    /// - A malformed non-null `payment` member, empty transaction, invalid nested
-    ///   `paymentRemittance`, or a mixture of supported and unsupported output
-    ///   protocols: **not** acknowledged, returns `Err`.
+    /// - A malformed non-null `payment` member, transaction outside 1..=32 MiB,
+    ///   more than 101 outputs, invalid description or nested `paymentRemittance`,
+    ///   or a mixture of supported and unsupported output protocols: **not**
+    ///   acknowledged, returns `Err`.
     /// - Internalize error, wallet declines, or an output cannot be built (missing
-    ///   required fields or bad `senderIdentityKey`): **not** acknowledged, returns `Err`.
+    ///   required fields or non-compressed/invalid `senderIdentityKey`): **not**
+    ///   acknowledged, returns `Err`.
     /// - Stored and acknowledged: `Ok(true)`.
     ///
     /// Deliberate TS differences: outputs whose `protocol` field is absent are
@@ -455,7 +458,16 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 return Ok(false);
             }
         };
-        let Some(payment_value) = body.get("payment").filter(|value| !value.is_null()) else {
+        let Some(body_object) = body.as_object() else {
+            acknowledge().await?;
+            return Ok(false);
+        };
+        if !body_object.contains_key("message") {
+            acknowledge().await?;
+            return Ok(false);
+        }
+        let Some(payment_value) = body_object.get("payment").filter(|value| !value.is_null())
+        else {
             acknowledge().await?;
             return Ok(false);
         };
@@ -473,6 +485,34 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 "notification payment transaction is empty".into(),
             ));
         }
+        if tx.len() > 32 * 1024 * 1024 {
+            return Err(MessageBoxError::Validation(
+                "notification payment transaction exceeds 32 MiB".into(),
+            ));
+        }
+        if outputs.len() > 101 {
+            return Err(MessageBoxError::Validation(
+                "notification payment exceeds 101 outputs".into(),
+            ));
+        }
+        let description = match payment.description {
+            Some(description) => {
+                let has_control = description.chars().any(|character| {
+                    matches!(character, '\u{0000}'..='\u{001f}' | '\u{007f}'..='\u{009f}')
+                });
+                if description.is_empty()
+                    || description.trim() != description
+                    || description.len() > 50
+                    || has_control
+                {
+                    return Err(MessageBoxError::Validation(
+                        "notification payment description must be nonempty, already trimmed, at most 50 UTF-8 bytes, and contain no C0/C1 controls".into(),
+                    ));
+                }
+                description
+            }
+            None => "MessageBox recipient payment".to_string(),
+        };
 
         let has_supported_output = outputs.iter().any(|output| {
             output.protocol.as_deref() == Some("wallet payment") || output.protocol.is_none()
@@ -519,6 +559,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     "notification paymentRemittance is missing derivationSuffix".into(),
                 )
             })?;
+            let derivation_prefix = derivation_prefix.trim();
+            if derivation_prefix.is_empty() {
+                return Err(MessageBoxError::Validation(
+                    "notification derivationPrefix must not be empty".into(),
+                ));
+            }
+            let derivation_suffix = derivation_suffix.trim();
+            if derivation_suffix.is_empty() {
+                return Err(MessageBoxError::Validation(
+                    "notification derivationSuffix must not be empty".into(),
+                ));
+            }
             let derivation_prefix = STANDARD.decode(derivation_prefix).map_err(|e| {
                 MessageBoxError::Validation(format!(
                     "invalid notification derivationPrefix base64: {e}"
@@ -529,17 +581,32 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     "invalid notification derivationSuffix base64: {e}"
                 ))
             })?;
-            let sender_pk = remittance
-                .sender_identity_key
-                .as_deref()
-                .ok_or_else(|| {
-                    MessageBoxError::Wallet("payment output has no senderIdentityKey".into())
-                })
-                .and_then(|k| {
-                    bsv::primitives::public_key::PublicKey::from_string(k).map_err(|e| {
-                        MessageBoxError::Wallet(format!("invalid senderIdentityKey: {e}"))
-                    })
+            let sender_identity_key =
+                remittance.sender_identity_key.as_deref().ok_or_else(|| {
+                    MessageBoxError::Validation(
+                        "notification paymentRemittance is missing senderIdentityKey".into(),
+                    )
                 })?;
+            if sender_identity_key.len() != 66
+                || (!sender_identity_key.starts_with("02")
+                    && !sender_identity_key.starts_with("03"))
+                || !sender_identity_key
+                    .as_bytes()
+                    .iter()
+                    .all(u8::is_ascii_hexdigit)
+            {
+                return Err(MessageBoxError::Validation(
+                    "notification senderIdentityKey must be exactly 66 ASCII hex characters with prefix 02 or 03".into(),
+                ));
+            }
+            let sender_pk = bsv::primitives::public_key::PublicKey::from_string(
+                sender_identity_key,
+            )
+            .map_err(|e| {
+                MessageBoxError::Validation(format!(
+                    "invalid notification senderIdentityKey point: {e}"
+                ))
+            })?;
             internalize_outputs.push(InternalizeOutput::WalletPayment {
                 output_index,
                 payment: Payment {
@@ -558,9 +625,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .internalize_action(
                 InternalizeActionArgs {
                     tx,
-                    description: payment
-                        .description
-                        .unwrap_or_else(|| "MessageBox recipient payment".to_string()),
+                    description,
                     labels: Some(vec!["notification-payment".to_string()]),
                     seek_permission: bsv::wallet::types::BooleanDefaultTrue(Some(false)),
                     outputs: internalize_outputs,
@@ -688,6 +753,32 @@ mod tests {
             .expect("get_public_key")
             .public_key
             .to_der_hex()
+        }
+    }
+
+    fn notification_wallet_output(sender_identity_key: &str) -> serde_json::Value {
+        serde_json::json!({
+            "outputIndex": 0,
+            "protocol": "wallet payment",
+            "paymentRemittance": {
+                "derivationPrefix": "BAU=",
+                "derivationSuffix": "Bgc=",
+                "senderIdentityKey": sender_identity_key,
+            },
+        })
+    }
+
+    fn notification_message(
+        message_id: &str,
+        sender: &str,
+        payment: serde_json::Value,
+    ) -> PeerMessage {
+        PeerMessage {
+            message_id: message_id.to_string(),
+            sender: sender.to_string(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({ "message": {}, "payment": payment }).to_string(),
         }
     }
 
@@ -1252,6 +1343,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn acknowledge_notification_acks_non_notification_json_without_inspecting_payment() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for (case, body) in [
+            (
+                "payment-only-object",
+                serde_json::json!({
+                    "payment": {
+                        "tx": [1, 2, 3],
+                        "outputs": [notification_wallet_output("not-inspected")],
+                    },
+                }),
+            ),
+            (
+                "array",
+                serde_json::json!([{
+                    "message": {},
+                    "payment": { "tx": [1, 2, 3], "outputs": [] },
+                }]),
+            ),
+            ("scalar", serde_json::json!("ordinary message")),
+        ] {
+            let wallet = ArcWallet::internalize_answering(true);
+            let observed_wallet = wallet.clone();
+            let client = client_for(wallet);
+            let message = PeerMessage {
+                message_id: format!("non-notification-{case}"),
+                sender: "sender".to_string(),
+                recipient: "recipient".to_string(),
+                message_box: "notifications".to_string(),
+                body: body.to_string(),
+            };
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+            let result = client
+                .acknowledge_notification_with_ack(&message, move || async move {
+                    acknowledged_by_relay.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert!(!result.unwrap(), "{case} is not a notification wrapper");
+            assert!(acknowledged.load(Ordering::SeqCst), "{case} must be acked");
+            assert!(
+                observed_wallet.internalize_originators().is_empty(),
+                "{case} payment member must not be inspected"
+            );
+        }
+    }
+
     /// TS 2.5.1 parity: a payment the client cannot store stays on the relay.
     /// Basket-insertion outputs are contract-valid but not yet supported, so the
     /// message must not be acknowledged — acknowledging discards the payment.
@@ -1438,6 +1581,8 @@ mod tests {
             ("missing-remittance", "paymentRemittance"),
             ("missing-prefix", "derivationPrefix"),
             ("missing-suffix", "derivationSuffix"),
+            ("empty-prefix", "derivationPrefix must not be empty"),
+            ("blank-suffix", "derivationSuffix must not be empty"),
             ("invalid-prefix", "derivationPrefix base64"),
             ("invalid-suffix", "derivationSuffix base64"),
         ] {
@@ -1470,6 +1615,13 @@ mod tests {
                         .as_object_mut()
                         .expect("payment remittance object")
                         .remove("derivationSuffix");
+                }
+                "empty-prefix" => {
+                    output_object["paymentRemittance"]["derivationPrefix"] = serde_json::json!("");
+                }
+                "blank-suffix" => {
+                    output_object["paymentRemittance"]["derivationSuffix"] =
+                        serde_json::json!("   ");
                 }
                 "invalid-prefix" => {
                     output_object["paymentRemittance"]["derivationPrefix"] =
@@ -1563,6 +1715,119 @@ mod tests {
         );
         assert!(observed_wallet.internalize_originators().is_empty());
         assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_oversized_transaction_before_internalizing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let message = notification_message(
+            "notification-oversized-tx",
+            &sender_identity_key,
+            serde_json::json!({
+                "tx": vec![0u8; 32 * 1024 * 1024 + 1],
+                "outputs": [notification_wallet_output(&sender_identity_key)],
+            }),
+        );
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("32 MiB")),
+            "oversized transaction must surface a clear error, got {result:?}"
+        );
+        assert!(observed_wallet.internalize_originators().is_empty());
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_too_many_outputs_before_internalizing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let outputs: Vec<_> = (0..102)
+            .map(|_| notification_wallet_output(&sender_identity_key))
+            .collect();
+        let message = notification_message(
+            "notification-too-many-outputs",
+            &sender_identity_key,
+            serde_json::json!({ "tx": [1, 2, 3], "outputs": outputs }),
+        );
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("101 outputs")),
+            "102 outputs must surface a clear error, got {result:?}"
+        );
+        assert!(observed_wallet.internalize_originators().is_empty());
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_invalid_descriptions_before_internalizing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for (case, description) in [
+            ("empty", String::new()),
+            ("leading-space", " leading".to_string()),
+            ("trailing-space", "trailing ".to_string()),
+            ("over-50-bytes", "a".repeat(51)),
+            ("over-50-utf8-bytes", "é".repeat(26)),
+            ("c0-control", "bad\u{001f}description".to_string()),
+            ("c1-control", "bad\u{0085}description".to_string()),
+        ] {
+            let wallet = ArcWallet::internalize_answering(true);
+            let sender_identity_key = wallet.identity_hex().await;
+            let observed_wallet = wallet.clone();
+            let client = client_for(wallet);
+            let message = notification_message(
+                &format!("notification-description-{case}"),
+                &sender_identity_key,
+                serde_json::json!({
+                    "tx": [1, 2, 3],
+                    "description": description,
+                    "outputs": [notification_wallet_output(&sender_identity_key)],
+                }),
+            );
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+            let result = client
+                .acknowledge_notification_with_ack(&message, move || async move {
+                    acknowledged_by_relay.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert!(
+                matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("description")),
+                "{case} description must surface a clear error, got {result:?}"
+            );
+            assert!(observed_wallet.internalize_originators().is_empty());
+            assert!(!acknowledged.load(Ordering::SeqCst));
+        }
     }
 
     #[tokio::test]
@@ -1891,13 +2156,60 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(MessageBoxError::Wallet(_))),
+            matches!(result, Err(MessageBoxError::Validation(_))),
             "bad sender key must surface as an error, got {result:?}"
         );
         assert!(
             !acknowledged.load(Ordering::SeqCst),
             "message must stay on the relay when an output cannot be built"
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_requires_compressed_sender_identity_key() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let identity_wallet = ArcWallet::new();
+        let compressed_key = identity_wallet.identity_hex().await;
+        let parsed_key = PublicKey::from_string(&compressed_key).expect("compressed public key");
+        let cases = [
+            (
+                "uncompressed",
+                bsv::primitives::utils::to_hex(&parsed_key.to_der_uncompressed()),
+            ),
+            ("invalid-hex", format!("02{}", "gg".repeat(32))),
+            ("invalid-point", format!("02{}", "00".repeat(32))),
+        ];
+
+        for (case, sender_identity_key) in cases {
+            let wallet = ArcWallet::internalize_answering(true);
+            let observed_wallet = wallet.clone();
+            let client = client_for(wallet);
+            let message = notification_message(
+                &format!("notification-{case}-sender-key"),
+                "sender",
+                serde_json::json!({
+                    "tx": [1, 2, 3],
+                    "outputs": [notification_wallet_output(&sender_identity_key)],
+                }),
+            );
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+            let result = client
+                .acknowledge_notification_with_ack(&message, move || async move {
+                    acknowledged_by_relay.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert!(
+                matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("senderIdentityKey")),
+                "{case} key must be rejected clearly, got {result:?}"
+            );
+            assert!(observed_wallet.internalize_originators().is_empty());
+            assert!(!acknowledged.load(Ordering::SeqCst));
+        }
     }
 
     // ---- accept_payment / reject_payment ordering (ts-stack #534 parity) ----

@@ -35,7 +35,11 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     away. This error result deliberately differs from TS, which resolves `false`;
     both retain the payment. Notifications with no payment envelope are still
     acknowledged. Rust also deliberately accepts absent output `protocol`, which TS
-    skips.
+    skips. The notification gate now matches TS: only an object with its own
+    `message` member can expose a payment for internalization. Notification payments
+    also enforce the TS transaction (1..=32 MiB), output-count (at most 101),
+    description (trimmed, nonempty, at most 50 UTF-8 bytes, no C0/C1 controls),
+    nonempty base64, and compressed 66-hex-character sender-key constraints.
   Endpoint and wire-schema compatibility are unchanged. Acknowledgement is not an
   atomic multi-host transaction: the existing fan-out reports success when any host
   succeeds, so failed hosts can retain copies after a partial acknowledgement.

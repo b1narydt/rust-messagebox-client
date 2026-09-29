@@ -389,8 +389,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///   returns `Ok(false)`. Acknowledging would discard the payment.
     /// - A malformed non-null `payment` member, or a mixture of supported and
     ///   unsupported output protocols: **not** acknowledged, returns `Err`.
-    /// - Internalize error, wallet declines, or an output cannot be built (bad
-    ///   `senderIdentityKey`): **not** acknowledged, returns `Err`.
+    /// - Internalize error, wallet declines, or an output cannot be built (missing
+    ///   required fields or bad `senderIdentityKey`): **not** acknowledged, returns `Err`.
     /// - Stored and acknowledged: `Ok(true)`.
     ///
     /// Exceeds TS in one place: outputs whose `protocol` field is absent are admitted
@@ -464,6 +464,21 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             if o.protocol.as_deref() != Some("wallet payment") && o.protocol.is_some() {
                 continue;
             }
+            let output_index = o.output_index.ok_or_else(|| {
+                MessageBoxError::Validation(
+                    "notification payment output is missing outputIndex".into(),
+                )
+            })?;
+            let derivation_prefix = o.derivation_prefix.ok_or_else(|| {
+                MessageBoxError::Validation(
+                    "notification payment output is missing derivationPrefix".into(),
+                )
+            })?;
+            let derivation_suffix = o.derivation_suffix.ok_or_else(|| {
+                MessageBoxError::Validation(
+                    "notification payment output is missing derivationSuffix".into(),
+                )
+            })?;
             let sender_pk = o
                 .sender_identity_key
                 .as_deref()
@@ -476,10 +491,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     })
                 })?;
             internalize_outputs.push(InternalizeOutput::WalletPayment {
-                output_index: o.output_index.unwrap_or(0),
+                output_index,
                 payment: Payment {
-                    derivation_prefix: o.derivation_prefix.unwrap_or_default(),
-                    derivation_suffix: o.derivation_suffix.unwrap_or_default(),
+                    derivation_prefix,
+                    derivation_suffix,
                     sender_identity_key: sender_pk,
                 },
             });
@@ -1285,6 +1300,66 @@ mod tests {
             "supported outputs must not be partially internalized"
         );
         assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_missing_required_output_fields() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for (field, expected_error_field) in [
+            ("outputIndex", "outputIndex"),
+            ("derivationPrefix", "derivationPrefix"),
+            ("derivationSuffix", "derivationSuffix"),
+        ] {
+            let wallet = ArcWallet::internalize_answering(true);
+            let sender_identity_key = wallet.identity_hex().await;
+            let observed_wallet = wallet.clone();
+            let client = client_for(wallet);
+            let mut output = serde_json::json!({
+                "outputIndex": 0,
+                "protocol": "wallet payment",
+                "derivationPrefix": [4, 5],
+                "derivationSuffix": [6, 7],
+                "senderIdentityKey": sender_identity_key,
+            });
+            output
+                .as_object_mut()
+                .expect("payment output object")
+                .remove(field);
+            let message = PeerMessage {
+                message_id: format!("notification-missing-{field}"),
+                sender: sender_identity_key,
+                recipient: "recipient".to_string(),
+                message_box: "notifications".to_string(),
+                body: serde_json::json!({
+                    "message": {},
+                    "payment": { "tx": [1, 2, 3], "outputs": [output] },
+                })
+                .to_string(),
+            };
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+            let result = client
+                .acknowledge_notification_with_ack(&message, move || async move {
+                    acknowledged_by_relay.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert!(
+                matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains(expected_error_field)),
+                "missing {field} must surface a clear error, got {result:?}"
+            );
+            assert!(
+                observed_wallet.internalize_originators().is_empty(),
+                "missing {field} must fail before internalization"
+            );
+            assert!(
+                !acknowledged.load(Ordering::SeqCst),
+                "missing {field} must remain queued"
+            );
+        }
     }
 
     #[tokio::test]

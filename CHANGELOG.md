@@ -12,16 +12,19 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Payment ordering now matches TS `@bsv/message-box-client` 2.5.1 / ts-stack #534**
-  (`src/peer_pay.rs`, Atlas-Documentation#279). Every payment-bearing path stores the
-  payment before the relay message is acknowledged, and a wallet answer of
-  `accepted: false` is a failure rather than a success:
+  (`src/peer_pay.rs`, Atlas-Documentation#279). Notification and payment-acceptance
+  paths, plus refund-eligible rejection paths, store the payment before the relay
+  message is acknowledged, and a wallet answer of `accepted: false` is a failure
+  rather than a success:
   - `accept_payment` returns `Err` and leaves the message queued when the wallet
     declines. Previously any `Ok` from `internalize_action` was treated as stored.
   - `reject_payment` now internalizes → refunds → makes one logical acknowledgement
     attempt. Previously it acknowledged before the refund (a failed refund stranded
     the sender with the queue record gone) and swallowed a 401 on the refund send as
     success. There is no durable refund journal: an uncertain refund send must be
-    reconciled before retry, or a retry can refund again.
+    reconciled before retry, or a retry can refund again. The existing
+    too-small-to-refund policy remains: payments below 2000 sats are acknowledged
+    without internalization because the refund after fees would be non-positive.
   - `acknowledge_notification` keeps a payment on the relay when nothing in it can
     be stored (missing `tx`/`outputs`, only unsupported protocols such as
     `basket insertion`) and returns `Err` on malformed payment fields, an
@@ -31,8 +34,6 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Endpoint and wire-schema compatibility are unchanged. Acknowledgement is not an
   atomic multi-host transaction: the existing fan-out reports success when any host
   succeeds, so failed hosts can retain copies after a partial acknowledgement.
-
-### Fixed
 
 - **Half-open WebSocket detection (issue #7)** (`src/websocket.rs`, `src/client.rs`).
   A black-holed socket (peer gone, no TCP FIN) was previously invisible until the

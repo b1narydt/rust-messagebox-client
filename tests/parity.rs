@@ -9,11 +9,12 @@
 //! logical relay acknowledgement attempt; refund-eligible rejection also refunds
 //! before acknowledging. Under the existing too-small-to-refund policy,
 //! `reject_payment` below 2000 sats intentionally acknowledges without internalizing.
-//! One deliberate divergence remains: `acknowledge_notification` admits outputs
-//! whose `protocol` field is absent (TS drops them). Endpoint and wire-schema
-//! compatibility are unchanged. This does not provide an atomic multi-host
-//! acknowledgement or a durable refund journal; partial host acknowledgement and
-//! refund retry ambiguity remain.
+//! Deliberate behavior divergences include: `acknowledge_notification` admits outputs
+//! whose `protocol` field is absent (TS drops them), and Rust surfaces
+//! malformed/declined/internalize failures as `Err` while TS resolves `false`; both
+//! retain the payment. Endpoint and wire-schema compatibility are unchanged. This
+//! does not provide an atomic multi-host acknowledgement or a durable refund journal;
+//! partial host acknowledgement and refund retry ambiguity remain.
 //! See src/peer_pay.rs and Atlas-Documentation#279.
 //!
 //! Method count: 33 MessageBoxClient + 7 PeerPayClient = 40 total

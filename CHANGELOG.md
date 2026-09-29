@@ -27,10 +27,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     without internalization because the refund after fees would be non-positive.
   - `acknowledge_notification` keeps a payment on the relay when nothing in it can
     be stored (missing `tx`/`outputs`, only unsupported protocols such as
-    `basket insertion`) and returns `Err` on malformed payment fields, an
-    unparseable `senderIdentityKey`, or mixed supported/unsupported output protocols,
-    instead of acknowledging the payment away. Notifications with no payment
-    envelope are still acknowledged.
+    `basket insertion`) and consumes the current nested
+    `outputs[].paymentRemittance` wire shape, decoding its base64 derivation fields
+    before wallet internalization. It returns `Err` on an empty transaction,
+    malformed/missing remittance, invalid base64 or identity key, or mixed
+    supported/unsupported output protocols, instead of acknowledging the payment
+    away. This error result deliberately differs from TS, which resolves `false`;
+    both retain the payment. Notifications with no payment envelope are still
+    acknowledged. Rust also deliberately accepts absent output `protocol`, which TS
+    skips.
   Endpoint and wire-schema compatibility are unchanged. Acknowledgement is not an
   atomic multi-host transaction: the existing fan-out reports success when any host
   succeeds, so failed hosts can retain copies after a partial acknowledgement.

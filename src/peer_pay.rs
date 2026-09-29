@@ -15,6 +15,32 @@ use crate::client::MessageBoxClient;
 use crate::error::MessageBoxError;
 use crate::types::{IncomingPayment, PaymentCustomInstructions, PaymentToken};
 
+/// Notification delivery-payment wire shape used by current TS MessageBox clients.
+/// Kept local so the polling/list parser in `http_ops` can evolve independently.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationPayment {
+    tx: Option<Vec<u8>>,
+    outputs: Option<Vec<NotificationPaymentOutput>>,
+    description: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationPaymentOutput {
+    output_index: Option<u32>,
+    protocol: Option<String>,
+    payment_remittance: Option<NotificationPaymentRemittance>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationPaymentRemittance {
+    derivation_prefix: Option<String>,
+    derivation_suffix: Option<String>,
+    sender_identity_key: Option<String>,
+}
+
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Create a PeerPay payment token for `recipient` worth `amount` satoshis.
     ///
@@ -387,14 +413,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// - Payment present but nothing internalizable (missing `tx`/`outputs`, or only
     ///   unsupported output protocols such as `basket insertion`): **not** acknowledged,
     ///   returns `Ok(false)`. Acknowledging would discard the payment.
-    /// - A malformed non-null `payment` member, or a mixture of supported and
-    ///   unsupported output protocols: **not** acknowledged, returns `Err`.
+    /// - A malformed non-null `payment` member, empty transaction, invalid nested
+    ///   `paymentRemittance`, or a mixture of supported and unsupported output
+    ///   protocols: **not** acknowledged, returns `Err`.
     /// - Internalize error, wallet declines, or an output cannot be built (missing
     ///   required fields or bad `senderIdentityKey`): **not** acknowledged, returns `Err`.
     /// - Stored and acknowledged: `Ok(true)`.
     ///
-    /// Exceeds TS in one place: outputs whose `protocol` field is absent are admitted
-    /// (TS drops them). Endpoint and wire-schema compatibility are unchanged.
+    /// Deliberate TS differences: outputs whose `protocol` field is absent are
+    /// admitted, and malformed/declined/internalize failures return `Err` rather
+    /// than resolving `false`. Both implementations retain the payment in these
+    /// failure cases. Endpoint and wire-schema compatibility are unchanged.
     ///
     /// One logical acknowledgement is attempted after the monetary step. This is
     /// not a cross-host transaction: multi-host acknowledgement may partially
@@ -433,13 +462,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // Once a non-null top-level payment member is present, parse failures
         // are payment failures. Falling through to the no-payment branch would
         // acknowledge away value that the client could not inspect.
-        let payment =
-            serde_json::from_value::<crate::http_ops::ServerPayment>(payment_value.clone())?;
+        let payment = serde_json::from_value::<NotificationPayment>(payment_value.clone())?;
 
         // From here on a payment exists; it leaves the relay only once stored.
         let (Some(tx), Some(outputs)) = (payment.tx, payment.outputs) else {
             return Ok(false);
         };
+        if tx.is_empty() {
+            return Err(MessageBoxError::Validation(
+                "notification payment transaction is empty".into(),
+            ));
+        }
 
         let has_supported_output = outputs.iter().any(|output| {
             output.protocol.as_deref() == Some("wallet payment") || output.protocol.is_none()
@@ -457,6 +490,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
 
+        use base64::{engine::general_purpose::STANDARD, Engine};
+
         let mut internalize_outputs = Vec::with_capacity(outputs.len());
         for o in outputs {
             // Admit `protocol: "wallet payment"` AND an absent `protocol`; skip
@@ -469,17 +504,32 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     "notification payment output is missing outputIndex".into(),
                 )
             })?;
-            let derivation_prefix = o.derivation_prefix.ok_or_else(|| {
+            let remittance = o.payment_remittance.ok_or_else(|| {
                 MessageBoxError::Validation(
-                    "notification payment output is missing derivationPrefix".into(),
+                    "notification wallet-payment output is missing paymentRemittance".into(),
                 )
             })?;
-            let derivation_suffix = o.derivation_suffix.ok_or_else(|| {
+            let derivation_prefix = remittance.derivation_prefix.ok_or_else(|| {
                 MessageBoxError::Validation(
-                    "notification payment output is missing derivationSuffix".into(),
+                    "notification paymentRemittance is missing derivationPrefix".into(),
                 )
             })?;
-            let sender_pk = o
+            let derivation_suffix = remittance.derivation_suffix.ok_or_else(|| {
+                MessageBoxError::Validation(
+                    "notification paymentRemittance is missing derivationSuffix".into(),
+                )
+            })?;
+            let derivation_prefix = STANDARD.decode(derivation_prefix).map_err(|e| {
+                MessageBoxError::Validation(format!(
+                    "invalid notification derivationPrefix base64: {e}"
+                ))
+            })?;
+            let derivation_suffix = STANDARD.decode(derivation_suffix).map_err(|e| {
+                MessageBoxError::Validation(format!(
+                    "invalid notification derivationSuffix base64: {e}"
+                ))
+            })?;
+            let sender_pk = remittance
                 .sender_identity_key
                 .as_deref()
                 .ok_or_else(|| {
@@ -558,7 +608,7 @@ mod tests {
     struct ArcWallet(
         Arc<ProtoWallet>,
         InternalizeMode,
-        Arc<std::sync::Mutex<Vec<Option<String>>>>,
+        Arc<std::sync::Mutex<Vec<(InternalizeActionArgs, Option<String>)>>>,
     );
 
     impl ArcWallet {
@@ -590,6 +640,15 @@ mod tests {
         }
 
         fn internalize_originators(&self) -> Vec<Option<String>> {
+            self.2
+                .lock()
+                .expect("internalize observations")
+                .iter()
+                .map(|(_, originator)| originator.clone())
+                .collect()
+        }
+
+        fn internalize_observations(&self) -> Vec<(InternalizeActionArgs, Option<String>)> {
             self.2.lock().expect("internalize observations").clone()
         }
 
@@ -670,7 +729,7 @@ mod tests {
             self.2
                 .lock()
                 .expect("internalize observations")
-                .push(orig.map(str::to_owned));
+                .push((args.clone(), orig.map(str::to_owned)));
             match self.1 {
                 InternalizeMode::Passthrough => self.0.internalize_action(args, orig).await,
                 InternalizeMode::Fail(message) => Err(WalletError::Internal(message.to_string())),
@@ -1127,9 +1186,11 @@ mod tests {
                     "outputs": [{
                         "outputIndex": 0,
                         "protocol": "wallet payment",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": sender_identity_key,
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": sender_identity_key,
+                        },
                     }],
                 },
             })
@@ -1218,9 +1279,7 @@ mod tests {
                     "outputs": [{
                         "outputIndex": 0,
                         "protocol": "basket insertion",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": sender_identity_key,
+                        "insertionRemittance": { "basket": "notifications" },
                     }],
                 },
             })
@@ -1268,9 +1327,11 @@ mod tests {
                         {
                             "outputIndex": 0,
                             "protocol": "wallet payment",
-                            "derivationPrefix": [4, 5],
-                            "derivationSuffix": [6, 7],
-                            "senderIdentityKey": sender_identity_key,
+                            "paymentRemittance": {
+                                "derivationPrefix": "BAU=",
+                                "derivationSuffix": "Bgc=",
+                                "senderIdentityKey": sender_identity_key,
+                            },
                         },
                         {
                             "outputIndex": 1,
@@ -1318,14 +1379,21 @@ mod tests {
             let mut output = serde_json::json!({
                 "outputIndex": 0,
                 "protocol": "wallet payment",
-                "derivationPrefix": [4, 5],
-                "derivationSuffix": [6, 7],
-                "senderIdentityKey": sender_identity_key,
+                "paymentRemittance": {
+                    "derivationPrefix": "BAU=",
+                    "derivationSuffix": "Bgc=",
+                    "senderIdentityKey": sender_identity_key,
+                },
             });
-            output
-                .as_object_mut()
-                .expect("payment output object")
-                .remove(field);
+            let output_object = output.as_object_mut().expect("payment output object");
+            if field == "outputIndex" {
+                output_object.remove(field);
+            } else {
+                output_object["paymentRemittance"]
+                    .as_object_mut()
+                    .expect("payment remittance object")
+                    .remove(field);
+            }
             let message = PeerMessage {
                 message_id: format!("notification-missing-{field}"),
                 sender: sender_identity_key,
@@ -1360,6 +1428,141 @@ mod tests {
                 "missing {field} must remain queued"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_invalid_ts_remittance_before_internalizing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for (case, expected_error) in [
+            ("missing-remittance", "paymentRemittance"),
+            ("missing-prefix", "derivationPrefix"),
+            ("missing-suffix", "derivationSuffix"),
+            ("invalid-prefix", "derivationPrefix base64"),
+            ("invalid-suffix", "derivationSuffix base64"),
+        ] {
+            let wallet = ArcWallet::internalize_answering(true);
+            let sender_identity_key = wallet.identity_hex().await;
+            let observed_wallet = wallet.clone();
+            let client = client_for(wallet);
+            let mut output = serde_json::json!({
+                "outputIndex": 0,
+                "protocol": "wallet payment",
+                "paymentRemittance": {
+                    "derivationPrefix": "BAU=",
+                    "derivationSuffix": "Bgc=",
+                    "senderIdentityKey": sender_identity_key,
+                },
+            });
+            let output_object = output.as_object_mut().expect("payment output object");
+            match case {
+                "missing-remittance" => {
+                    output_object.remove("paymentRemittance");
+                }
+                "missing-prefix" => {
+                    output_object["paymentRemittance"]
+                        .as_object_mut()
+                        .expect("payment remittance object")
+                        .remove("derivationPrefix");
+                }
+                "missing-suffix" => {
+                    output_object["paymentRemittance"]
+                        .as_object_mut()
+                        .expect("payment remittance object")
+                        .remove("derivationSuffix");
+                }
+                "invalid-prefix" => {
+                    output_object["paymentRemittance"]["derivationPrefix"] =
+                        serde_json::json!("not base64");
+                }
+                "invalid-suffix" => {
+                    output_object["paymentRemittance"]["derivationSuffix"] =
+                        serde_json::json!("not base64");
+                }
+                _ => unreachable!(),
+            }
+            let message = PeerMessage {
+                message_id: format!("notification-{case}"),
+                sender: sender_identity_key,
+                recipient: "recipient".to_string(),
+                message_box: "notifications".to_string(),
+                body: serde_json::json!({
+                    "message": {},
+                    "payment": { "tx": [1, 2, 3], "outputs": [output] },
+                })
+                .to_string(),
+            };
+            let acknowledged = Arc::new(AtomicBool::new(false));
+            let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+            let result = client
+                .acknowledge_notification_with_ack(&message, move || async move {
+                    acknowledged_by_relay.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await;
+
+            assert!(
+                matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains(expected_error)),
+                "{case} must surface a clear error, got {result:?}"
+            );
+            assert!(
+                observed_wallet.internalize_originators().is_empty(),
+                "{case} must fail before internalization"
+            );
+            assert!(
+                !acknowledged.load(Ordering::SeqCst),
+                "{case} must remain queued"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_empty_transaction_before_internalizing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let message = PeerMessage {
+            message_id: "notification-empty-tx".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": {
+                    "tx": [],
+                    "outputs": [{
+                        "outputIndex": 0,
+                        "protocol": "wallet payment",
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": sender_identity_key,
+                        },
+                    }],
+                },
+            })
+            .to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("transaction is empty")),
+            "empty transaction must surface a clear error, got {result:?}"
+        );
+        assert!(observed_wallet.internalize_originators().is_empty());
+        assert!(!acknowledged.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1445,9 +1648,11 @@ mod tests {
                     "outputs": [{
                         "outputIndex": 0,
                         "protocol": "wallet payment",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": sender_identity_key,
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": sender_identity_key,
+                        },
                     }],
                 },
             })
@@ -1488,9 +1693,11 @@ mod tests {
                     "outputs": [{
                         "outputIndex": 0,
                         "protocol": "wallet payment",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": sender_identity_key,
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": sender_identity_key,
+                        },
                     }],
                 },
             })
@@ -1511,7 +1718,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acknowledge_notification_forwards_configured_originator() {
+    async fn acknowledge_notification_maps_ts_wire_and_forwards_originator() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let wallet = ArcWallet::internalize_answering(true);
         let sender_identity_key = wallet.identity_hex().await;
         let observed_wallet = wallet.clone();
@@ -1530,27 +1739,56 @@ mod tests {
                 "message": {},
                 "payment": {
                     "tx": [1, 2, 3],
+                    "description": "delivery fee",
                     "outputs": [{
-                        "outputIndex": 0,
+                        "outputIndex": 7,
                         "protocol": "wallet payment",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": sender_identity_key,
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": sender_identity_key,
+                        },
                     }],
                 },
             })
             .to_string(),
         };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
 
         let result = client
-            .acknowledge_notification_with_ack(&message, || async move { Ok(()) })
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
             .await;
 
         assert!(result.unwrap());
-        assert_eq!(
-            observed_wallet.internalize_originators(),
-            vec![Some("https://originator.example".to_string())]
-        );
+        assert!(acknowledged.load(Ordering::SeqCst));
+        let observations = observed_wallet.internalize_observations();
+        assert_eq!(observations.len(), 1);
+        let (args, originator) = &observations[0];
+        assert_eq!(args.tx, vec![1, 2, 3]);
+        assert_eq!(args.description, "delivery fee");
+        assert_eq!(args.labels, Some(vec!["notification-payment".to_string()]));
+        assert_eq!(args.seek_permission, BooleanDefaultTrue(Some(false)));
+        assert_eq!(originator.as_deref(), Some("https://originator.example"));
+        assert_eq!(args.outputs.len(), 1);
+        match &args.outputs[0] {
+            InternalizeOutput::WalletPayment {
+                output_index,
+                payment,
+            } => {
+                assert_eq!(*output_index, 7);
+                assert_eq!(payment.derivation_prefix, vec![4, 5]);
+                assert_eq!(payment.derivation_suffix, vec![6, 7]);
+                assert_eq!(
+                    payment.sender_identity_key.to_der_hex(),
+                    sender_identity_key
+                );
+            }
+            output => panic!("expected wallet-payment output, got {output:?}"),
+        }
     }
 
     /// A payment envelope with `outputs` but no `tx` is malformed, not absent:
@@ -1578,9 +1816,11 @@ mod tests {
                     "outputs": [{
                         "outputIndex": 0,
                         "protocol": "wallet payment",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": sender_identity_key,
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": sender_identity_key,
+                        },
                     }],
                 },
             })
@@ -1630,9 +1870,11 @@ mod tests {
                     "outputs": [{
                         "outputIndex": 0,
                         "protocol": "wallet payment",
-                        "derivationPrefix": [4, 5],
-                        "derivationSuffix": [6, 7],
-                        "senderIdentityKey": "not-a-key",
+                        "paymentRemittance": {
+                            "derivationPrefix": "BAU=",
+                            "derivationSuffix": "Bgc=",
+                            "senderIdentityKey": "not-a-key",
+                        },
                     }],
                 },
             })
@@ -1855,9 +2097,11 @@ mod tests {
                 "message": {},
                 "payment": { "tx": [1, 2, 3], "outputs": [{
                     "outputIndex": 0,
-                    "derivationPrefix": [4, 5],
-                    "derivationSuffix": [6, 7],
-                    "senderIdentityKey": sender_identity_key,
+                    "paymentRemittance": {
+                        "derivationPrefix": "BAU=",
+                        "derivationSuffix": "Bgc=",
+                        "senderIdentityKey": sender_identity_key,
+                    },
                 }]},
             })
             .to_string(),

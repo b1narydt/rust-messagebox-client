@@ -5,10 +5,13 @@
 //! Scope is the API SURFACE — names, arity, signatures. It does not assert behavioural
 //! parity. Payment ordering follows TS @bsv/message-box-client 2.5.1 (ts-stack #534):
 //! `accept_payment`, `reject_payment` and `acknowledge_notification` all internalize
-//! and require `accepted: true` before the relay message is acknowledged, and
-//! `reject_payment` refunds before acknowledging. One deliberate divergence remains:
-//! `acknowledge_notification` admits outputs whose `protocol` field is absent (TS
-//! drops them). Wire-compatible: same requests, same endpoints.
+//! and require `accepted: true` before making one logical relay acknowledgement
+//! attempt, and `reject_payment` refunds before acknowledging. One deliberate
+//! divergence remains: `acknowledge_notification` admits outputs whose `protocol`
+//! field is absent (TS drops them). Endpoint and wire-schema compatibility are
+//! unchanged. This does not provide an atomic multi-host acknowledgement or a
+//! durable refund journal; partial host acknowledgement and refund retry ambiguity
+//! remain.
 //! See src/peer_pay.rs and Atlas-Documentation#279.
 //!
 //! Method count: 33 MessageBoxClient + 7 PeerPayClient = 40 total

@@ -17,17 +17,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `accepted: false` is a failure rather than a success:
   - `accept_payment` returns `Err` and leaves the message queued when the wallet
     declines. Previously any `Ok` from `internalize_action` was treated as stored.
-  - `reject_payment` now internalizes → refunds → acknowledges once. Previously it
-    acknowledged before the refund (a failed refund stranded the sender with the
-    queue record gone) and swallowed a 401 on the refund send as success.
-    Refund/ack is still not exactly-once: an uncertain refund send must be
-    reconciled before retry (same caveat as TS).
+  - `reject_payment` now internalizes → refunds → makes one logical acknowledgement
+    attempt. Previously it acknowledged before the refund (a failed refund stranded
+    the sender with the queue record gone) and swallowed a 401 on the refund send as
+    success. There is no durable refund journal: an uncertain refund send must be
+    reconciled before retry, or a retry can refund again.
   - `acknowledge_notification` keeps a payment on the relay when nothing in it can
     be stored (missing `tx`/`outputs`, only unsupported protocols such as
-    `basket insertion`) and returns `Err` on an unparseable `senderIdentityKey`
-    instead of silently dropping the output and acknowledging the payment away.
-    Notifications with no payment envelope are still acknowledged.
-  Wire-compatible: same requests to the same endpoints in a safer order.
+    `basket insertion`) and returns `Err` on malformed payment fields, an
+    unparseable `senderIdentityKey`, or mixed supported/unsupported output protocols,
+    instead of acknowledging the payment away. Notifications with no payment
+    envelope are still acknowledged.
+  Endpoint and wire-schema compatibility are unchanged. Acknowledgement is not an
+  atomic multi-host transaction: the existing fan-out reports success when any host
+  succeeds, so failed hosts can retain copies after a partial acknowledgement.
 
 ### Fixed
 

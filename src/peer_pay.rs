@@ -387,17 +387,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// - Payment present but nothing internalizable (missing `tx`/`outputs`, or only
     ///   unsupported output protocols such as `basket insertion`): **not** acknowledged,
     ///   returns `Ok(false)`. Acknowledging would discard the payment.
+    /// - A malformed non-null `payment` member, or a mixture of supported and
+    ///   unsupported output protocols: **not** acknowledged, returns `Err`.
     /// - Internalize error, wallet declines, or an output cannot be built (bad
     ///   `senderIdentityKey`): **not** acknowledged, returns `Err`.
     /// - Stored and acknowledged: `Ok(true)`.
     ///
     /// Exceeds TS in one place: outputs whose `protocol` field is absent are admitted
-    /// (TS drops them). Wire-compatible — same requests, same endpoints.
+    /// (TS drops them). Endpoint and wire-schema compatibility are unchanged.
     ///
-    /// At-least-once is the contract: a replayed internalize collides on outpoint
-    /// uniqueness rather than double-crediting. The flip side, shared with TS, is
-    /// that a payment which can never be stored is never acknowledged; a polling
-    /// caller needs its own escape hatch for that.
+    /// One logical acknowledgement is attempted after the monetary step. This is
+    /// not a cross-host transaction: multi-host acknowledgement may partially
+    /// succeed because `acknowledge_message` succeeds when any host succeeds.
     pub async fn acknowledge_notification(
         &self,
         message: &PeerMessage,
@@ -418,16 +419,43 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), MessageBoxError>>,
     {
-        let parsed = serde_json::from_str::<crate::http_ops::WrappedMessageBody>(&message.body);
-        let Some(payment) = parsed.ok().and_then(|w| w.payment) else {
+        let body = match serde_json::from_str::<serde_json::Value>(&message.body) {
+            Ok(body) => body,
+            Err(_) => {
+                acknowledge().await?;
+                return Ok(false);
+            }
+        };
+        let Some(payment_value) = body.get("payment").filter(|value| !value.is_null()) else {
             acknowledge().await?;
             return Ok(false);
         };
+        // Once a non-null top-level payment member is present, parse failures
+        // are payment failures. Falling through to the no-payment branch would
+        // acknowledge away value that the client could not inspect.
+        let payment =
+            serde_json::from_value::<crate::http_ops::ServerPayment>(payment_value.clone())?;
 
         // From here on a payment exists; it leaves the relay only once stored.
         let (Some(tx), Some(outputs)) = (payment.tx, payment.outputs) else {
             return Ok(false);
         };
+
+        let has_supported_output = outputs.iter().any(|output| {
+            output.protocol.as_deref() == Some("wallet payment") || output.protocol.is_none()
+        });
+        if has_supported_output {
+            if let Some(protocol) = outputs.iter().find_map(|output| {
+                output
+                    .protocol
+                    .as_deref()
+                    .filter(|protocol| *protocol != "wallet payment")
+            }) {
+                return Err(MessageBoxError::Validation(format!(
+                    "notification payment mixes wallet-payment outputs with unsupported protocol `{protocol}`"
+                )));
+            }
+        }
 
         let mut internalize_outputs = Vec::with_capacity(outputs.len());
         for o in outputs {
@@ -512,7 +540,11 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct ArcWallet(Arc<ProtoWallet>, InternalizeMode);
+    struct ArcWallet(
+        Arc<ProtoWallet>,
+        InternalizeMode,
+        Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    );
 
     impl ArcWallet {
         fn new() -> Self {
@@ -520,6 +552,7 @@ mod tests {
             ArcWallet(
                 Arc::new(ProtoWallet::new(key)),
                 InternalizeMode::Passthrough,
+                Arc::new(std::sync::Mutex::new(Vec::new())),
             )
         }
 
@@ -528,6 +561,7 @@ mod tests {
             ArcWallet(
                 Arc::new(ProtoWallet::new(key)),
                 InternalizeMode::Fail(message),
+                Arc::new(std::sync::Mutex::new(Vec::new())),
             )
         }
 
@@ -536,7 +570,12 @@ mod tests {
             ArcWallet(
                 Arc::new(ProtoWallet::new(key)),
                 InternalizeMode::Answer { accepted },
+                Arc::new(std::sync::Mutex::new(Vec::new())),
             )
+        }
+
+        fn internalize_originators(&self) -> Vec<Option<String>> {
+            self.2.lock().expect("internalize observations").clone()
         }
 
         /// A well-formed PeerPay token from this wallet's identity, above the refund threshold.
@@ -613,6 +652,10 @@ mod tests {
             args: InternalizeActionArgs,
             orig: Option<&str>,
         ) -> Result<InternalizeActionResult, WalletError> {
+            self.2
+                .lock()
+                .expect("internalize observations")
+                .push(orig.map(str::to_owned));
             match self.1 {
                 InternalizeMode::Passthrough => self.0.internalize_action(args, orig).await,
                 InternalizeMode::Fail(message) => Err(WalletError::Internal(message.to_string())),
@@ -1182,6 +1225,256 @@ mod tests {
         assert!(
             !acknowledged.load(Ordering::SeqCst),
             "a payment with no internalizable outputs must stay on the relay"
+        );
+    }
+
+    /// A notification payment is an atomic unit for this client. If any output
+    /// uses an unsupported protocol, do not internalize the supported subset:
+    /// that would make a later retry ambiguous and could lose the unsupported
+    /// value when the relay message is acknowledged.
+    #[tokio::test]
+    async fn acknowledge_notification_rejects_mixed_output_protocols_before_internalizing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let message = PeerMessage {
+            message_id: "notification-with-mixed-outputs".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": {
+                    "tx": [1, 2, 3],
+                    "outputs": [
+                        {
+                            "outputIndex": 0,
+                            "protocol": "wallet payment",
+                            "derivationPrefix": [4, 5],
+                            "derivationSuffix": [6, 7],
+                            "senderIdentityKey": sender_identity_key,
+                        },
+                        {
+                            "outputIndex": 1,
+                            "protocol": "basket insertion"
+                        }
+                    ],
+                },
+            })
+            .to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Validation(ref m)) if m.contains("basket insertion")),
+            "unsupported protocol must surface clearly, got {result:?}"
+        );
+        assert!(
+            observed_wallet.internalize_originators().is_empty(),
+            "supported outputs must not be partially internalized"
+        );
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_keeps_non_object_payment_queued() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::failing_internalize("internalize must not be called");
+        let client = client_for(wallet);
+        let message = PeerMessage {
+            message_id: "notification-with-string-payment".to_string(),
+            sender: "sender".to_string(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({ "message": {}, "payment": "malformed" }).to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Json(_))),
+            "malformed payment member must surface a parse error, got {result:?}"
+        );
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_keeps_malformed_payment_fields_queued() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::failing_internalize("internalize must not be called");
+        let client = client_for(wallet);
+        let message = PeerMessage {
+            message_id: "notification-with-malformed-payment-fields".to_string(),
+            sender: "sender".to_string(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": { "tx": "not-a-byte-array", "outputs": [] }
+            })
+            .to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Json(_))),
+            "malformed payment fields must surface a parse error, got {result:?}"
+        );
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_keeps_message_when_wallet_declines() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let wallet = ArcWallet::internalize_answering(false);
+        let sender_identity_key = wallet.identity_hex().await;
+        let client = client_for(wallet);
+        let message = PeerMessage {
+            message_id: "notification-wallet-declined".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": {
+                    "tx": [1, 2, 3],
+                    "outputs": [{
+                        "outputIndex": 0,
+                        "protocol": "wallet payment",
+                        "derivationPrefix": [4, 5],
+                        "derivationSuffix": [6, 7],
+                        "senderIdentityKey": sender_identity_key,
+                    }],
+                },
+            })
+            .to_string(),
+        };
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let acknowledged_by_relay = Arc::clone(&acknowledged);
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, move || async move {
+                acknowledged_by_relay.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageBoxError::Wallet(ref m)) if m.contains("did not accept")),
+            "accepted:false must surface as an error, got {result:?}"
+        );
+        assert!(!acknowledged.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_propagates_ack_failure_after_internalizing() {
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let message = PeerMessage {
+            message_id: "notification-ack-failure".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": {
+                    "tx": [1, 2, 3],
+                    "outputs": [{
+                        "outputIndex": 0,
+                        "protocol": "wallet payment",
+                        "derivationPrefix": [4, 5],
+                        "derivationSuffix": [6, 7],
+                        "senderIdentityKey": sender_identity_key,
+                    }],
+                },
+            })
+            .to_string(),
+        };
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, || async move {
+                Err(MessageBoxError::Http(503, "relay unavailable".to_string()))
+            })
+            .await;
+
+        assert_eq!(observed_wallet.internalize_originators().len(), 1);
+        assert!(
+            matches!(result, Err(MessageBoxError::Http(503, ref m)) if m == "relay unavailable"),
+            "acknowledgement failure must propagate, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_notification_forwards_configured_originator() {
+        let wallet = ArcWallet::internalize_answering(true);
+        let sender_identity_key = wallet.identity_hex().await;
+        let observed_wallet = wallet.clone();
+        let client = crate::client::MessageBoxClient::new(
+            "https://example.com".to_string(),
+            wallet,
+            Some("https://originator.example".to_string()),
+            bsv::services::overlay_tools::Network::Mainnet,
+        );
+        let message = PeerMessage {
+            message_id: "notification-originator".to_string(),
+            sender: sender_identity_key.clone(),
+            recipient: "recipient".to_string(),
+            message_box: "notifications".to_string(),
+            body: serde_json::json!({
+                "message": {},
+                "payment": {
+                    "tx": [1, 2, 3],
+                    "outputs": [{
+                        "outputIndex": 0,
+                        "protocol": "wallet payment",
+                        "derivationPrefix": [4, 5],
+                        "derivationSuffix": [6, 7],
+                        "senderIdentityKey": sender_identity_key,
+                    }],
+                },
+            })
+            .to_string(),
+        };
+
+        let result = client
+            .acknowledge_notification_with_ack(&message, || async move { Ok(()) })
+            .await;
+
+        assert!(result.unwrap());
+        assert_eq!(
+            observed_wallet.internalize_originators(),
+            vec![Some("https://originator.example".to_string())]
         );
     }
 

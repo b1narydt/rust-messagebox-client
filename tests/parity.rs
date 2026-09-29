@@ -17,8 +17,9 @@
 //! partial host acknowledgement and refund retry ambiguity remain.
 //! See src/peer_pay.rs and Atlas-Documentation#279.
 //!
-//! Method count: 33 MessageBoxClient + 7 PeerPayClient = 40 total
-//! (TS reference: 33 MessageBoxClient + 7 PeerPayClient = 40 total)
+//! Method count: 35 MessageBoxClient + 7 PeerPayClient = 42 total.
+//! The TS-parity surface remains 40; Rust adds two source-compatible detailed
+//! list methods that preserve explicit payment outcomes and retry envelopes.
 //!
 //! ## TS → Rust method mapping
 //!
@@ -38,10 +39,12 @@
 //!   TS: initializeConnection()              → Rust: .initialize_connection(override_host)
 //!   TS: joinedRooms (Map accessor)          → Rust: .get_joined_rooms()
 //!
-//! ### HTTP Messaging (4)
+//! ### HTTP Messaging (6; 4 TS-parity + 2 Rust safety extensions)
 //!   TS: sendMessage(msg, opts?)             → Rust: .send_message(recipient, mb, body, skip_enc, check_perms, msg_id, override_host)
-//!   TS: listMessages(mb)                    → Rust: .list_messages(message_box, override_host)
+//!   TS: listMessages(mb)                    → Rust: .list_messages(message_box, accept_payments, override_host)
+//!   Rust safety extension                    → Rust: .list_messages_detailed(message_box, accept_payments, override_host)
 //!   TS: listMessagesLite(mb)                → Rust: .list_messages_lite(message_box, override_host)
+//!   Rust safety extension                    → Rust: .list_messages_lite_detailed(message_box, override_host)
 //!   TS: acknowledgeMessage(ids, host?)      → Rust: .acknowledge_message(ids, override_host)
 //!
 //! ### Multi-recipient (2)
@@ -93,7 +96,8 @@ use bsv::wallet::error::WalletError;
 use bsv::wallet::interfaces::*;
 use bsv::wallet::proto_wallet::ProtoWallet;
 use bsv_messagebox_client::{
-    FailedRecipient, MessageBoxClient, MessageBoxMultiQuote, PaymentCustomInstructions,
+    FailedRecipient, ListMessagePaymentOutcome, MessageBoxClient, MessageBoxMultiQuote,
+    PaymentAwarePeerMessage, PaymentAwareServerPeerMessage, PaymentCustomInstructions,
     PaymentToken, RecipientQuote, SendListParams, SendListResult, SendListTotals, SentRecipient,
 };
 
@@ -321,7 +325,7 @@ fn make_client() -> (MessageBoxClient<ArcWallet>, ArcWallet) {
 /// their existence and signature. Methods that cannot be called without a
 /// live server are referenced via type resolution / let-binding patterns.
 ///
-/// Covers all 33 MessageBoxClient methods + 7 PeerPayClient methods = 40 total.
+/// Covers all 35 MessageBoxClient methods + 7 PeerPayClient methods = 42 total.
 #[tokio::test]
 async fn parity_01_all_public_methods_exist() {
     let (client, _wallet) = make_client();
@@ -364,11 +368,25 @@ async fn parity_01_all_public_methods_exist() {
     // send_message(recipient, mb, body, skip_enc, check_perms, msg_id, override_host)
     let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::send_message);
 
-    // list_messages(message_box: &str, accept_payments: bool)
+    // list_messages(message_box: &str, accept_payments: bool, override_host: Option<&str>)
     let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::list_messages);
+    let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::list_messages_detailed);
 
-    // list_messages_lite(message_box: &str)
+    // list_messages_lite(message_box: &str, override_host: Option<&str>)
     let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::list_messages_lite);
+    let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::list_messages_lite_detailed);
+
+    // Public payment-aware receipt types and all six outcome states compile.
+    let _: Option<PaymentAwarePeerMessage> = None;
+    let _: Option<PaymentAwareServerPeerMessage> = None;
+    let _ = [
+        ListMessagePaymentOutcome::NoPayment,
+        ListMessagePaymentOutcome::Internalized,
+        ListMessagePaymentOutcome::Skipped,
+        ListMessagePaymentOutcome::Declined,
+        ListMessagePaymentOutcome::Failed,
+        ListMessagePaymentOutcome::Unprocessable,
+    ];
 
     // acknowledge_message(message_ids: Vec<String>, override_host: Option<&str>)
     let _ = std::mem::size_of_val(&MessageBoxClient::<ArcWallet>::acknowledge_message);

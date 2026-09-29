@@ -66,17 +66,38 @@ let message_id = client.send_message(
 ### Receiving Messages
 
 ```rust
-// List messages with automatic payment internalization
-let messages = client.list_messages("inbox", true).await?;
+// Prefer the detailed API when messages may carry recipient payments.
+let receipts = client.list_messages_detailed("inbox", true, None).await?;
 
-for msg in &messages {
-    println!("From: {}, Body: {}", msg.sender, msg.body);
+for receipt in &receipts {
+    println!(
+        "From: {}, Body: {}, Payment: {:?}",
+        receipt.message.sender,
+        receipt.message.body,
+        receipt.payment_outcome,
+    );
 }
 
-// Acknowledge (delete from server)
-let ids: Vec<String> = messages.iter().map(|m| m.message_id.clone()).collect();
+// Only acknowledge after the application accepts the reported outcome.
+let ids: Vec<String> = receipts
+    .iter()
+    .filter(|r| r.payment_outcome.payment_is_safe())
+    .map(|r| r.message.message_id.clone())
+    .collect();
 client.acknowledge_message(ids, None).await?;
 ```
+
+`PaymentAwarePeerMessage` keeps the normal decrypted inner `PeerMessage` plus a
+`ListMessagePaymentOutcome`. For `Skipped`, `Declined`, `Failed`, or
+`Unprocessable`, `raw_payment_envelope` is the byte-exact outer body returned by
+the relay, suitable for durable retention and retry. The lite detailed API uses
+`PaymentAwareServerPeerMessage` and reports every present payment as `Skipped`.
+
+The legacy `list_messages` and `list_messages_lite` signatures remain available.
+They preserve their historical inner-body result for messages with no payment or
+a successfully internalized payment. For every unsuccessful payment outcome they
+now return the exact raw wrapper in `body`, preventing callers from accidentally
+acknowledging away the only retry data.
 
 ### WebSocket Live Messaging
 
@@ -148,8 +169,10 @@ let comms: Arc<dyn CommsLayer + Send + Sync> = Arc::new(adapter);
 |--------|-------------|
 | `send_message(recipient, mb, body, skip_enc, check_perms, msg_id, host)` | Send encrypted message via HTTP |
 | `send_message_to_recipients(params, host)` | Batch send to multiple recipients |
-| `list_messages(mb, accept_payments)` | List messages with multi-host dedup |
-| `list_messages_lite(mb)` | List messages from default host only |
+| `list_messages(mb, accept_payments, host)` | Legacy list with multi-host dedup; unsuccessful payment wrappers remain in `body` |
+| `list_messages_detailed(mb, accept_payments, host)` | Payment-aware multi-host list with typed outcome and exact retry envelope |
+| `list_messages_lite(mb, host)` | Legacy list from one host; present payment wrappers remain in `body` |
+| `list_messages_lite_detailed(mb, host)` | Payment-aware single-host list; payments are reported as skipped |
 | `acknowledge_message(ids, host)` | Mark messages as read |
 
 #### WebSocket Live Messaging

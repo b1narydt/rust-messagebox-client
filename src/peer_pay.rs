@@ -1074,22 +1074,42 @@ mod tests {
     // Task 2 tests: accept_payment, reject_payment, list_incoming_payments
     // -----------------------------------------------------------------------
 
-    /// reject_payment with amount < 2000 should only ack (not accept/refund).
-    ///
-    /// We verify this by checking the logic path — since we can't intercept
-    /// internal calls, we test via the threshold boundary value.
-    #[test]
-    fn reject_payment_threshold_below_2000() {
-        // Verify the threshold value in the compiled code.
-        // The implementation uses `amount >= 2000` to decide accept + refund path.
-        // We document the boundary via assert_eq on the threshold constant itself.
-        const THRESHOLD: u64 = 2000;
-        assert_eq!(THRESHOLD, 2000, "threshold must be 2000 sats");
+    /// The existing too-small-to-refund policy acknowledges a 1999-sat payment
+    /// without internalizing it or invoking the refund path.
+    #[tokio::test]
+    async fn reject_payment_below_2000_only_acknowledges_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        // Verify refund amount calculation: amount - 1000
-        let amount: u64 = 3000;
-        let refund = amount - 1000;
-        assert_eq!(refund, 2000, "refund is amount minus 1000 sat fee");
+        let wallet = ArcWallet::internalize_answering(true);
+        let payment = wallet.incoming_payment(1999).await;
+        let observed_wallet = wallet.clone();
+        let client = client_for(wallet);
+        let refund_count = Arc::new(AtomicUsize::new(0));
+        let acknowledgement_count = Arc::new(AtomicUsize::new(0));
+        let refunds = Arc::clone(&refund_count);
+        let acknowledgements = Arc::clone(&acknowledgement_count);
+
+        client
+            .reject_payment_with(
+                &payment,
+                move |_amount| async move {
+                    refunds.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                move || async move {
+                    acknowledgements.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await
+            .expect("sub-threshold rejection succeeds");
+
+        assert!(
+            observed_wallet.internalize_originators().is_empty(),
+            "sub-threshold rejection must not internalize"
+        );
+        assert_eq!(refund_count.load(Ordering::SeqCst), 0);
+        assert_eq!(acknowledgement_count.load(Ordering::SeqCst), 1);
     }
 
     /// list_incoming_payments silently skips messages with invalid bodies.

@@ -89,9 +89,19 @@ struct ProcessedMessageBody {
 const MAX_PAYMENT_TX_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PAYMENT_OUTPUTS: usize = 101;
 const MAX_PAYMENT_DESCRIPTION_BYTES: usize = 50;
-/// Matches the MessageBox protocol's 4 MiB body limit. Apply it before JSON
-/// parsing so a hostile stored body cannot trigger an unbounded parse tree or a
-/// second retained copy. Oversized bodies are represented by a bounded marker.
+/// Maximum authenticated `/listMessages` response body accepted for one host.
+///
+/// 32 MiB matches the message-box server's largest bounded list-response profile
+/// (`highThroughput`) and admits multiple 4 MiB nested envelopes plus response
+/// metadata. This is checked before `check_status_error` or
+/// `ListMessagesResponse` deserialization. It cannot prevent `AuthFetch` from
+/// buffering the authenticated response frame first: bsv-sdk exposes the
+/// completed body as a `Vec<u8>`.
+const MAX_LIST_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+/// Conservative nested-envelope processing cap aligned with the server's 4 MiB
+/// HTTP JSON request ceiling. Apply it before nested JSON parsing so a hostile
+/// stored body cannot trigger an unbounded parse tree or a second retained copy.
+/// Oversized bodies are represented by a bounded marker.
 const MAX_LIST_MESSAGE_BODY_BYTES: usize = 4 * 1024 * 1024;
 const OVERSIZED_MESSAGE_BODY: &str = "[Message body exceeds the 4 MiB processing limit]";
 /// Send-side derivation nonces are 32 bytes, whose padded base64 form is 44 bytes.
@@ -100,6 +110,17 @@ const MAX_DERIVATION_BASE64_BYTES: usize = 44;
 const MAX_BASKET_FIELD_BYTES: usize = 300;
 const MAX_CUSTOM_INSTRUCTIONS_BYTES: usize = 1000;
 const MAX_BASKET_TAGS: usize = 10_000;
+
+fn parse_bounded_list_response(body: &[u8]) -> Result<ListMessagesResponse, MessageBoxError> {
+    if body.len() > MAX_LIST_RESPONSE_BYTES {
+        return Err(MessageBoxError::Validation(format!(
+            "listMessages response exceeds the {} MiB page limit",
+            MAX_LIST_RESPONSE_BYTES / (1024 * 1024)
+        )));
+    }
+    check_status_error(body)?;
+    Ok(serde_json::from_slice(body)?)
+}
 
 fn into_legacy_peer_message(receipt: PaymentAwarePeerMessage) -> PeerMessage {
     let mut message = receipt.message;
@@ -1052,9 +1073,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
         let response = self.post_json(&url, body_bytes).await?;
-        check_status_error(&response.body)?;
-
-        let list_response: ListMessagesResponse = serde_json::from_slice(&response.body)?;
+        // Strongest boundary available with AuthFetch: it has already buffered
+        // `body: Vec<u8>`, but no JSON inspection or second body copy has occurred here.
+        let list_response = parse_bounded_list_response(&response.body)?;
         let mut result = Vec::with_capacity(list_response.messages.len());
         for mut message in list_response.messages {
             let processed = self
@@ -1171,9 +1192,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
         let response = self.post_json(&url, body_bytes).await?;
-        check_status_error(&response.body)?;
-
-        let list_response: ListMessagesResponse = serde_json::from_slice(&response.body)?;
+        // Keep the full and lite host paths on the same pre-deserialization bound.
+        let list_response = parse_bounded_list_response(&response.body)?;
 
         let mut result = Vec::with_capacity(list_response.messages.len());
         for msg in list_response.messages {
@@ -1316,6 +1336,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 #[cfg(test)]
 mod tests {
     use crate::encryption::generate_message_id;
+    use crate::error::MessageBoxError;
     use crate::types::{
         AcknowledgeMessageParams, ListMessagesResponse, SendMessageParams, SendMessageRequest,
     };
@@ -1645,6 +1666,27 @@ mod tests {
         assert_eq!(resp.messages[0].message_id, "abc123");
         assert_eq!(resp.messages[0].body, "hello world");
         assert_eq!(resp.messages[0].sender, "03xyz");
+    }
+
+    /// The shared full/lite response parser accepts exactly the documented page
+    /// limit and rejects the next byte before either outer JSON parse runs.
+    #[test]
+    fn list_response_page_limit_is_inclusive_and_precedes_deserialization() {
+        let mut body = br#"{"status":"success","messages":[]}"#.to_vec();
+        body.resize(super::MAX_LIST_RESPONSE_BYTES, b' ');
+        assert_eq!(body.len(), super::MAX_LIST_RESPONSE_BYTES);
+
+        let parsed = super::parse_bounded_list_response(&body)
+            .expect("an exactly-at-limit valid response must parse");
+        assert!(parsed.messages.is_empty());
+
+        body.push(b' ');
+        let error = super::parse_bounded_list_response(&body)
+            .expect_err("one byte over the response limit must be rejected");
+        assert!(
+            matches!(error, MessageBoxError::Validation(ref message) if message.contains("32 MiB page limit")),
+            "unexpected error: {error:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

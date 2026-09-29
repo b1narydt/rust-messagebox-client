@@ -354,8 +354,9 @@ pub struct ServerPeerMessage {
 /// details that should not become part of a long-lived message receipt. Callers
 /// can distinguish a wallet error from a validation failure and retry using the
 /// byte-exact [`PaymentAwarePeerMessage::raw_payment_envelope`] (or lite
-/// equivalent). An outer body above the protocol's 4 MiB message limit is the
-/// sole exception: it is reported as `Unprocessable` with no retained raw copy.
+/// equivalent). An outer body above this crate's conservative 4 MiB nested-
+/// envelope processing cap is the sole exception: it is reported as
+/// `Unprocessable` with no retained raw copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListMessagePaymentOutcome {
     /// The stored body did not contain a non-null payment.
@@ -386,7 +387,10 @@ impl ListMessagePaymentOutcome {
 /// `raw_payment_envelope` contains the exact server body so a caller can retain
 /// and retry every payment field, including fields unknown to this crate. It is
 /// `None` for an oversized outer body, which is replaced by a bounded marker to
-/// avoid retaining attacker-controlled data above the 4 MiB protocol limit.
+/// avoid retaining attacker-controlled data above the 4 MiB processing cap.
+/// Host list responses are capped at 32 MiB before outer JSON deserialization,
+/// although bsv-sdk `AuthFetch` has already buffered the authenticated frame and
+/// copied its body into a `Vec<u8>` before this crate can apply that cap.
 #[derive(Clone, Debug)]
 pub struct PaymentAwarePeerMessage {
     pub message: PeerMessage,
@@ -412,6 +416,8 @@ impl Eq for PaymentAwarePeerMessage {}
 ///
 /// Lite listing never internalizes payments, so a present payment is reported as
 /// [`ListMessagePaymentOutcome::Skipped`] and its exact envelope is retained.
+/// The response/body allocation boundaries are the same as
+/// [`PaymentAwarePeerMessage`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentAwareServerPeerMessage {
     pub message: ServerPeerMessage,

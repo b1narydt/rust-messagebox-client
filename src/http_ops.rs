@@ -8,6 +8,7 @@ use bsv::wallet::interfaces::{
 };
 use bsv::wallet::types::BooleanDefaultTrue;
 use futures_util::future::join_all;
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::client::MessageBoxClient;
 use crate::client::{check_status_error, is_duplicate_message_rejection};
@@ -116,8 +117,82 @@ const MAX_BASKET_TAGS: usize = 10_000;
 struct ListStatusProjection<'a> {
     #[serde(default, borrow)]
     status: Option<Cow<'a, str>>,
-    #[serde(default, borrow)]
-    description: Option<Cow<'a, str>>,
+    #[serde(default)]
+    description: ErrorDescription,
+}
+
+#[derive(Default)]
+struct ErrorDescription(Option<String>);
+
+impl<'de> serde::Deserialize<'de> for ErrorDescription {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DescriptionVisitor;
+
+        impl<'de> Visitor<'de> for DescriptionVisitor {
+            type Value = ErrorDescription;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+                Ok(ErrorDescription(Some(value.to_string())))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(ErrorDescription(Some(value.to_string())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(ErrorDescription(Some(value)))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                while sequence.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ErrorDescription::default())
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(ErrorDescription::default())
+            }
+        }
+
+        deserializer.deserialize_any(DescriptionVisitor)
+    }
 }
 
 fn list_error_description(body: &[u8]) -> Option<String> {
@@ -128,6 +203,7 @@ fn list_error_description(body: &[u8]) -> Option<String> {
     Some(
         projection
             .description
+            .0
             .as_deref()
             .unwrap_or("unknown error")
             .to_string(),
@@ -1747,6 +1823,19 @@ mod tests {
         assert!(
             matches!(missing_description, MessageBoxError::Auth(ref message) if message == "unknown error")
         );
+
+        for body in [
+            br#"{"status":"error","description":null}"#.as_slice(),
+            br#"{"status":"error","description":42}"#.as_slice(),
+            br#"{"status":"error","description":["not",{"a":"string"}]}"#.as_slice(),
+            br#"{"status":"error","description":{"nested":[1,2,3]}}"#.as_slice(),
+        ] {
+            let error = super::parse_bounded_list_response(body).unwrap_err();
+            assert!(
+                matches!(error, MessageBoxError::Auth(ref message) if message == "unknown error"),
+                "non-string descriptions retain legacy fallback semantics: {error:?}"
+            );
+        }
 
         let malformed_success =
             super::parse_bounded_list_response(br#"{"status":"success"}"#).unwrap_err();

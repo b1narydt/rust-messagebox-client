@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use bsv::remittance::types::PeerMessage;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -324,7 +325,7 @@ pub struct AcknowledgeMessageParams {
 /// naming conventions: `messageId`, `sender` are camelCase but `created_at` /
 /// `updated_at` are snake_case. Do NOT use `deny_unknown_fields` — the server
 /// may add new fields at any time.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ServerPeerMessage {
     #[serde(rename = "messageId")]
     pub message_id: String,
@@ -345,6 +346,84 @@ pub struct ServerPeerMessage {
     /// sender provenance (the MPC transport) reject bodies with this `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub authenticated_decrypt: bool,
+}
+
+/// Payment handling result for a message returned by a detailed list operation.
+///
+/// Wallet error strings are deliberately not retained: they can contain backend
+/// details that should not become part of a long-lived message receipt. Callers
+/// can distinguish a wallet error from a validation failure and retry using the
+/// byte-exact [`PaymentAwarePeerMessage::raw_payment_envelope`] (or lite
+/// equivalent). An outer body above this crate's conservative 4 MiB nested-
+/// envelope processing cap is the sole exception: it is reported as
+/// `Unprocessable` with no retained raw copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListMessagePaymentOutcome {
+    /// The stored body did not contain a non-null payment.
+    NoPayment,
+    /// Every payment output was accepted by the wallet in one atomic call.
+    Internalized,
+    /// A payment was present but acceptance was disabled (including lite lists).
+    Skipped,
+    /// The wallet returned successfully but reported `accepted: false`.
+    Declined,
+    /// The wallet call failed.
+    Failed,
+    /// The payment wire data was malformed, unsupported, or outside safe limits.
+    Unprocessable,
+}
+
+impl ListMessagePaymentOutcome {
+    /// Whether the legacy body may safely expose only the decrypted inner message.
+    pub fn payment_is_safe(&self) -> bool {
+        matches!(self, Self::NoPayment | Self::Internalized)
+    }
+}
+
+/// Detailed result for [`crate::MessageBoxClient::list_messages_detailed`].
+///
+/// `message.body` is the normal decrypted (or fail-open plaintext) inner body.
+/// Whenever `payment_outcome` is not `NoPayment` or `Internalized`,
+/// `raw_payment_envelope` contains the exact server body so a caller can retain
+/// and retry every payment field, including fields unknown to this crate. It is
+/// `None` for an oversized outer body, which is replaced by a bounded marker to
+/// avoid retaining attacker-controlled data above the 4 MiB processing cap.
+/// Full, lite, and background-poll host responses are capped at 32 MiB before
+/// outer JSON deserialization, although bsv-sdk `AuthFetch` has already buffered
+/// the authenticated frame and copied its body into a `Vec<u8>` before this crate
+/// can apply that cap.
+#[derive(Clone, Debug)]
+pub struct PaymentAwarePeerMessage {
+    pub message: PeerMessage,
+    pub payment_outcome: ListMessagePaymentOutcome,
+    pub raw_payment_envelope: Option<String>,
+}
+
+impl PartialEq for PaymentAwarePeerMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.message.message_id == other.message.message_id
+            && self.message.sender == other.message.sender
+            && self.message.recipient == other.message.recipient
+            && self.message.message_box == other.message.message_box
+            && self.message.body == other.message.body
+            && self.payment_outcome == other.payment_outcome
+            && self.raw_payment_envelope == other.raw_payment_envelope
+    }
+}
+
+impl Eq for PaymentAwarePeerMessage {}
+
+/// Detailed result for [`crate::MessageBoxClient::list_messages_lite_detailed`].
+///
+/// Lite listing never internalizes payments, so a present payment is reported as
+/// [`ListMessagePaymentOutcome::Skipped`] and its exact envelope is retained.
+/// The response/body allocation boundaries are the same as
+/// [`PaymentAwarePeerMessage`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaymentAwareServerPeerMessage {
+    pub message: ServerPeerMessage,
+    pub payment_outcome: ListMessagePaymentOutcome,
+    pub raw_payment_envelope: Option<String>,
 }
 
 /// A live-delivered peer message paired with its authenticated-decrypt provenance.

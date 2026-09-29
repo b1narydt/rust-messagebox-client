@@ -11,6 +11,32 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **List-message payments now retain explicit outcomes and byte-exact retry data**
+  (`src/http_ops.rs`, Atlas-Documentation#383). New source-compatible
+  `list_messages_detailed` and `list_messages_lite_detailed` APIs return the
+  decrypted inner message alongside `NoPayment`, `Internalized`, `Skipped`,
+  `Declined`, `Failed`, or `Unprocessable`. Every in-limit non-successful payment
+  result includes the exact raw outer envelope, including unknown fields. The legacy
+  list methods retain their signatures and prior inner-body behavior for
+  no-payment/success cases; skipped, declined, failed, and unprocessable payments
+  now leave the raw wrapper in `body` instead of silently discarding retry data.
+  Recipient payments consume the nested TS `paymentRemittance` base64 wire shape,
+  support wallet-payment and basket-insertion outputs (including valid mixed
+  sets), validate the TS transaction/output/description/remittance limits, build
+  all outputs before one wallet call, forward `originator`, and treat only
+  `accepted: true` as success. Multi-host source provenance, cross-host atomicity,
+  and exactly-once refund behavior remain out of scope (source issue #12). Each
+  host's list response is capped at 32 MiB (the largest bounded server profile)
+  before status inspection or outer JSON deserialization across full, lite, and
+  background-poll paths. Successful pages now use one typed parse instead of a
+  preceding full `serde_json::Value` parse. Individual stored bodies above a
+  conservative 4 MiB nested-envelope processing cap are rejected before nested
+  JSON parsing as `Unprocessable`, with a bounded marker and no raw copy;
+  derivation remittances are capped before base64 decoding at the send-side
+  32-byte nonce size. `AuthFetch` still buffers the authenticated response frame
+  before returning its `Vec<u8>`; a pre-buffer transport cap requires upstream
+  bsv-sdk support.
+
 - **Payment ordering now matches TS `@bsv/message-box-client` 2.5.1 / ts-stack #534**
   (`src/peer_pay.rs`, Atlas-Documentation#279). Notification and payment-acceptance
   paths, plus refund-eligible rejection paths, store the payment before the relay

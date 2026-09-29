@@ -388,9 +388,10 @@ impl ListMessagePaymentOutcome {
 /// and retry every payment field, including fields unknown to this crate. It is
 /// `None` for an oversized outer body, which is replaced by a bounded marker to
 /// avoid retaining attacker-controlled data above the 4 MiB processing cap.
-/// Host list responses are capped at 32 MiB before outer JSON deserialization,
-/// although bsv-sdk `AuthFetch` has already buffered the authenticated frame and
-/// copied its body into a `Vec<u8>` before this crate can apply that cap.
+/// Full, lite, and background-poll host responses are capped at 32 MiB before
+/// outer JSON deserialization, although bsv-sdk `AuthFetch` has already buffered
+/// the authenticated frame and copied its body into a `Vec<u8>` before this crate
+/// can apply that cap.
 #[derive(Clone, Debug)]
 pub struct PaymentAwarePeerMessage {
     pub message: PeerMessage,

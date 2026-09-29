@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use bsv::primitives::public_key::PublicKey;
@@ -93,10 +94,10 @@ const MAX_PAYMENT_DESCRIPTION_BYTES: usize = 50;
 ///
 /// 32 MiB matches the message-box server's largest bounded list-response profile
 /// (`highThroughput`) and admits multiple 4 MiB nested envelopes plus response
-/// metadata. This is checked before `check_status_error` or
-/// `ListMessagesResponse` deserialization. It cannot prevent `AuthFetch` from
-/// buffering the authenticated response frame first: bsv-sdk exposes the
-/// completed body as a `Vec<u8>`.
+/// metadata. Every full, lite, and background-poll list path checks this before
+/// any response JSON deserialization. It cannot prevent `AuthFetch` from buffering
+/// the authenticated response frame first: bsv-sdk exposes the completed body as
+/// a `Vec<u8>`.
 const MAX_LIST_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 /// Conservative nested-envelope processing cap aligned with the server's 4 MiB
 /// HTTP JSON request ceiling. Apply it before nested JSON parsing so a hostile
@@ -111,15 +112,53 @@ const MAX_BASKET_FIELD_BYTES: usize = 300;
 const MAX_CUSTOM_INSTRUCTIONS_BYTES: usize = 1000;
 const MAX_BASKET_TAGS: usize = 10_000;
 
-fn parse_bounded_list_response(body: &[u8]) -> Result<ListMessagesResponse, MessageBoxError> {
+#[derive(serde::Deserialize)]
+struct ListStatusProjection<'a> {
+    #[serde(default, borrow)]
+    status: Option<Cow<'a, str>>,
+    #[serde(default, borrow)]
+    description: Option<Cow<'a, str>>,
+}
+
+fn list_error_description(body: &[u8]) -> Option<String> {
+    let projection: ListStatusProjection<'_> = serde_json::from_slice(body).ok()?;
+    if projection.status.as_deref() != Some("error") {
+        return None;
+    }
+    Some(
+        projection
+            .description
+            .as_deref()
+            .unwrap_or("unknown error")
+            .to_string(),
+    )
+}
+
+pub(crate) fn parse_bounded_list_response(
+    body: &[u8],
+) -> Result<ListMessagesResponse, MessageBoxError> {
     if body.len() > MAX_LIST_RESPONSE_BYTES {
         return Err(MessageBoxError::Validation(format!(
             "listMessages response exceeds the {} MiB page limit",
             MAX_LIST_RESPONSE_BYTES / (1024 * 1024)
         )));
     }
-    check_status_error(body)?;
-    Ok(serde_json::from_slice(body)?)
+
+    // Successful responses take one typed streaming-deserialization pass. Unlike
+    // `check_status_error`, this does not first materialize the entire page as an
+    // arbitrary `serde_json::Value`. Only a typed failure or a logical-error
+    // status receives a second, small status/description projection; unknown
+    // fields (including `messages`) are skipped rather than retained.
+    match serde_json::from_slice::<ListMessagesResponse>(body) {
+        Ok(response) if response.status != "error" => Ok(response),
+        Ok(_) => Err(MessageBoxError::Auth(
+            list_error_description(body).unwrap_or_else(|| "unknown error".to_string()),
+        )),
+        Err(parse_error) => match list_error_description(body) {
+            Some(description) => Err(MessageBoxError::Auth(description)),
+            None => Err(MessageBoxError::Json(parse_error)),
+        },
+    }
 }
 
 fn into_legacy_peer_message(receipt: PaymentAwarePeerMessage) -> PeerMessage {
@@ -1687,6 +1726,37 @@ mod tests {
             matches!(error, MessageBoxError::Validation(ref message) if message.contains("32 MiB page limit")),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn bounded_list_parser_preserves_logical_error_and_json_error_semantics() {
+        for body in [
+            br#"{"status":"error","description":"relay refused the list"}"#.as_slice(),
+            br#"{"status":"error","description":"relay refused the list","messages":[]}"#
+                .as_slice(),
+        ] {
+            let error = super::parse_bounded_list_response(body).unwrap_err();
+            assert!(
+                matches!(error, MessageBoxError::Auth(ref message) if message == "relay refused the list"),
+                "unexpected logical-error result: {error:?}"
+            );
+        }
+
+        let missing_description =
+            super::parse_bounded_list_response(br#"{"status":"error"}"#).unwrap_err();
+        assert!(
+            matches!(missing_description, MessageBoxError::Auth(ref message) if message == "unknown error")
+        );
+
+        let malformed_success =
+            super::parse_bounded_list_response(br#"{"status":"success"}"#).unwrap_err();
+        assert!(matches!(malformed_success, MessageBoxError::Json(_)));
+
+        let success_with_unknown_tree = super::parse_bounded_list_response(
+            br#"{"status":"success","messages":[],"future":{"nested":[1,2,3]}}"#,
+        )
+        .expect("unknown success fields must remain forward-compatible");
+        assert!(success_with_unknown_tree.messages.is_empty());
     }
 
     // -----------------------------------------------------------------------

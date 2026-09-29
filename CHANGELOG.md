@@ -27,10 +27,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `accepted: true` as success. Multi-host source provenance, cross-host atomicity,
   and exactly-once refund behavior remain out of scope (source issue #12). Each
   host's list response is capped at 32 MiB (the largest bounded server profile)
-  before status inspection or outer JSON deserialization. Individual stored
-  bodies above a conservative 4 MiB nested-envelope processing cap are rejected
-  before nested JSON parsing as `Unprocessable`, with a bounded marker and no raw
-  copy; derivation remittances are capped before base64 decoding at the send-side
+  before status inspection or outer JSON deserialization across full, lite, and
+  background-poll paths. Successful pages now use one typed parse instead of a
+  preceding full `serde_json::Value` parse. Individual stored bodies above a
+  conservative 4 MiB nested-envelope processing cap are rejected before nested
+  JSON parsing as `Unprocessable`, with a bounded marker and no raw copy;
+  derivation remittances are capped before base64 decoding at the send-side
   32-byte nonce size. `AuthFetch` still buffers the authenticated response frame
   before returning its `Vec<u8>`; a pre-buffer transport cap requires upstream
   bsv-sdk support.

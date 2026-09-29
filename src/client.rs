@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
-use crate::types::{AuthenticatedPeerMessage, ListMessagesParams, ListMessagesResponse};
+use crate::types::{AuthenticatedPeerMessage, ListMessagesParams};
 
 /// Internal callback type for live message subscriptions. Carries the
 /// authenticated-decrypt provenance flag end-to-end (WS dispatch, reconnect
@@ -1209,9 +1209,9 @@ where
         return Err(MessageBoxError::Http(response.status, url));
     }
 
-    check_status_error(&response.body)?;
-
-    let list_response: ListMessagesResponse = serde_json::from_slice(&response.body)?;
+    // Apply the same pre-deserialization page cap and single-pass success parser
+    // as the public full/lite list paths.
+    let list_response = crate::http_ops::parse_bounded_list_response(&response.body)?;
 
     let mut result = Vec::with_capacity(list_response.messages.len());
     for msg in list_response.messages {

@@ -92,12 +92,15 @@ client.acknowledge_message(ids, None).await?;
 `Unprocessable`, `raw_payment_envelope` is the byte-exact outer body returned by
 the relay, suitable for durable retention and retry. The lite detailed API uses
 `PaymentAwareServerPeerMessage` and reports every present payment as `Skipped`.
-Each host's authenticated list response is capped at 32 MiB—the largest bounded
-message-box server response profile—before status inspection or outer list JSON
-deserialization. Within it, an individual stored body above this crate's
-conservative 4 MiB nested-envelope processing cap is `Unprocessable` with a short
-marker body and no retained raw copy, preventing an oversized hostile envelope
-from being parsed or duplicated in memory.
+Every full, lite, and background-poll list path caps each host's authenticated
+response at 32 MiB—the largest bounded message-box server response profile—before
+status inspection or outer list JSON deserialization. Successful pages use one
+typed streaming-deserialization pass; only malformed or logical-error responses
+receive a second lightweight status/description projection. Within a valid page,
+an individual stored body above this crate's conservative 4 MiB nested-envelope
+processing cap is `Unprocessable` with a short marker body and no retained raw
+copy, preventing an oversized hostile envelope from being parsed or duplicated
+in memory.
 
 This is an application-level parsing boundary, not a transport allocation limit:
 bsv-sdk `AuthFetch` currently buffers the complete authenticated response frame

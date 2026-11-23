@@ -12,7 +12,9 @@ use tokio::sync::{Mutex, OnceCell};
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
 use crate::transport::{RelayHttp, RelayResponse};
-use crate::types::{AuthenticatedPeerMessage, ListMessagesParams};
+use crate::types::{
+    AuthenticatedPeerMessage, ListMessagesParams, WsSendMessageData, WsSendMessagePayload,
+};
 
 /// Internal callback type for live message subscriptions. Carries the
 /// authenticated-decrypt provenance flag end-to-end (WS dispatch, reconnect
@@ -687,13 +689,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
     ///
     /// Mirrors TS `sendLiveMessage`: auto-connects if needed, joins the sender's
-    /// own room (required for ack routing), then emits. Falls back to HTTP if the
-    /// connection cannot be established or the ack times out / fails.
+    /// own room, then emits. Falls back to HTTP, with the same message id, if
+    /// the connection cannot be established, the emit fails, the relay refuses
+    /// the send (`messageFailed`), or no ack names this message within 10 s.
     ///
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
     /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
-    /// `override_host`: when Some, the HTTP fallback path sends to that host directly.
-    /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
     ///
     /// Mirrors TS `sendLiveMessage(params, overrideHost?)` which accepts the full
     /// `SendMessageParams` including `skipEncryption`, `checkPermissions`, and `messageId`.
@@ -758,108 +759,45 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
         if let Err(e) = self.ensure_ws_connected(override_host).await {
             eprintln!("Warning: WebSocket connection failed, falling back to HTTP: {e}");
-            // HTTP fallback: use override_host if provided, otherwise overlay resolution.
             // Returns Persisted because no WS ack was received.
-            let msg_id = match override_host {
-                Some(host) => {
-                    self.send_message_to_host(
-                        host,
-                        recipient,
-                        message_box,
-                        body,
-                        skip_encryption,
-                        check_permissions,
-                        message_id,
-                        None,
-                    )
-                    .await?
-                }
-                None => {
-                    self.send_message(
-                        recipient,
-                        message_box,
-                        body,
-                        skip_encryption,
-                        check_permissions,
-                        message_id,
-                        None,
-                    )
-                    .await?
-                }
-            };
+            let msg_id = self
+                .send_persisted(
+                    override_host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    message_id,
+                )
+                .await?;
             return Ok(DeliveryMode::Persisted { message_id: msg_id });
         }
 
         // Join sender's own room before send — TS calls joinRoom(messageBox) which
-        // joins `${myIdentityKey}-${messageBox}`. Required so the server can route
-        // the sendMessageAck back to this socket.
+        // joins `${myIdentityKey}-${messageBox}`.
         let identity_key = self.get_identity_key().await?;
         let my_room = format!("{identity_key}-{message_box}");
-        {
+        let joined = {
             let guard = self.ws_state.lock().await;
-            if let Some(ref ws) = *guard {
-                if ws.join_room(&my_room).await.is_err() {
-                    drop(guard);
-                    let msg_id = match override_host {
-                        Some(host) => {
-                            self.send_message_to_host(
-                                host,
-                                recipient,
-                                message_box,
-                                body,
-                                skip_encryption,
-                                check_permissions,
-                                message_id,
-                                None,
-                            )
-                            .await?
-                        }
-                        None => {
-                            self.send_message(
-                                recipient,
-                                message_box,
-                                body,
-                                skip_encryption,
-                                check_permissions,
-                                message_id,
-                                None,
-                            )
-                            .await?
-                        }
-                    };
-                    return Ok(DeliveryMode::Persisted { message_id: msg_id });
-                }
-            } else {
-                drop(guard);
-                let msg_id = match override_host {
-                    Some(host) => {
-                        self.send_message_to_host(
-                            host,
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            message_id,
-                            None,
-                        )
-                        .await?
-                    }
-                    None => {
-                        self.send_message(
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            message_id,
-                            None,
-                        )
-                        .await?
-                    }
-                };
-                return Ok(DeliveryMode::Persisted { message_id: msg_id });
+            match *guard {
+                Some(ref ws) => ws.join_room(&my_room).await.is_ok(),
+                None => false,
             }
+        };
+        if !joined {
+            let msg_id = self
+                .send_persisted(
+                    override_host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    message_id,
+                )
+                .await?;
+            return Ok(DeliveryMode::Persisted { message_id: msg_id });
         }
 
         // Encrypt (unless skip_encryption) and resolve message ID for the WebSocket path
@@ -881,81 +819,123 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await?
         };
 
-        let room_id = format!("{recipient}-{message_box}");
-        let ack_key = format!("sendMessageAck-{room_id}");
+        // The relay lowercases the HTTP recipient but compares the WS room key
+        // with the recipient exactly, and rooms are joined lowercase. Send both
+        // lowercase so a mixed-case key reaches the recipient's room.
+        let recipient_key = recipient.trim().to_ascii_lowercase();
+        let data = WsSendMessageData {
+            room_id: format!("{recipient_key}-{message_box}"),
+            message: WsSendMessagePayload {
+                message_id: message_id.clone(),
+                recipient: recipient_key,
+                body: encrypted,
+            },
+        };
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<bool>();
-
-        let payload = serde_json::json!({
-            "roomId": room_id,
-            "message": {
-                "messageId": message_id,
-                "recipient": recipient,
-                "body": encrypted
-            }
-        });
-
-        // Emit — acquire lock briefly then release before awaiting ack
-        {
+        // Emit — hold the lock only for the emit, not while awaiting the answer.
+        let emitted = {
             let guard = self.ws_state.lock().await;
-            if let Some(ref ws) = *guard {
-                ws.emit_send_message(payload, ack_key.clone(), ack_tx)
-                    .await?;
+            match *guard {
+                Some(ref ws) => ws.emit_send_message(&data).await,
+                None => Err(MessageBoxError::WebSocket("not connected".to_string())),
             }
-        }
+        };
+        let outcome = match emitted {
+            Ok(ack) => ack.wait(LIVE_ACK_TIMEOUT).await,
+            Err(e) => Err(e),
+        };
+        self.finish_live_send(
+            outcome,
+            override_host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+        )
+        .await
+    }
 
-        // Await ack with 10-second timeout.
-        // Live: server acked via WS within the window → DeliveryMode::Live.
-        // Anything else (timeout, channel error, ack=false): fall back to HTTP
-        // and return DeliveryMode::Persisted.
-        match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
-            Ok(Ok(true)) => Ok(DeliveryMode::Live { message_id }),
-            _ => {
-                // Clean up the pending ack to prevent channel leaks (Pitfall 7)
-                let guard = self.ws_state.lock().await;
-                if let Some(ref ws) = *guard {
-                    ws.remove_pending_ack(&ack_key).await;
-                }
-                drop(guard);
-                tracing::debug!(
-                    "send_live_message: WS ack timed out or failed; falling back to HTTP"
-                );
-                // Fall back to HTTP with the SAME id already emitted over the
-                // WebSocket. The live push may have reached the receiver even
-                // though its ack was lost, and receivers dedup by message id, so
-                // a fresh id would arrive as a second logical message. The relay
-                // is not exactly-once: it collapses a resend only while the first
-                // row still exists (INSERT IGNORE), and an ack deletes that row.
-                let http_id = match override_host {
-                    Some(host) => {
-                        self.send_message_to_host(
-                            host,
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            fallback_message_id(&message_id),
-                            None,
-                        )
-                        .await?
-                    }
-                    None => {
-                        self.send_message(
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            fallback_message_id(&message_id),
-                            None,
-                        )
-                        .await?
-                    }
-                };
-                Ok(DeliveryMode::Persisted {
-                    message_id: http_id,
-                })
+    /// Turn the relay's answer to a live send into the delivery result.
+    ///
+    /// Accepted: [`DeliveryMode::Live`]. Anything else (refused, no answer in
+    /// time, emit failed): send over HTTP with the SAME id already emitted
+    /// over the WebSocket. The live push may have reached the receiver even
+    /// though its answer was lost, and receivers dedup by message id, so a
+    /// fresh id would arrive as a second logical message. The relay is not
+    /// exactly-once: it collapses a resend only while the first row still
+    /// exists (INSERT IGNORE), and an ack deletes that row.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish_live_send(
+        &self,
+        outcome: Result<(), MessageBoxError>,
+        override_host: Option<&str>,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: String,
+    ) -> Result<DeliveryMode, MessageBoxError> {
+        if let Err(reason) = outcome {
+            tracing::debug!(%reason, %message_id, "live send not accepted; sending over HTTP");
+            let http_id = self
+                .send_persisted(
+                    override_host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    Some(&message_id),
+                )
+                .await?;
+            return Ok(DeliveryMode::Persisted {
+                message_id: http_id,
+            });
+        }
+        Ok(DeliveryMode::Live { message_id })
+    }
+
+    /// The HTTP send behind every live-send fallback: to `override_host` when
+    /// given, else to the recipient's overlay-resolved host.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_persisted(
+        &self,
+        override_host: Option<&str>,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
+    ) -> Result<String, MessageBoxError> {
+        match override_host {
+            Some(host) => {
+                self.send_message_to_host(
+                    host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    message_id,
+                    None,
+                )
+                .await
+            }
+            None => {
+                self.send_message(
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    message_id,
+                    None,
+                )
+                .await
             }
         }
     }
@@ -1028,12 +1008,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 /// backstop even if *individual* pushes are being lost.
 const MAX_POLL_SKIPS: u32 = 7;
 
-/// The id the HTTP fallback sends: always the id already emitted on the live
-/// path, so the receiver's per-id dedup can drop a second copy. (The relay
-/// itself dedups only while the first row exists; see `send_live_message`.)
-fn fallback_message_id(message_id: &str) -> Option<&str> {
-    Some(message_id)
-}
+/// How long a live send waits for the relay to accept or refuse it before
+/// it falls back to HTTP.
+const LIVE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
 /// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
@@ -1862,14 +1839,6 @@ mod tests {
             activity.load(Ordering::Relaxed),
             1,
             "only the WS path stamps activity"
-        );
-    }
-
-    #[test]
-    fn http_fallback_reuses_the_live_message_id() {
-        assert_eq!(
-            super::fallback_message_id("caller-selected-id"),
-            Some("caller-selected-id")
         );
     }
 }

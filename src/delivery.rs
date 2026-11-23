@@ -1,19 +1,19 @@
 /// Result of a [`send_live_message`](crate::client::MessageBoxClient::send_live_message) call.
 ///
-/// The WebSocket path waits up to 10 seconds for a `sendMessageAck`
-/// event from the server. If the ack arrives, the message was
-/// relayed to any live subscribers and delivery is `Live`. If the ack
-/// times out, the client falls back to the HTTP POST /sendMessage
-/// endpoint, which persists the message durably — the message IS
-/// stored, but no live push was confirmed (recipients must poll or
+/// The WebSocket path waits up to 10 seconds for the relay's
+/// `sendMessageAck` naming this message. If it arrives, the relay pushed
+/// the message to any live subscribers and queued it for storage, and
+/// delivery is `Live`. If the relay refuses the send or no ack arrives,
+/// the client sends the same message id over HTTP POST /sendMessage,
+/// which stores it — no live push was confirmed (recipients must poll or
 /// be subscribed). Use `Live` when your protocol requires the peer
 /// to have received the message in real time.
 #[derive(Debug, Clone)]
 pub enum DeliveryMode {
     /// Delivered via WebSocket — server acked within the 10s window.
     Live { message_id: String },
-    /// Persisted via HTTP fallback — WS ack timed out. Recipient must
-    /// poll or already be subscribed to receive it.
+    /// Persisted via HTTP fallback — the live send was refused or not
+    /// acked. Recipient must poll or already be subscribed to receive it.
     Persisted { message_id: String },
 }
 

@@ -55,19 +55,10 @@ impl RelayResponse {
         };
 
         if self.status == 429 || field("reason") == Some("rate_limited") {
-            let seconds = body
-                .as_ref()
-                .and_then(|b| b.get("retry_after"))
-                .and_then(|v| v.as_u64())
-                .or_else(|| self.header_seconds("retry-after"))
+            let header_seconds = self
+                .header_seconds("retry-after")
                 .or_else(|| self.header_seconds("x-bsv-retry-after"));
-            return MessageBoxError::RateLimited {
-                retry_after: seconds
-                    .map(Duration::from_secs)
-                    .unwrap_or(DEFAULT_RETRY_AFTER)
-                    .min(MAX_RETRY_AFTER),
-                tier: field("tier").map(str::to_string),
-            };
+            return rate_limited(body.as_ref(), header_seconds);
         }
 
         if let Some(code) = field("code").or_else(|| field("error")) {
@@ -86,6 +77,30 @@ impl RelayResponse {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .and_then(|(_, v)| v.trim().parse().ok())
+    }
+}
+
+/// The relay's rate-limit refusal as an error. The wait is the body's
+/// `retry_after` (seconds), else `header_seconds`, capped at
+/// [`MAX_RETRY_AFTER`]; [`DEFAULT_RETRY_AFTER`] when neither names one. The
+/// same body arrives over HTTP (a 429) and over the WebSocket (`messageFailed`).
+pub(crate) fn rate_limited(
+    body: Option<&serde_json::Map<String, serde_json::Value>>,
+    header_seconds: Option<u64>,
+) -> MessageBoxError {
+    let seconds = body
+        .and_then(|b| b.get("retry_after"))
+        .and_then(|v| v.as_u64())
+        .or(header_seconds);
+    MessageBoxError::RateLimited {
+        retry_after: seconds
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_RETRY_AFTER)
+            .min(MAX_RETRY_AFTER),
+        tier: body
+            .and_then(|b| b.get("tier"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     }
 }
 

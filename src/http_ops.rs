@@ -2577,6 +2577,61 @@ mod tests {
         assert!(relay.sent().len() < 100, "the grace is bounded");
     }
 
+    const RECIPIENT: &str = "02abababababababababababababababababababababababababababababababab";
+
+    /// A refusal on the socket fails every pending live send; each then goes
+    /// over HTTP with the id it already emitted, so a receiver that got the
+    /// live push dedups the second copy.
+    #[tokio::test]
+    async fn refused_live_sends_fall_back_with_their_own_ids() {
+        use crate::websocket::{lock_waiters, LiveSendAck, PendingAcks};
+
+        let waiters = PendingAcks::default();
+        let pending = [
+            ("id-a", LiveSendAck::register(&waiters, "id-a")),
+            ("id-b", LiveSendAck::register(&waiters, "id-b")),
+        ];
+        lock_waiters(&waiters).route(
+            "messageFailed",
+            &json!({"reason": "Could not verify delivery permission"}),
+        );
+
+        let relay = ScriptedTransport::new();
+        for id in ["id-a", "id-b"] {
+            relay.push(
+                200,
+                &[],
+                json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":id}]}),
+            );
+        }
+        let client = scripted_client(&relay);
+        for (id, ack) in pending {
+            let outcome = ack.wait(std::time::Duration::from_secs(1)).await;
+            assert!(outcome.is_err(), "the refusal reached {id}");
+            let mode = client
+                .finish_live_send(
+                    outcome,
+                    Some(HOST),
+                    RECIPIENT,
+                    "inbox",
+                    "hello",
+                    true,
+                    false,
+                    id.to_string(),
+                )
+                .await
+                .expect("HTTP fallback");
+            assert!(!mode.is_live());
+            assert_eq!(mode.message_id(), id);
+        }
+        let ids: Vec<_> = relay
+            .sent()
+            .into_iter()
+            .map(|r| r.body.unwrap()["message"]["messageId"].clone())
+            .collect();
+        assert_eq!(ids, [json!("id-a"), json!("id-b")]);
+    }
+
     /// Only the not-yet-visible answer is retried; any other refusal is final.
     #[tokio::test(start_paused = true)]
     async fn ack_does_not_retry_other_refusals() {

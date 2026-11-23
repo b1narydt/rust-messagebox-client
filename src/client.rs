@@ -935,8 +935,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 tracing::debug!(
                     "send_live_message: WS ack timed out or failed; falling back to HTTP"
                 );
-                // Fall back to HTTP — pass through all feature params.
-                // The HTTP path generates a fresh message ID; use that for the Persisted ID.
+                // Fall back to HTTP with the SAME id already emitted over the
+                // WebSocket. The live push may have reached the receiver even
+                // though its ack was lost, and receivers dedup by message id, so
+                // a fresh id would arrive as a second logical message. The relay
+                // is not exactly-once: it collapses a resend only while the first
+                // row still exists (INSERT IGNORE), and an ack deletes that row.
                 let http_id = match override_host {
                     Some(host) => {
                         self.send_message_to_host(
@@ -946,7 +950,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             body,
                             skip_encryption,
                             check_permissions,
-                            None,
+                            fallback_message_id(&message_id),
                             None,
                         )
                         .await?
@@ -958,7 +962,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                             body,
                             skip_encryption,
                             check_permissions,
-                            None,
+                            fallback_message_id(&message_id),
                             None,
                         )
                         .await?
@@ -1050,6 +1054,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 /// chatty room that keeps WS *activity* alive can never permanently suppress the
 /// backstop even if *individual* pushes are being lost.
 const MAX_POLL_SKIPS: u32 = 7;
+
+/// The id the HTTP fallback sends: always the id already emitted on the live
+/// path, so the receiver's per-id dedup can drop a second copy. (The relay
+/// itself dedups only while the first row exists; see `send_live_message`.)
+fn fallback_message_id(message_id: &str) -> Option<&str> {
+    Some(message_id)
+}
 
 /// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
 /// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
@@ -1967,6 +1978,14 @@ mod tests {
             activity.load(Ordering::Relaxed),
             1,
             "only the WS path stamps activity"
+        );
+    }
+
+    #[test]
+    fn http_fallback_reuses_the_live_message_id() {
+        assert_eq!(
+            super::fallback_message_id("caller-selected-id"),
+            Some("caller-selected-id")
         );
     }
 }

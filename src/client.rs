@@ -1,17 +1,17 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
+use bsv::auth::clients::auth_fetch::AuthFetch;
 use bsv::remittance::types::PeerMessage;
 use bsv::services::overlay_tools::Network;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
-// `Mutex` is still used for WebSocket state, joined rooms, and the subscription
-// registry — see the corresponding fields below. It is NO LONGER used for
-// `auth_fetch`, which is now concurrency-safe (`&self`) and shared bare via `Arc`.
+// `Mutex` guards WebSocket state, joined rooms, and the subscription registry.
+// HTTP needs no lock: the transport is concurrency-safe (`&self`).
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
+use crate::transport::{RelayHttp, RelayResponse};
 use crate::types::{AuthenticatedPeerMessage, ListMessagesParams};
 
 /// Internal callback type for live message subscriptions. Carries the
@@ -83,11 +83,10 @@ where
 pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Base URL of the MessageBox server (trailing whitespace trimmed on construction).
     host: String,
-    /// BRC-31 authenticated HTTP client. `&self`-concurrency-safe, so it is shared
-    /// via a bare `Arc` — N requests can be in flight on one session at once.
-    /// The `Arc` lets background polling tasks share the same wallet auth state
-    /// without a lock or duplicating it.
-    auth_fetch: Arc<AuthFetch<W>>,
+    /// BRC-31 authenticated HTTP, behind the client's one HTTP door. Cheap to
+    /// clone, so background polling tasks share the same session without a
+    /// lock; N requests can be in flight at once.
+    http: RelayHttp,
     /// Wallet retained for direct encrypt / decrypt calls in `http_ops`.
     wallet: W,
     /// Optional originator string forwarded to wallet operations.
@@ -128,7 +127,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub fn new(host: String, wallet: W, originator: Option<String>, network: Network) -> Self {
         MessageBoxClient {
             host: host.trim().to_string(),
-            auth_fetch: Arc::new(AuthFetch::new(wallet.clone())),
+            http: RelayHttp::new(Arc::new(AuthFetch::new(wallet.clone()))),
             wallet,
             originator,
             identity_key: OnceCell::new(),
@@ -342,52 +341,38 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         Ok(())
     }
 
-    /// POST JSON bytes to `url` using BRC-31 authenticated transport.
+    /// POST JSON bytes to `url` using BRC-31 authenticated transport. A
+    /// non-2xx status is an error.
     ///
-    /// `fetch()` takes `&self` and is concurrency-safe, so this call holds no
-    /// client-side lock — multiple `post_json` calls on the same client run in
-    /// parallel.
+    /// The transport takes `&self` and is concurrency-safe, so this call holds
+    /// no client-side lock — multiple `post_json` calls on the same client run
+    /// in parallel.
     pub(crate) async fn post_json(
         &self,
         url: &str,
         body_bytes: Vec<u8>,
-    ) -> Result<AuthFetchResponse, MessageBoxError> {
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/json".to_string());
-
-        let response = self
-            .auth_fetch
-            .fetch(url, "POST", Some(body_bytes), Some(headers))
-            .await
-            .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
-
-        if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(response.status, url.to_string()));
-        }
-
-        Ok(response)
+    ) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_ok(url, "POST", Some(body_bytes)).await
     }
 
     /// POST JSON bytes to `url`, returning the response **regardless of HTTP
     /// status** so the caller can inspect the body on a non-2xx reply.
-    ///
-    /// `post_json` early-returns `Err(Http(status))` on any non-2xx response and
-    /// discards the body — which is correct for most endpoints, but loses the
-    /// relay's structured error payload. `sendMessage` needs that payload to
-    /// distinguish the idempotent `ERR_DUPLICATE_MESSAGE` rejection (delivered
-    /// HTTP 400) from genuine failures, so it uses this raw variant instead.
     pub(crate) async fn post_json_raw(
         &self,
         url: &str,
         body_bytes: Vec<u8>,
-    ) -> Result<AuthFetchResponse, MessageBoxError> {
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/json".to_string());
+    ) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_raw(url, "POST", Some(body_bytes)).await
+    }
 
-        self.auth_fetch
-            .fetch(url, "POST", Some(body_bytes), Some(headers))
-            .await
-            .map_err(|e| MessageBoxError::Auth(e.to_string()))
+    /// Replace the HTTP transport (unit tests drive a scripted relay).
+    #[cfg(test)]
+    pub(crate) fn with_transport(
+        mut self,
+        transport: Arc<dyn crate::transport::HttpTransport>,
+    ) -> Self {
+        self.http = RelayHttp::new(transport);
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -629,7 +614,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // down for any interval in which a WS delivery already occurred. This
         // keeps redundant /listMessages load off the server under high-frequency,
         // many-connection traffic while preserving a correctness backstop.
-        let poll_auth_fetch = self.auth_fetch.clone();
+        let poll_http = self.http.clone();
         let poll_joined_rooms = self.joined_rooms.clone();
         let poll_host = self.host.clone();
         let poll_message_box = message_box.to_string();
@@ -665,7 +650,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 // genuine catch-up when live push stalled. The shared `deduped`
                 // callback suppresses anything WS already delivered.
                 match poll_list_messages(
-                    &poll_auth_fetch,
+                    &poll_http,
                     &poll_host,
                     &poll_message_box,
                     &poll_identity_key,
@@ -1026,22 +1011,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     // Internal HTTP helpers
     // -----------------------------------------------------------------------
 
-    /// GET `url` using BRC-31 authenticated transport.
-    ///
-    /// Mirrors `post_json` but sends no body and no content-type header.
-    /// The caller is responsible for building the full URL including query string.
-    pub(crate) async fn get_json(&self, url: &str) -> Result<AuthFetchResponse, MessageBoxError> {
-        let response = self
-            .auth_fetch
-            .fetch(url, "GET", None, None)
-            .await
-            .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
-
-        if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(response.status, url.to_string()));
-        }
-
-        Ok(response)
+    /// GET `url` using BRC-31 authenticated transport. A non-2xx status is an
+    /// error. The caller builds the full URL including query string.
+    pub(crate) async fn get_json(&self, url: &str) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_ok(url, "GET", None).await
     }
 }
 
@@ -1193,7 +1166,7 @@ impl BoundedIdSet {
 /// authenticated-decrypt provenance), or an empty vec on error.
 /// `accept_payments` is always false — the polling path does not handle delivery fees.
 async fn poll_list_messages<W>(
-    auth_fetch: &Arc<AuthFetch<W>>,
+    http: &RelayHttp,
     host: &str,
     message_box: &str,
     identity_key: &str,
@@ -1208,17 +1181,7 @@ where
     };
     let body_bytes = serde_json::to_vec(&params)?;
     let url = format!("{host}/listMessages");
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/json".to_string());
-
-    let response = auth_fetch
-        .fetch(&url, "POST", Some(body_bytes), Some(headers))
-        .await
-        .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
-
-    if response.status < 200 || response.status >= 300 {
-        return Err(MessageBoxError::Http(response.status, url));
-    }
+    let response = http.fetch_ok(&url, "POST", Some(body_bytes)).await?;
 
     // Apply the same pre-deserialization page cap and single-pass success parser
     // as the public full/lite list paths.

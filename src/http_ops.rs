@@ -2536,4 +2536,43 @@ mod tests {
 
         assert_eq!(id1, id2, "same inputs must produce the same HMAC");
     }
+
+    // -----------------------------------------------------------------------
+    // Relay answers, driven through a scripted transport
+    // -----------------------------------------------------------------------
+
+    use crate::transport::scripted::ScriptedTransport;
+    use serde_json::json;
+
+    const HOST: &str = "https://relay.example";
+
+    fn scripted_client(relay: &Arc<ScriptedTransport>) -> crate::MessageBoxClient<ArcWallet> {
+        payment_client(ArcWallet::new(), None).with_transport(relay.clone())
+    }
+
+    fn ack_not_found() -> serde_json::Value {
+        json!({"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"})
+    }
+
+    /// The relay persists after it pushes, so an ack can beat the row. The
+    /// client retries that one answer and succeeds once the row is visible.
+    #[tokio::test]
+    async fn ack_is_retried_while_the_row_is_not_yet_visible() {
+        let relay = ScriptedTransport::new();
+        relay.push(400, &[], ack_not_found());
+        relay.push(200, &[], json!({"status":"success"}));
+        let client = scripted_client(&relay);
+
+        client
+            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .await
+            .expect("the second ack lands");
+        let sent = relay.sent();
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            assert_eq!(request.url, format!("{HOST}/acknowledgeMessage"));
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.body, Some(json!({"messageIds": ["m1"]})));
+        }
+    }
 }

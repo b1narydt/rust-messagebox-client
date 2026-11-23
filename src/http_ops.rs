@@ -2632,6 +2632,71 @@ mod tests {
         assert_eq!(ids, [json!("id-a"), json!("id-b")]);
     }
 
+    /// A pinned client refuses an answer proven by any other key before it
+    /// reads the body; the pin ignores case and whitespace. Unpinned, the
+    /// client takes whoever answers.
+    #[tokio::test]
+    async fn a_pinned_client_refuses_other_relays() {
+        use crate::transport::scripted::RELAY_KEY;
+        const IMPOSTOR: &str = "02eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let accepted = |id: &str| json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":id}]});
+
+        let relay = ScriptedTransport::new();
+        relay.push_from(IMPOSTOR, 200, &[], accepted("forged"));
+        relay.push(200, &[], accepted("id-1"));
+        let pinned = scripted_client(&relay)
+            .with_expected_relay_key(format!(" {} ", RELAY_KEY.to_ascii_uppercase()));
+        let err = pinned
+            .send_message_to_host(
+                HOST,
+                RECIPIENT,
+                "inbox",
+                "hi",
+                true,
+                false,
+                Some("id-1"),
+                None,
+            )
+            .await
+            .expect_err("an impostor's answer is refused");
+        assert!(
+            matches!(&err, MessageBoxError::RelayIdentityMismatch { observed: Some(k), .. } if k == IMPOSTOR),
+            "{err:?}"
+        );
+        let id = pinned
+            .send_message_to_host(
+                HOST,
+                RECIPIENT,
+                "inbox",
+                "hi",
+                true,
+                false,
+                Some("id-1"),
+                None,
+            )
+            .await
+            .expect("the pinned relay's answer is used");
+        assert_eq!(id, "id-1");
+
+        let relay = ScriptedTransport::new();
+        relay.push_from(IMPOSTOR, 200, &[], accepted("id-2"));
+        let unpinned = scripted_client(&relay);
+        let id = unpinned
+            .send_message_to_host(
+                HOST,
+                RECIPIENT,
+                "inbox",
+                "hi",
+                true,
+                false,
+                Some("id-2"),
+                None,
+            )
+            .await
+            .expect("an unpinned client trusts whoever answers");
+        assert_eq!(id, "id-2");
+    }
+
     /// Only the not-yet-visible answer is retried; any other refusal is final.
     #[tokio::test(start_paused = true)]
     async fn ack_does_not_retry_other_refusals() {

@@ -35,11 +35,16 @@ const RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 /// rather than `&self` — so the `'static` supervisor task can call it without a
 /// self-reference. On success the new socket replaces whatever was in
 /// `ws_state`; the old (dead) socket is dropped, tearing down its tasks.
+///
+/// With a relay identity pin, a server that proves a different key is
+/// disconnected before any room is joined, and the error is returned; the
+/// socket in `ws_state` is left as it was.
 async fn reconnect_ws<W>(
     ws_state: &Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
     subscriptions: &Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
     ws_url: &str,
     identity_key: &str,
+    expected_relay_key: Option<&str>,
     wallet: W,
     originator: Option<String>,
 ) -> Result<(), MessageBoxError>
@@ -49,6 +54,14 @@ where
     let ws =
         crate::websocket::MessageBoxWebSocket::connect(ws_url, identity_key, wallet, originator)
             .await?;
+    if let Err(e) =
+        crate::transport::check_relay_identity(expected_relay_key, Some(ws.server_identity_key()))
+    {
+        if let Err(close) = ws.disconnect().await {
+            tracing::warn!(error = %close, "closing the mismatched relay socket failed");
+        }
+        return Err(e);
+    }
 
     // Replay subscriptions on the fresh socket so the general_msg_dispatcher
     // has callbacks registered for every active room. Without this, events
@@ -95,6 +108,10 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     originator: Option<String>,
     /// Cached identity public key (hex) — populated on first call.
     identity_key: OnceCell<String>,
+    /// The relay identity pin (normalised hex), set by
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key). `None`
+    /// trusts whichever relay answers the host.
+    expected_relay_key: Option<String>,
     /// Ensures assert_initialized runs the full init path at most once.
     pub(crate) init_once: OnceCell<()>,
     /// Network preset for overlay tools (LookupResolver, TopicBroadcaster).
@@ -129,10 +146,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub fn new(host: String, wallet: W, originator: Option<String>, network: Network) -> Self {
         MessageBoxClient {
             host: host.trim().to_string(),
-            http: RelayHttp::new(Arc::new(AuthFetch::new(wallet.clone()))),
+            http: RelayHttp::new(Arc::new(AuthFetch::new(wallet.clone())), None),
             wallet,
             originator,
             identity_key: OnceCell::new(),
+            expected_relay_key: None,
             init_once: OnceCell::new(),
             network,
             ws_state: Arc::new(Mutex::new(None)),
@@ -145,6 +163,33 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Convenience constructor defaulting to `Network::Mainnet`.
     pub fn new_mainnet(host: String, wallet: W, originator: Option<String>) -> Self {
         Self::new(host, wallet, originator, Network::Mainnet)
+    }
+
+    /// Pin the relay's identity key (hex; case and surrounding whitespace are
+    /// ignored).
+    ///
+    /// Once pinned, the client trusts only that relay:
+    /// - every HTTP response must come from a server that proved this key in
+    ///   the BRC-103 handshake, or it is refused with
+    ///   [`MessageBoxError::RelayIdentityMismatch`] before its body is used;
+    /// - every WebSocket connect and reconnect checks the key the server
+    ///   proved, and on a mismatch disconnects and returns that error.
+    ///
+    /// This covers every host the client talks to, including a recipient's
+    /// relay found through the overlay: a pinned client reaches only its
+    /// pinned relay. A refused request has still reached the other server.
+    ///
+    /// Without a pin the client trusts whichever relay answers the host.
+    pub fn with_expected_relay_key(mut self, identity_key: impl AsRef<str>) -> Self {
+        let key = crate::transport::normalize_identity_key(identity_key.as_ref());
+        self.http = self.http.with_expected_server_key(Some(key.clone()));
+        self.expected_relay_key = Some(key);
+        self
+    }
+
+    /// The relay identity pin, if one is set (normalised lowercase hex).
+    pub fn expected_relay_key(&self) -> Option<&str> {
+        self.expected_relay_key.as_deref()
     }
 
     // -----------------------------------------------------------------------
@@ -373,7 +418,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         mut self,
         transport: Arc<dyn crate::transport::HttpTransport>,
     ) -> Self {
-        self.http = RelayHttp::new(transport);
+        self.http = RelayHttp::new(transport, self.expected_relay_key.clone());
         self
     }
 
@@ -412,6 +457,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             &self.subscriptions,
             &ws_url,
             &identity_key,
+            self.expected_relay_key.as_deref(),
             self.wallet.clone(),
             self.originator.clone(),
         )
@@ -452,6 +498,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let subscriptions = self.subscriptions.clone();
         let wallet = self.wallet.clone();
         let originator = self.originator.clone();
+        let expected_relay_key = self.expected_relay_key.clone();
 
         tokio::spawn(async move {
             loop {
@@ -487,6 +534,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                         &subscriptions,
                         &ws_url,
                         &identity_key,
+                        expected_relay_key.as_deref(),
                         wallet.clone(),
                         originator.clone(),
                     )

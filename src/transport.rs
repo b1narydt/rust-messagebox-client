@@ -2,7 +2,8 @@
 //!
 //! Every send, list, ack, permission and quote call reaches the relay through
 //! [`RelayHttp`]. It holds the BRC-103 transport behind the [`HttpTransport`]
-//! trait, so a response is turned into a client result in exactly one place.
+//! trait, so a response is turned into a client result in exactly one place,
+//! and the relay identity pin is checked there before any body is used.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +28,9 @@ pub(crate) struct RelayResponse {
     /// `content-type`) reach the client.
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
+    /// The identity key the server proved in the BRC-103 handshake. `AuthFetch`
+    /// fills it on every authenticated response.
+    pub server_identity_key: Option<String>,
 }
 
 impl RelayResponse {
@@ -136,7 +140,31 @@ where
             status: response.status,
             headers: response.headers,
             body: response.body,
+            server_identity_key: response.server_identity_key,
         })
+    }
+}
+
+/// Normalise an identity key for comparison: trimmed, lowercase hex.
+pub(crate) fn normalize_identity_key(key: &str) -> String {
+    key.trim().to_ascii_lowercase()
+}
+
+/// Check a server's proven identity against the pin. With no pin every server
+/// passes; with a pin, a different key or no key at all is refused.
+pub(crate) fn check_relay_identity(
+    expected: Option<&str>,
+    observed: Option<&str>,
+) -> Result<(), MessageBoxError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    match observed.map(normalize_identity_key) {
+        Some(observed) if observed == expected => Ok(()),
+        observed => Err(MessageBoxError::RelayIdentityMismatch {
+            expected: expected.to_string(),
+            observed,
+        }),
     }
 }
 
@@ -144,15 +172,36 @@ where
 #[derive(Clone)]
 pub(crate) struct RelayHttp {
     transport: Arc<dyn HttpTransport>,
+    /// The relay identity pin, normalised. `None` trusts whichever server
+    /// answers.
+    expected_server_key: Option<String>,
 }
 
 impl RelayHttp {
-    pub(crate) fn new(transport: Arc<dyn HttpTransport>) -> Self {
-        Self { transport }
+    pub(crate) fn new(
+        transport: Arc<dyn HttpTransport>,
+        expected_server_key: Option<String>,
+    ) -> Self {
+        Self {
+            transport,
+            expected_server_key,
+        }
+    }
+
+    /// The same transport with a different pin.
+    pub(crate) fn with_expected_server_key(self, expected_server_key: Option<String>) -> Self {
+        Self {
+            expected_server_key,
+            ..self
+        }
     }
 
     /// Send one request and return the response whatever its status.
     /// A request with a body is sent as `application/json`.
+    ///
+    /// With a pin, a response from any other server is an error before its
+    /// status or body is looked at. The request itself has already reached
+    /// that server.
     pub(crate) async fn fetch_raw(
         &self,
         url: &str,
@@ -162,7 +211,12 @@ impl RelayHttp {
         let headers = body
             .as_ref()
             .map(|_| HashMap::from([("content-type".to_string(), "application/json".to_string())]));
-        self.transport.fetch(url, method, body, headers).await
+        let response = self.transport.fetch(url, method, body, headers).await?;
+        check_relay_identity(
+            self.expected_server_key.as_deref(),
+            response.server_identity_key.as_deref(),
+        )?;
+        Ok(response)
     }
 
     /// Send one request; a non-2xx status becomes an error
@@ -194,6 +248,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             body: body.to_vec(),
+            server_identity_key: None,
         }
     }
 
@@ -243,6 +298,16 @@ mod tests {
         }
     }
 
+    /// A pinned check fails closed when the server proved no key at all.
+    #[test]
+    fn a_pin_refuses_a_response_with_no_proven_key() {
+        assert!(matches!(
+            check_relay_identity(Some("03aa"), None),
+            Err(MessageBoxError::RelayIdentityMismatch { observed: None, .. })
+        ));
+        assert!(check_relay_identity(None, None).is_ok());
+    }
+
     /// A body naming a code (or the identity gate's `error`) keeps it; a body
     /// with neither is a bare HTTP error.
     #[test]
@@ -285,6 +350,10 @@ pub(crate) mod scripted {
         pub body: Option<serde_json::Value>,
     }
 
+    /// The identity key the scripted relay proves.
+    pub(crate) const RELAY_KEY: &str =
+        "03aa00000000000000000000000000000000000000000000000000000000000001";
+
     #[derive(Default)]
     pub(crate) struct ScriptedTransport {
         responses: Mutex<VecDeque<RelayResponse>>,
@@ -296,8 +365,19 @@ pub(crate) mod scripted {
             Arc::new(Self::default())
         }
 
-        /// Queue the next response.
+        /// Queue the next response, proven by [`RELAY_KEY`].
         pub(crate) fn push(&self, status: u16, headers: &[(&str, &str)], body: serde_json::Value) {
+            self.push_from(RELAY_KEY, status, headers, body);
+        }
+
+        /// Queue the next response, proven by `server_key`.
+        pub(crate) fn push_from(
+            &self,
+            server_key: &str,
+            status: u16,
+            headers: &[(&str, &str)],
+            body: serde_json::Value,
+        ) {
             self.responses.lock().unwrap().push_back(RelayResponse {
                 status,
                 headers: headers
@@ -305,6 +385,7 @@ pub(crate) mod scripted {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
                     .collect(),
                 body: serde_json::to_vec(&body).unwrap(),
+                server_identity_key: Some(server_key.to_string()),
             });
         }
 

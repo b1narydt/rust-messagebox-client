@@ -34,6 +34,14 @@ pub enum MessageBoxError {
         retry_after: Duration,
         tier: Option<String>,
     },
+    /// The client was pinned to one relay identity key
+    /// ([`MessageBoxClient::with_expected_relay_key`](crate::MessageBoxClient::with_expected_relay_key))
+    /// and a server proved a different key, or none. The answer was not used.
+    #[error("relay identity mismatch: expected {expected}, server proved {}", observed.as_deref().unwrap_or("no key"))]
+    RelayIdentityMismatch {
+        expected: String,
+        observed: Option<String>,
+    },
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("JSON parse error: {0}")]

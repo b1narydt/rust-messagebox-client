@@ -249,8 +249,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     }
 
     /// Answer the relay's certificate request on every WebSocket connect and
-    /// reconnect with `provider` (see
-    /// [`CertificateProvider`](crate::websocket::CertificateProvider)).
+    /// reconnect with `provider` (see [`CertificateProvider`]).
     ///
     /// A relay with its identity gate armed asks for one Account Details
     /// certificate during the handshake. Without a provider the WebSocket
@@ -847,6 +846,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// own room, then emits. Falls back to HTTP, with the same message id, if
     /// the connection cannot be established, the emit fails, the relay refuses
     /// the send (`messageFailed`), or no ack names this message within 10 s.
+    /// Before the emit it waits out a rate-limit hold on the relay, and returns
+    /// [`MessageBoxError::RateLimited`] if that wait would pass
+    /// [`with_rate_limit_wait`](Self::with_rate_limit_wait).
     ///
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
     /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.

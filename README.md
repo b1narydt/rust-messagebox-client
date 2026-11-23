@@ -1,6 +1,6 @@
 # bsv-messagebox-client
 
-A Rust implementation of the BSV MessageBox client — a peer-to-peer messaging and payment toolkit for the BSV blockchain. Full parity with the TypeScript [`@bsv/message-box-client`](https://github.com/bsv-blockchain/message-box-client) v2.0.x.
+A Rust implementation of the BSV MessageBox client — a peer-to-peer messaging and payment toolkit for the BSV blockchain. Full parity with the TypeScript [`@bsv/message-box-client`](https://github.com/bsv-blockchain/message-box-client) v2.0.x, and follows what the Atlas relay does ([Relay behaviour](#relay-behaviour)).
 
 ## Overview
 
@@ -127,7 +127,8 @@ client.listen_for_live_messages(
     None,
 ).await?;
 
-// Send via WebSocket (falls back to HTTP after 10s timeout)
+// Send via WebSocket. Falls back to HTTP, with the same message id, if the
+// relay refuses it or no ack names it within 10 s.
 client.send_live_message(
     recipient, "inbox", "Real-time hello!",
     false, false, None, None,
@@ -166,6 +167,67 @@ let adapter = RemittanceAdapter::new(client);
 let comms: Arc<dyn CommsLayer + Send + Sync> = Arc::new(adapter);
 ```
 
+## Relay behaviour
+
+What the client does against the Atlas relay.
+
+**Errors.** A request the relay refuses returns
+`MessageBoxError::Relay { status, code, description }` with the relay's code
+(`ERR_DELIVERY_BLOCKED`, `not_certified`, ...). A rate-limit refusal that
+outlasts the client's wait returns `RateLimited { retry_after, tier }`.
+`Http(status, url)` is left for answers whose body names no code.
+
+**Rate budget.** The relay charges HTTP sends, WebSocket sends and lists to one
+budget per identity: 10 a minute for an uncertified key, 300 for a certified
+one. A send costs one per recipient; acknowledgements are free. A refused
+request changes nothing on the relay. After a refusal the client holds every
+send and list to that relay for the relay's `retry_after` (at least 1 s), then
+resends the same bytes, so the same message id. When the wait would pass
+`with_rate_limit_wait` (default 60 s; `Duration::ZERO` never waits) the call
+returns `RateLimited` instead. A send to more recipients than the key's
+per-minute budget is always refused.
+
+**Live sends.** `send_live_message` first waits out a rate-limit hold, then
+emits over the WebSocket and waits up to 10 s for the relay's ack naming that
+message. If the emit fails, the relay refuses, or no ack arrives, it sends over
+HTTP with the same message id. A refusal (`messageFailed`) names no message, so
+it fails every pending live send on that socket. The relay is not
+exactly-once: it keeps one row per id only until the recipient acknowledges
+it, so receivers dedup by message id.
+
+**Acknowledgements.** The relay pushes a live message before it stores it. An
+ack that arrives first is answered `ERR_INVALID_ACKNOWLEDGMENT`; the client
+retries that answer, and only that one, for up to 5 s.
+
+**Poll backstop.** `listen_for_live_messages` also lists the box over HTTP,
+which spends the rate budget: once on each WebSocket connect and reconnect,
+then every 15 s while connected (`with_poll_interval`); with no connected
+socket, after 1 s, doubling to 8 s. It waits out a rate-limit refusal and backs
+off, up to 60 s, after a failed list. The relay does not paginate, so a box
+whose list exceeds 32 MiB cannot be listed: the poll logs an error and retries
+at most once a minute while live delivery continues.
+
+**Relay identity pin.** `with_expected_relay_key(key)` requires every HTTP
+answer and every WebSocket connect to come from a server that proved that key
+in the BRC-103 handshake, else `RelayIdentityMismatch`; a server that proved
+no key fails too. The pin covers every host, including a recipient's relay
+found through the overlay. Without a pin the client trusts whichever relay
+answers the host.
+
+**Certificates.** A relay with its identity gate armed asks for a certificate
+during the handshake.
+- WebSocket: `with_certificate_provider(provider)` answers it on every connect
+  and reconnect. `MessageBoxWebSocket::connect_with_certificate_provider` does
+  the same for a socket you open yourself.
+- HTTP: bsv-sdk 0.8.0's `AuthFetch` has no provider hook. It answers from the
+  wallet's `list_certificates` and `prove_certificate`. If the wallet holds no
+  matching certificate, or either call fails, it sends nothing, and the relay
+  answers 408 after its 30 s certificate timeout.
+
+**Pinned-host payments.** `list_incoming_payments_from_host`,
+`accept_payment_from_host` and `request_payment_to_host` use only the named
+host: no overlay lookup and no multi-host fan-out.
+
 ## API Reference
 
 ### MessageBoxClient
@@ -176,6 +238,11 @@ let comms: Arc<dyn CommsLayer + Send + Sync> = Arc::new(adapter);
 |--------|-------------|
 | `new(host, wallet, originator, network)` | Create a new client |
 | `new_mainnet(host, wallet, originator)` | Convenience constructor for mainnet |
+| `with_expected_relay_key(key)` | Pin the relay identity key ([Relay behaviour](#relay-behaviour)) |
+| `expected_relay_key()` | The pin, if set (lowercase hex) |
+| `with_certificate_provider(provider)` | Answer the relay's certificate request on WebSocket connects |
+| `with_rate_limit_wait(duration)` | Longest a send or list waits on the rate limit (default 60 s) |
+| `with_poll_interval(duration)` | Poll backstop interval while the WebSocket is connected (default 15 s) |
 
 #### Core Messaging
 
@@ -194,7 +261,7 @@ let comms: Arc<dyn CommsLayer + Send + Sync> = Arc::new(adapter);
 | Method | Description |
 |--------|-------------|
 | `initialize_connection(host)` | Establish authenticated WebSocket connection |
-| `send_live_message(recipient, mb, body, skip_enc, check_perms, msg_id, host)` | Send via WS with 10s ack timeout, HTTP fallback |
+| `send_live_message(recipient, mb, body, skip_enc, check_perms, msg_id, host)` | Send via WS; HTTP with the same id if refused or not acked within 10 s |
 | `listen_for_live_messages(mb, callback, host)` | Subscribe to live messages with auto-decrypt |
 | `join_room(mb)` | Join a WebSocket room |
 | `leave_room(mb, host)` | Leave a WebSocket room |
@@ -211,6 +278,9 @@ let comms: Arc<dyn CommsLayer + Send + Sync> = Arc::new(adapter);
 | `accept_payment(payment)` | Internalize received payment |
 | `reject_payment(payment)` | Refund payment (minus 1000 sat fee) |
 | `list_incoming_payments()` | List pending payments |
+| `list_incoming_payments_from_host(host)` | List pending payments on one host only |
+| `accept_payment_from_host(payment, host)` | Accept, acknowledging on one host only |
+| `request_payment_to_host(recipient, amount, description, expires_at, host)` | Request a payment through one host, no overlay lookup |
 | `listen_for_live_payments(callback)` | Subscribe to live payments |
 | `acknowledge_notification(message)` | Acknowledge with payment internalization |
 
@@ -270,14 +340,16 @@ Implements the BSV SDK `CommsLayer` trait:
 ```
 src/
   lib.rs               # Module exports and public re-exports
-  client.rs            # MessageBoxClient struct, WebSocket integration
+  client.rs            # MessageBoxClient struct, WebSocket integration, poll backstop
+  delivery.rs          # DeliveryMode (live or persisted)
+  transport.rs         # Every relay HTTP request: error mapping, identity pin, rate-limit hold
   adapter.rs           # RemittanceAdapter (CommsLayer trait impl)
   http_ops.rs          # HTTP messaging operations, multi-host logic
   peer_pay.rs          # PeerPay payment operations
+  payment_requests.rs  # Payment requests
   permissions.rs       # Permission management and notification wrappers
   encryption.rs        # BRC-78 encryption/decryption, HMAC message IDs
-  websocket.rs         # Socket.IO WebSocket connection with BRC-103 auth
-  socket_transport.rs  # SocketIOTransport (SDK Transport trait over Socket.IO)
+  websocket.rs         # Socket.IO WebSocket over authsocket (BRC-103), live-send acks
   host_resolution.rs   # Overlay network host discovery (PushDrop)
   types.rs             # Request/response types with serde serialization
   error.rs             # Unified error type
@@ -301,15 +373,15 @@ This crate targets full behavioral parity with `@bsv/message-box-client` v2.0.x.
 ## Testing
 
 ```bash
-# Run all offline tests (112 tests: 94 unit + 12 integration + 6 parity)
+# Run all offline tests (173 tests: 155 unit + 12 integration + 6 parity)
 cargo test
 
 # Run specific test suites
-cargo test --lib               # Unit tests (94)
+cargo test --lib               # Unit tests (155)
 cargo test --test integration  # Integration tests (12)
 cargo test --test parity       # Parity verification tests (6)
 
-# Run live server tests against messagebox.babbage.systems (31 tests)
+# Run live server tests against messagebox.babbage.systems (38 tests)
 # Use --test-threads=1 to avoid server rate limiting under parallel load
 cargo test --test live_server -- --ignored --test-threads=1
 ```
@@ -320,7 +392,8 @@ Offline tests use `ProtoWallet` instances — no live server required. Coverage 
 - Wire format serialization (camelCase JSON for all types)
 - CommsLayer adapter mapping (all 5 PeerMessage fields)
 - Payment token shape and derivation encoding
-- BRC-103 SocketIOTransport encoding/decoding and auth message parsing
+- Relay answers driven through a scripted HTTP transport: error codes, rate-limit waits and resends, the ack retry, the identity pin
+- Live-send ack matching and the poll backstop's cadence
 - Critical pitfall guards (snake_case params, header extraction, recipient population)
 
 Live server tests validate 30+ operations against the production Babbage MessageBox service, including messaging, encryption, permissions, payments, overlay queries, host resolution, and device registration.

@@ -7,10 +7,65 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased]
+## [0.6.0] — 2026-11-23
+
+Parity with what the Atlas relay does (rust-mpc#462). The README's "Relay
+behaviour" section describes the result.
+
+### Changed (breaking)
+
+- **Relay errors carry the relay's code** (`src/transport.rs`). Every relay
+  HTTP answer maps through one place. `MessageBoxError` gains
+  `Relay { status, code, description }` (the body's `code`, or the identity
+  gate's `error` such as `not_certified`), `RateLimited { retry_after, tier }`
+  and `RelayIdentityMismatch { expected, observed }`. A relay JSON error that
+  was `Http(status, url)` is now `Relay` or `RateLimited`; `Http` remains for a
+  body that names no code.
+- **Live-send answers are matched by message id** (`src/websocket.rs`).
+  `MessageBoxWebSocket::emit_send_message(&self, &WsSendMessageData)` now
+  returns a `LiveSendAck`; `LiveSendAck::wait(timeout)` gives the relay's
+  answer, and dropping it withdraws that waiter and no other.
+  `remove_pending_ack` is removed. The relay's ack names the message (the
+  earlier note that it does not was wrong), and its refusal, `messageFailed`,
+  names none, so a refusal fails every pending live send on the socket. A
+  refused, unanswered or failed emit falls back to HTTP with the same message
+  id. The WebSocket room and recipient are sent lowercase, as the relay joins
+  rooms lowercase and compares them exactly.
+- **Sends and lists honour the relay's rate budget** (`src/transport.rs`,
+  `src/http_ops.rs`). After a refusal the client holds every send and list to
+  that relay for `retry_after` (at least 1 s) and resends the same bytes, so
+  the same id, within `with_rate_limit_wait` (default 60 s); past it the call
+  returns `RateLimited`. A call can now take up to that long.
+- **The poll backstop lists sparingly** (`src/client.rs`). It replaces the 2 s
+  poll that stood down on WebSocket activity: one list on each WebSocket
+  connect and reconnect, then every 15 s while connected
+  (`with_poll_interval`); with no connected socket, after 1 s, doubling to 8 s.
+  It waits out a rate-limit refusal and backs off up to 60 s after a failed
+  list. An oversize list (over the 32 MiB bound) is logged as an error.
+
+### Added
+
+- `MessageBoxClient::with_expected_relay_key` and `expected_relay_key`: pin the
+  relay's identity key on every HTTP answer and WebSocket connect.
+- `MessageBoxClient::with_certificate_provider`,
+  `MessageBoxWebSocket::connect_with_certificate_provider`, and the
+  `websocket::CertificateProvider` re-export: answer the relay's certificate
+  request on the WebSocket. HTTP has no provider hook in bsv-sdk 0.8.0.
+- `MessageBoxClient::with_rate_limit_wait` and `with_poll_interval`.
+- Pinned-host payment APIs: `list_incoming_payments_from_host`,
+  `accept_payment_from_host` and `request_payment_to_host`, which use only the
+  named host.
 
 ### Fixed
 
+- **An ack that beats the relay's insert is retried** (`src/http_ops.rs`).
+  `ERR_INVALID_ACKNOWLEDGMENT`, and only that answer, is retried for up to 5 s.
+- **The payment-request whitelist error keys on `ERR_DELIVERY_BLOCKED`**
+  instead of any 403, so an uncertified sender is no longer told it is off the
+  whitelist.
+- **The `ERR_DUPLICATE_MESSAGE` success path is removed.** The relay never
+  sends that code: it stores with INSERT IGNORE, answers a resend 200 while
+  the first row exists, and stores it again after an ack deletes the row.
 - **List-message payments now retain explicit outcomes and byte-exact retry data**
   (`src/http_ops.rs`, Atlas-Documentation#383). New source-compatible
   `list_messages_detailed` and `list_messages_lite_detailed` APIs return the
@@ -69,6 +124,10 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Endpoint and wire-schema compatibility are unchanged. Acknowledgement is not an
   atomic multi-host transaction: the existing fan-out reports success when any host
   succeeds, so failed hosts can retain copies after a partial acknowledgement.
+
+## [Unreleased]
+
+### Fixed
 
 - **Half-open WebSocket detection (issue #7)** (`src/websocket.rs`, `src/client.rs`).
   A black-holed socket (peer gone, no TCP FIN) was previously invisible until the

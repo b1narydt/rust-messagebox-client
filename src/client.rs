@@ -15,6 +15,7 @@ use crate::transport::{RelayHttp, RelayResponse};
 use crate::types::{
     AuthenticatedPeerMessage, ListMessagesParams, WsSendMessageData, WsSendMessagePayload,
 };
+use crate::websocket::CertificateProvider;
 
 /// Internal callback type for live message subscriptions. Carries the
 /// authenticated-decrypt provenance flag end-to-end (WS dispatch, reconnect
@@ -27,6 +28,60 @@ type SubscriptionCallback = Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>;
 const RECONNECT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Everything needed to open the client's WebSocket. The reconnect
+/// supervisor owns one, so it dials exactly as the first connect did.
+struct WsDial<W> {
+    url: String,
+    identity_key: String,
+    expected_relay_key: Option<String>,
+    certificate_provider: Option<CertificateProvider>,
+    wallet: W,
+    originator: Option<String>,
+}
+
+impl<W> WsDial<W>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    /// Connect and authenticate, answering a certificate request with the
+    /// provider when one is configured. With a relay identity pin, a server
+    /// that proves a different key is disconnected and the error returned.
+    async fn connect(&self) -> Result<crate::websocket::MessageBoxWebSocket, MessageBoxError> {
+        use crate::websocket::MessageBoxWebSocket;
+        let ws = match &self.certificate_provider {
+            Some(provider) => {
+                MessageBoxWebSocket::connect_with_certificate_provider(
+                    &self.url,
+                    &self.identity_key,
+                    self.wallet.clone(),
+                    self.originator.clone(),
+                    provider.clone(),
+                )
+                .await?
+            }
+            None => {
+                MessageBoxWebSocket::connect(
+                    &self.url,
+                    &self.identity_key,
+                    self.wallet.clone(),
+                    self.originator.clone(),
+                )
+                .await?
+            }
+        };
+        if let Err(e) = crate::transport::check_relay_identity(
+            self.expected_relay_key.as_deref(),
+            Some(ws.server_identity_key()),
+        ) {
+            if let Err(close) = ws.disconnect().await {
+                tracing::warn!(error = %close, "closing the mismatched relay socket failed");
+            }
+            return Err(e);
+        }
+        Ok(ws)
+    }
+}
+
 /// Establish a fresh WebSocket connection and swap it into `ws_state`, replaying
 /// joinRoom + re-subscribe for every active subscription.
 ///
@@ -34,34 +89,18 @@ const RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_sec
 /// supervisor (proactive heal). Lives as a free function — taking `Arc` handles
 /// rather than `&self` — so the `'static` supervisor task can call it without a
 /// self-reference. On success the new socket replaces whatever was in
-/// `ws_state`; the old (dead) socket is dropped, tearing down its tasks.
-///
-/// With a relay identity pin, a server that proves a different key is
-/// disconnected before any room is joined, and the error is returned; the
-/// socket in `ws_state` is left as it was.
+/// `ws_state`; the old (dead) socket is dropped, tearing down its tasks. A
+/// failed dial (including a relay identity mismatch) leaves `ws_state` as it
+/// was and joins no room.
 async fn reconnect_ws<W>(
     ws_state: &Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
     subscriptions: &Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
-    ws_url: &str,
-    identity_key: &str,
-    expected_relay_key: Option<&str>,
-    wallet: W,
-    originator: Option<String>,
+    dial: &WsDial<W>,
 ) -> Result<(), MessageBoxError>
 where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
-    let ws =
-        crate::websocket::MessageBoxWebSocket::connect(ws_url, identity_key, wallet, originator)
-            .await?;
-    if let Err(e) =
-        crate::transport::check_relay_identity(expected_relay_key, Some(ws.server_identity_key()))
-    {
-        if let Err(close) = ws.disconnect().await {
-            tracing::warn!(error = %close, "closing the mismatched relay socket failed");
-        }
-        return Err(e);
-    }
+    let ws = dial.connect().await?;
 
     // Replay subscriptions on the fresh socket so the general_msg_dispatcher
     // has callbacks registered for every active room. Without this, events
@@ -112,6 +151,9 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// [`with_expected_relay_key`](Self::with_expected_relay_key). `None`
     /// trusts whichever relay answers the host.
     expected_relay_key: Option<String>,
+    /// Answers the relay's certificate request on the WebSocket handshake,
+    /// set by [`with_certificate_provider`](Self::with_certificate_provider).
+    certificate_provider: Option<CertificateProvider>,
     /// Ensures assert_initialized runs the full init path at most once.
     pub(crate) init_once: OnceCell<()>,
     /// Network preset for overlay tools (LookupResolver, TopicBroadcaster).
@@ -151,6 +193,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             originator,
             identity_key: OnceCell::new(),
             expected_relay_key: None,
+            certificate_provider: None,
             init_once: OnceCell::new(),
             network,
             ws_state: Arc::new(Mutex::new(None)),
@@ -190,6 +233,32 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// The relay identity pin, if one is set (normalised lowercase hex).
     pub fn expected_relay_key(&self) -> Option<&str> {
         self.expected_relay_key.as_deref()
+    }
+
+    /// Answer the relay's certificate request on every WebSocket connect and
+    /// reconnect with `provider` (see
+    /// [`CertificateProvider`](crate::websocket::CertificateProvider)).
+    ///
+    /// A relay with its identity gate armed asks for one Account Details
+    /// certificate during the handshake. Without a provider the WebSocket
+    /// handshake fails on such a relay. HTTP requests have no provider hook:
+    /// `AuthFetch` answers the same request from the wallet's
+    /// `list_certificates`, so the wallet must implement it (see the README).
+    pub fn with_certificate_provider(mut self, provider: CertificateProvider) -> Self {
+        self.certificate_provider = Some(provider);
+        self
+    }
+
+    /// How this client dials its WebSocket at `override_host` or its own host.
+    async fn ws_dial(&self, override_host: Option<&str>) -> Result<WsDial<W>, MessageBoxError> {
+        Ok(WsDial {
+            url: override_host.unwrap_or_else(|| self.host()).to_string(),
+            identity_key: self.get_identity_key().await?,
+            expected_relay_key: self.expected_relay_key.clone(),
+            certificate_provider: self.certificate_provider.clone(),
+            wallet: self.wallet.clone(),
+            originator: self.originator.clone(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -450,18 +519,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             return Ok(());
         }
 
-        let identity_key = self.get_identity_key().await?;
-        let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
-        reconnect_ws(
-            &self.ws_state,
-            &self.subscriptions,
-            &ws_url,
-            &identity_key,
-            self.expected_relay_key.as_deref(),
-            self.wallet.clone(),
-            self.originator.clone(),
-        )
-        .await?;
+        let dial = self.ws_dial(override_host).await?;
+        reconnect_ws(&self.ws_state, &self.subscriptions, &dial).await?;
 
         // Start the proactive reconnect supervisor (idempotent) so a later
         // half-open death is healed in the background, not on the next call.
@@ -485,8 +544,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         if self.reconnect_supervisor.get().is_some() {
             return Ok(());
         }
-        let identity_key = self.get_identity_key().await?;
-        let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
+        let dial = self.ws_dial(override_host).await?;
 
         // OnceCell::set races are benign — only one initializer wins; the loser
         // simply skips spawning a duplicate.
@@ -496,9 +554,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let ws_state = self.ws_state.clone();
         let subscriptions = self.subscriptions.clone();
-        let wallet = self.wallet.clone();
-        let originator = self.originator.clone();
-        let expected_relay_key = self.expected_relay_key.clone();
 
         tokio::spawn(async move {
             loop {
@@ -529,17 +584,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     if subscriptions.lock().await.is_empty() {
                         break;
                     }
-                    match reconnect_ws(
-                        &ws_state,
-                        &subscriptions,
-                        &ws_url,
-                        &identity_key,
-                        expected_relay_key.as_deref(),
-                        wallet.clone(),
-                        originator.clone(),
-                    )
-                    .await
-                    {
+                    match reconnect_ws(&ws_state, &subscriptions, &dial).await {
                         Ok(()) => {
                             tracing::info!("WS reconnected proactively after half-open death");
                             break;

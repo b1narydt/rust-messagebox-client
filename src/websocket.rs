@@ -28,6 +28,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use authsocket::client::AuthSocketClient;
+/// Answers a relay's certificate request during the WebSocket handshake:
+/// given the relay's identity key and the requested set, return the
+/// certificates to show. An error or an empty batch fails the connection
+/// (authsocket refuses both).
+pub use authsocket::client::CertificateProvider;
 use bsv::wallet::interfaces::WalletInterface;
 
 use crate::encryption;
@@ -208,9 +213,49 @@ impl MessageBoxWebSocket {
     where
         W: WalletInterface + Clone + Send + Sync + 'static,
     {
-        let ws = AuthSocketClient::connect(url, identity_key, wallet.clone())
-            .await
-            .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
+        Self::open(url, identity_key, wallet, originator, None).await
+    }
+
+    /// [`connect`](Self::connect), answering the relay's certificate request
+    /// with `provider`. A relay whose identity gate is armed asks for a
+    /// certificate during the handshake; the provider's batch is sent before
+    /// the client's first signed `authenticated` event.
+    pub async fn connect_with_certificate_provider<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        originator: Option<String>,
+        provider: CertificateProvider,
+    ) -> Result<Self, MessageBoxError>
+    where
+        W: WalletInterface + Clone + Send + Sync + 'static,
+    {
+        Self::open(url, identity_key, wallet, originator, Some(provider)).await
+    }
+
+    async fn open<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        originator: Option<String>,
+        provider: Option<CertificateProvider>,
+    ) -> Result<Self, MessageBoxError>
+    where
+        W: WalletInterface + Clone + Send + Sync + 'static,
+    {
+        let ws = match provider {
+            Some(provider) => {
+                AuthSocketClient::connect_with_certificate_provider(
+                    url,
+                    identity_key,
+                    wallet.clone(),
+                    provider,
+                )
+                .await
+            }
+            None => AuthSocketClient::connect(url, identity_key, wallet.clone()).await,
+        }
+        .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
 
         let subscriptions: SubscriptionMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_acks: PendingAcks = Arc::default();

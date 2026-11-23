@@ -10,10 +10,8 @@ use bsv::wallet::types::BooleanDefaultTrue;
 use futures_util::future::join_all;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
+use crate::client::check_status_error;
 use crate::client::MessageBoxClient;
-use crate::client::{
-    check_status_error, is_acknowledgment_not_found, is_duplicate_message_rejection,
-};
 use crate::encryption;
 use crate::error::MessageBoxError;
 use crate::types::{
@@ -552,33 +550,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let body_bytes = serde_json::to_vec(&request)?;
         let url = format!("{host}/sendMessage");
-        // Use the raw POST so we can inspect the body even on a non-2xx status.
-        // The relay rejects a duplicate `messageId` with HTTP 400 + a structured
-        // body; `post_json` would early-return `Err(Http(400))` and discard that
-        // body, hiding the duplicate signal from us.
-        let response = self.post_json_raw(&url, body_bytes).await?;
-
-        // IDEMPOTENT-DELIVERY SEMANTICS: a duplicate-message rejection means the
-        // relay ALREADY has this exact `messageId` stored — i.e. the message was
-        // already delivered. Because `generate_message_id` is a deterministic
-        // HMAC over (body, recipient, originator), two concurrent sends of the
-        // same logical message collide on the same id: one insert wins, the
-        // other gets `ERR_DUPLICATE_MESSAGE`. The logical send DID succeed, so we
-        // return Ok with the (already-known) message id instead of an error. This
-        // prevents spurious failures + retries under concurrent presign sends.
-        //
-        // We match the relay's PRECISE duplicate signal (`code ==
-        // "ERR_DUPLICATE_MESSAGE"`), never a blanket "swallow all 400s" — genuine
-        // auth / validation rejections continue to surface as errors below.
-        if is_duplicate_message_rejection(&response.body) {
-            return Ok(resolved_message_id);
-        }
-
-        // Non-2xx that ISN'T a duplicate → genuine HTTP failure. Preserve the
-        // status-code error `post_json` would have produced.
-        if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(response.status, url));
-        }
+        // The relay has no duplicate refusal: it stores with INSERT IGNORE, so
+        // a resend of an id whose row still exists is answered 200, and a
+        // resend after the row was acked and deleted is stored again.
+        let response = self.post_json(&url, body_bytes).await?;
 
         // 2xx but possibly a logical `{"status":"error",...}` payload.
         check_status_error(&response.body)?;
@@ -1452,18 +1427,21 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             // 400 response so only the exact "row is not visible yet" outcome is
             // retried. Other validation, auth, and server failures remain fatal.
             let response = self.post_json_raw(&url, body_bytes.clone()).await?;
-            if (200..300).contains(&response.status) {
+            if response.is_success() {
                 check_status_error(&response.body)?;
                 return Ok(());
             }
-
-            if response.status != 400 || !is_acknowledgment_not_found(&response.body) {
-                return Err(MessageBoxError::Http(response.status, url));
+            let error = response.error(&url);
+            if !matches!(
+                &error,
+                MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"
+            ) {
+                return Err(error);
             }
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Err(MessageBoxError::Http(response.status, url));
+                return Err(error);
             }
             tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))).await;
             delay = (delay * 2).min(MAX_RETRY_DELAY);
@@ -2574,5 +2552,50 @@ mod tests {
             assert_eq!(request.method, "POST");
             assert_eq!(request.body, Some(json!({"messageIds": ["m1"]})));
         }
+    }
+
+    /// Past the grace the relay's own refusal reaches the caller, code intact.
+    #[tokio::test(start_paused = true)]
+    async fn ack_grace_ends_with_the_relay_code() {
+        let relay = ScriptedTransport::new();
+        for _ in 0..100 {
+            relay.push(400, &[], ack_not_found());
+        }
+        let client = scripted_client(&relay);
+        let started = tokio::time::Instant::now();
+
+        let err = client
+            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .await
+            .expect_err("the row never appears");
+        assert!(
+            matches!(&err, MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ERR_INVALID_ACKNOWLEDGMENT"));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(relay.sent().len() < 100, "the grace is bounded");
+    }
+
+    /// Only the not-yet-visible answer is retried; any other refusal is final.
+    #[tokio::test(start_paused = true)]
+    async fn ack_does_not_retry_other_refusals() {
+        let relay = ScriptedTransport::new();
+        relay.push(
+            400,
+            &[],
+            json!({"status":"error","code":"ERR_INVALID_MESSAGE_ID","description":"bad id"}),
+        );
+        let client = scripted_client(&relay);
+
+        let err = client
+            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&err, MessageBoxError::Relay { code, .. } if code == "ERR_INVALID_MESSAGE_ID"),
+            "{err:?}"
+        );
+        assert_eq!(relay.sent().len(), 1);
     }
 }

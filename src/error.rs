@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Unified error type for all MessageBox client operations.
@@ -10,8 +12,28 @@ pub enum MessageBoxError {
     Wallet(String),
     #[error("auth error: {0}")]
     Auth(String),
+    /// A non-2xx answer whose body carries no relay error code.
     #[error("HTTP error: status {0} from {1}")]
     Http(u16, String),
+    /// The relay refused the request and named why. `code` is the relay's
+    /// machine-readable code: the `code` field of its standard error body
+    /// (`ERR_INVALID_ACKNOWLEDGMENT`, `ERR_DELIVERY_BLOCKED`, ...) or the
+    /// `error` field of the identity gate's body (`not_certified`,
+    /// `identity_status_unavailable`).
+    #[error("relay refused ({status} {code}): {description}")]
+    Relay {
+        status: u16,
+        code: String,
+        description: String,
+    },
+    /// The relay's rate limit refused the request (HTTP 429). Wait
+    /// `retry_after` before the next send or list; `tier` is the budget the
+    /// relay applied (`uncertified` or `certified`), when it said.
+    #[error("rate limited by the relay; retry after {retry_after:?}")]
+    RateLimited {
+        retry_after: Duration,
+        tier: Option<String>,
+    },
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("JSON parse error: {0}")]

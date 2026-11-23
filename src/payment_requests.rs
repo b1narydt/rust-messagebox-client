@@ -154,7 +154,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
         {
             Ok(_) => {}
-            Err(MessageBoxError::Http(403, _)) => {
+            Err(MessageBoxError::Relay { code, .. }) if code == "ERR_DELIVERY_BLOCKED" => {
                 return Err(MessageBoxError::Validation(
                     "Payment request blocked — you are not on the recipient's whitelist."
                         .to_string(),

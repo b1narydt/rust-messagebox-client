@@ -1230,56 +1230,6 @@ fn extract_plain_body(body: &str) -> String {
     body.to_string()
 }
 
-/// Detect the relay's *duplicate-message* rejection in a response body.
-///
-/// The MessageBox relay rejects a re-send of an already-stored `messageId` with
-/// HTTP 400 and body `{"status":"error","code":"ERR_DUPLICATE_MESSAGE",
-/// "description":"Duplicate message."}` (see
-/// `rust-messagebox-server/src/handlers/send_message.rs` — `error_response(
-/// BAD_REQUEST, "ERR_DUPLICATE_MESSAGE", "Duplicate message.")`).
-///
-/// Because `generate_message_id` is a deterministic HMAC over
-/// `(body, recipient, originator)`, two concurrent sends of the *same logical
-/// message* derive the *same* `messageId`: one wins the insert, the other gets
-/// this rejection. A duplicate rejection therefore means the message was
-/// **already delivered** — it is idempotent-delivery success, NOT a failure.
-///
-/// We match on the precise `code == "ERR_DUPLICATE_MESSAGE"` signal (not a
-/// blanket "ignore all 400s"), so genuine auth / validation rejections
-/// (`ERR_INVALID_RECIPIENT_KEY`, `ERR_MESSAGE_REQUIRED`, BRC-31 auth failures,
-/// …) still surface as errors.
-///
-/// Note: NOT a TS-parity behaviour. `@bsv/message-box-client` (v2.0.6) treats
-/// any non-`success` send response as a thrown error and has no idempotent
-/// duplicate handling; this is a deliberate Rust-side correctness improvement
-/// for concurrent presign sends that collide on the deterministic messageId.
-pub(crate) fn is_duplicate_message_rejection(body: &[u8]) -> bool {
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-        if v.get("status").and_then(|s| s.as_str()) == Some("error")
-            && v.get("code").and_then(|c| c.as_str()) == Some("ERR_DUPLICATE_MESSAGE")
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Match the relay's precise signal for an acknowledgement that raced ahead of
-/// asynchronous message persistence.
-///
-/// Atlas broadcasts a live message before it enqueues the durable INSERT. A
-/// recipient can therefore receive and acknowledge the message while the row is
-/// not visible yet. The relay reports that narrow window as HTTP 400 with
-/// `ERR_INVALID_ACKNOWLEDGMENT`; callers may retry it briefly, but must never
-/// treat it as success because the row can still appear later.
-pub(crate) fn is_acknowledgment_not_found(body: &[u8]) -> bool {
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-        return v.get("status").and_then(|s| s.as_str()) == Some("error")
-            && v.get("code").and_then(|c| c.as_str()) == Some("ERR_INVALID_ACKNOWLEDGMENT");
-    }
-    false
-}
-
 /// Check if a successful (2xx) HTTP response body contains a server-level
 /// error indicator (`{"status": "error", "description": "..."}`).
 ///
@@ -1675,66 +1625,6 @@ mod tests {
         let err = check_status_error(body).unwrap_err();
         assert!(matches!(err, crate::error::MessageBoxError::Auth(_)));
         assert_eq!(err.to_string(), "auth error: permission denied");
-    }
-
-    /// `is_duplicate_message_rejection` matches the relay's precise duplicate signal.
-    #[test]
-    fn is_duplicate_message_rejection_matches_exact_code() {
-        use super::is_duplicate_message_rejection;
-        // The exact body the relay returns (HTTP 400) for a duplicate messageId.
-        let dup = br#"{"status":"error","code":"ERR_DUPLICATE_MESSAGE","description":"Duplicate message."}"#;
-        assert!(
-            is_duplicate_message_rejection(dup),
-            "must match ERR_DUPLICATE_MESSAGE"
-        );
-    }
-
-    /// Genuine validation / auth errors must NOT be treated as duplicates.
-    #[test]
-    fn is_duplicate_message_rejection_rejects_other_errors() {
-        use super::is_duplicate_message_rejection;
-        let invalid =
-            br#"{"status":"error","code":"ERR_INVALID_RECIPIENT_KEY","description":"bad key"}"#;
-        let missing =
-            br#"{"status":"error","code":"ERR_MESSAGE_REQUIRED","description":"no body"}"#;
-        // An error body with no `code` field (e.g. a raw BRC-31 auth failure).
-        let no_code = br#"{"status":"error","description":"permission denied"}"#;
-        let success = br#"{"status":"success","messageId":"abc"}"#;
-        assert!(
-            !is_duplicate_message_rejection(invalid),
-            "ERR_INVALID_RECIPIENT_KEY is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(missing),
-            "ERR_MESSAGE_REQUIRED is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(no_code),
-            "no-code error is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(success),
-            "success is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(b"not json"),
-            "malformed body is not a duplicate"
-        );
-    }
-
-    #[test]
-    fn acknowledgment_not_found_matches_only_the_precise_relay_code() {
-        use super::is_acknowledgment_not_found;
-
-        let not_found = br#"{"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"}"#;
-        let invalid_id =
-            br#"{"status":"error","code":"ERR_INVALID_MESSAGE_ID","description":"bad id"}"#;
-        let success = br#"{"status":"success"}"#;
-
-        assert!(is_acknowledgment_not_found(not_found));
-        assert!(!is_acknowledgment_not_found(invalid_id));
-        assert!(!is_acknowledgment_not_found(success));
-        assert!(!is_acknowledgment_not_found(b"not json"));
     }
 
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).

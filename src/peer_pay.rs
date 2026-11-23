@@ -313,6 +313,23 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         .await
     }
 
+    /// Internalize a payment received from one explicitly selected host and
+    /// acknowledge it only on that host.
+    ///
+    /// This keeps a pinned-relay workflow from fanning the acknowledgement out
+    /// to every host advertised for the wallet identity.
+    pub async fn accept_payment_from_host(
+        &self,
+        payment: &IncomingPayment,
+        host: &str,
+    ) -> Result<(), MessageBoxError> {
+        let message_id = payment.message_id.clone();
+        self.accept_payment_with_ack(payment, || async move {
+            self.acknowledge_message(vec![message_id], Some(host)).await
+        })
+        .await
+    }
+
     async fn accept_payment_with_ack<F, Fut>(
         &self,
         payment: &IncomingPayment,
@@ -425,7 +442,26 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Silently skips messages whose bodies are not valid JSON payment tokens
     /// (mirrors TS `safeParse` behavior).
     pub async fn list_incoming_payments(&self) -> Result<Vec<IncomingPayment>, MessageBoxError> {
-        let messages = self.list_messages("payment_inbox", false, None).await?;
+        self.list_incoming_payments_inner(None).await
+    }
+
+    /// List incoming payments from one explicitly selected MessageBox host.
+    ///
+    /// No advertisement lookup or multi-host fallback is performed.
+    pub async fn list_incoming_payments_from_host(
+        &self,
+        host: &str,
+    ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
+        self.list_incoming_payments_inner(Some(host)).await
+    }
+
+    async fn list_incoming_payments_inner(
+        &self,
+        host_override: Option<&str>,
+    ) -> Result<Vec<IncomingPayment>, MessageBoxError> {
+        let messages = self
+            .list_messages("payment_inbox", false, host_override)
+            .await?;
 
         let payments = messages
             .into_iter()

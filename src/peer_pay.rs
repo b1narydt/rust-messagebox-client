@@ -743,12 +743,11 @@ mod tests {
         Answer { accepted: bool },
     }
 
+    type InternalizeObservations =
+        Arc<std::sync::Mutex<Vec<(InternalizeActionArgs, Option<String>)>>>;
+
     #[derive(Clone)]
-    struct ArcWallet(
-        Arc<ProtoWallet>,
-        InternalizeMode,
-        Arc<std::sync::Mutex<Vec<(InternalizeActionArgs, Option<String>)>>>,
-    );
+    struct ArcWallet(Arc<ProtoWallet>, InternalizeMode, InternalizeObservations);
 
     impl ArcWallet {
         fn new() -> Self {

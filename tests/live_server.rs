@@ -1366,7 +1366,7 @@ async fn test_two_client_live_messaging() {
                 let prefix = msg.sender.get(..12).unwrap_or(&msg.sender);
                 println!(
                     "[Callback] Client A received: sender={}..., body={}",
-                    prefix, &msg.body
+                    prefix, msg.body
                 );
                 // try_send works from both sync and async contexts; blocking_send panics inside Tokio.
                 let _ = tx.try_send(msg);
@@ -1421,7 +1421,7 @@ async fn test_two_client_live_messaging() {
             let prefix = msg.sender.get(..12).unwrap_or(&msg.sender);
             println!(
                 "[Phase 3] Client A received: sender={}..., body={}",
-                prefix, &msg.body
+                prefix, msg.body
             );
             assert_eq!(msg.sender, key_b, "sender must be Client B's identity key");
             assert_eq!(msg.body, test_body, "body must match what Client B sent");
@@ -1475,7 +1475,7 @@ async fn test_bidirectional_live_messaging() {
                 println!(
                     "[A callback] sender={}..., body={}",
                     &msg.sender[..12.min(msg.sender.len())],
-                    &msg.body
+                    msg.body
                 );
                 let _ = tx_a2.try_send(msg);
             }),
@@ -1492,7 +1492,7 @@ async fn test_bidirectional_live_messaging() {
                 println!(
                     "[B callback] sender={}..., body={}",
                     &msg.sender[..12.min(msg.sender.len())],
-                    &msg.body
+                    msg.body
                 );
                 let _ = tx_b2.try_send(msg);
             }),
@@ -1609,7 +1609,7 @@ async fn test_join_leave_room() {
         .listen_for_live_messages(
             "e2e_joinleave_inbox",
             Arc::new(move |msg| {
-                println!("[JL callback] received: body={}", &msg.body);
+                println!("[JL callback] received: body={}", msg.body);
                 let _ = tx.try_send(msg);
             }),
             None,

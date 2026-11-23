@@ -26,9 +26,13 @@ pub enum MessageBoxError {
         code: String,
         description: String,
     },
-    /// The relay's rate limit refused the request (HTTP 429). Wait
-    /// `retry_after` before the next send or list; `tier` is the budget the
-    /// relay applied (`uncertified` or `certified`), when it said.
+    /// The relay's rate limit refused the request (an HTTP 429, or
+    /// `messageFailed` on the WebSocket), and the wait was longer than the
+    /// client's rate-limit wait
+    /// ([`MessageBoxClient::with_rate_limit_wait`](crate::MessageBoxClient::with_rate_limit_wait)).
+    /// `retry_after` is how long until the relay takes the next send or list;
+    /// `tier` is the budget the relay applied (`uncertified` or `certified`),
+    /// when it said.
     #[error("rate limited by the relay; retry after {retry_after:?}")]
     RateLimited {
         retry_after: Duration,

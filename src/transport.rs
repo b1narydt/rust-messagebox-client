@@ -3,7 +3,8 @@
 //! Every send, list, ack, permission and quote call reaches the relay through
 //! [`RelayHttp`]. It holds the BRC-103 transport behind the [`HttpTransport`]
 //! trait, so a response is turned into a client result in exactly one place,
-//! and the relay identity pin is checked there before any body is used.
+//! the relay identity pin is checked there before any body is used, and sends
+//! and lists wait out the relay's rate limit there ([`RateGate`]).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,8 +18,12 @@ use crate::error::MessageBoxError;
 
 /// The longest wait the client takes from a relay's rate-limit answer.
 pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
-/// The wait when a rate-limit answer names none.
+/// The wait when a rate-limit answer names none, and the shortest one the
+/// client takes, so a resend never follows a refusal at once.
 pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(1);
+/// How long one send or list waits, in all, on the relay's rate limit before
+/// it returns [`MessageBoxError::RateLimited`].
+pub(crate) const DEFAULT_RATE_LIMIT_WAIT: Duration = MAX_RETRY_AFTER;
 
 /// One relay HTTP response.
 #[derive(Debug, Clone)]
@@ -44,8 +49,9 @@ impl RelayResponse {
     ///   "rate_limited"`) is [`MessageBoxError::RateLimited`]. The relay's body
     ///   has no `code`; the wait comes from the body's `retry_after` (seconds),
     ///   else the `Retry-After` header, else the signed `x-bsv-retry-after`
-    ///   header (the only one BRC-104 delivers), capped at [`MAX_RETRY_AFTER`]
-    ///   and [`DEFAULT_RETRY_AFTER`] when none is given.
+    ///   header (the only one BRC-104 delivers), kept between
+    ///   [`DEFAULT_RETRY_AFTER`] and [`MAX_RETRY_AFTER`], and
+    ///   [`DEFAULT_RETRY_AFTER`] when none is given.
     /// - A JSON body naming a `code` (or, from the identity gate, an `error`)
     ///   is [`MessageBoxError::Relay`].
     /// - Anything else is [`MessageBoxError::Http`].
@@ -85,9 +91,10 @@ impl RelayResponse {
 }
 
 /// The relay's rate-limit refusal as an error. The wait is the body's
-/// `retry_after` (seconds), else `header_seconds`, capped at
-/// [`MAX_RETRY_AFTER`]; [`DEFAULT_RETRY_AFTER`] when neither names one. The
-/// same body arrives over HTTP (a 429) and over the WebSocket (`messageFailed`).
+/// `retry_after` (seconds), else `header_seconds`, kept between
+/// [`DEFAULT_RETRY_AFTER`] and [`MAX_RETRY_AFTER`]; [`DEFAULT_RETRY_AFTER`]
+/// when neither names one. The same body arrives over HTTP (a 429) and over
+/// the WebSocket (`messageFailed`).
 pub(crate) fn rate_limited(
     body: Option<&serde_json::Map<String, serde_json::Value>>,
     header_seconds: Option<u64>,
@@ -100,7 +107,7 @@ pub(crate) fn rate_limited(
         retry_after: seconds
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_RETRY_AFTER)
-            .min(MAX_RETRY_AFTER),
+            .clamp(DEFAULT_RETRY_AFTER, MAX_RETRY_AFTER),
         tier: body
             .and_then(|b| b.get("tier"))
             .and_then(|v| v.as_str())
@@ -168,6 +175,72 @@ pub(crate) fn check_relay_identity(
     }
 }
 
+/// The relay's rate-limit holds, one per relay host, shared by every clone of
+/// a client's [`RelayHttp`].
+///
+/// The relay charges HTTP sends, WebSocket sends and lists to one budget per
+/// identity, and answers an exhausted budget with `retry_after`. A hold
+/// records that answer, so the client's next send or list to that relay
+/// waits it out instead of spending a request on a refusal it already knows.
+#[derive(Clone, Default)]
+pub(crate) struct RateGate {
+    holds: Arc<std::sync::Mutex<HashMap<String, Hold>>>,
+}
+
+#[derive(Clone)]
+struct Hold {
+    until: tokio::time::Instant,
+    tier: Option<String>,
+}
+
+impl RateGate {
+    fn holds(&self) -> std::sync::MutexGuard<'_, HashMap<String, Hold>> {
+        // A poisoned map still holds valid instants; keep using it.
+        self.holds.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn key(host: &str) -> String {
+        host.trim().trim_end_matches('/').to_ascii_lowercase()
+    }
+
+    /// Hold `host` for `retry_after` from now. A hold that ends later stays.
+    pub(crate) fn hold(&self, host: &str, retry_after: Duration, tier: Option<String>) {
+        let until = tokio::time::Instant::now() + retry_after;
+        let mut holds = self.holds();
+        let key = Self::key(host);
+        if holds.get(&key).is_none_or(|h| h.until < until) {
+            holds.insert(key, Hold { until, tier });
+        }
+    }
+
+    /// Wait until `host` is not held. When the hold ends after `deadline`,
+    /// return [`MessageBoxError::RateLimited`] with the time left, at once.
+    pub(crate) async fn wait(
+        &self,
+        host: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), MessageBoxError> {
+        let key = Self::key(host);
+        loop {
+            let Some(hold) = self.holds().get(&key).cloned() else {
+                return Ok(());
+            };
+            let now = tokio::time::Instant::now();
+            if hold.until <= now {
+                return Ok(());
+            }
+            if hold.until > deadline {
+                return Err(MessageBoxError::RateLimited {
+                    retry_after: hold.until - now,
+                    tier: hold.tier,
+                });
+            }
+            // Look again after the sleep: a later refusal may have extended it.
+            tokio::time::sleep_until(hold.until).await;
+        }
+    }
+}
+
 /// The client's relay HTTP handle. Cheap to clone; background tasks hold one.
 #[derive(Clone)]
 pub(crate) struct RelayHttp {
@@ -175,6 +248,10 @@ pub(crate) struct RelayHttp {
     /// The relay identity pin, normalised. `None` trusts whichever server
     /// answers.
     expected_server_key: Option<String>,
+    /// Rate-limit holds, shared by every clone.
+    rate_gate: RateGate,
+    /// How long one send or list waits, in all, on the rate limit.
+    rate_limit_wait: Duration,
 }
 
 impl RelayHttp {
@@ -185,6 +262,8 @@ impl RelayHttp {
         Self {
             transport,
             expected_server_key,
+            rate_gate: RateGate::default(),
+            rate_limit_wait: DEFAULT_RATE_LIMIT_WAIT,
         }
     }
 
@@ -193,6 +272,68 @@ impl RelayHttp {
         Self {
             expected_server_key,
             ..self
+        }
+    }
+
+    /// The same handle with a different rate-limit wait.
+    pub(crate) fn with_rate_limit_wait(self, rate_limit_wait: Duration) -> Self {
+        Self {
+            rate_limit_wait,
+            ..self
+        }
+    }
+
+    /// The same handle over a different transport (tests drive a scripted relay).
+    #[cfg(test)]
+    pub(crate) fn with_transport(self, transport: Arc<dyn HttpTransport>) -> Self {
+        Self { transport, ..self }
+    }
+
+    /// When a send or list starting now must stop waiting on the rate limit.
+    pub(crate) fn rate_limit_deadline(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now() + self.rate_limit_wait
+    }
+
+    /// Wait out a rate-limit hold on `host` (see [`RateGate::wait`]).
+    pub(crate) async fn wait_for_rate_limit(
+        &self,
+        host: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), MessageBoxError> {
+        self.rate_gate.wait(host, deadline).await
+    }
+
+    /// Record a rate-limit refusal from `host`; any other error is ignored.
+    pub(crate) fn hold_for_rate_limit(&self, host: &str, error: &MessageBoxError) {
+        if let MessageBoxError::RateLimited { retry_after, tier } = error {
+            self.rate_gate.hold(host, *retry_after, tier.clone());
+        }
+    }
+
+    /// POST one send or list to `url` on `host`. These share the relay's
+    /// per-identity rate budget (acks do not).
+    ///
+    /// Waits out any rate-limit hold on `host` first. On a refusal, holds
+    /// `host` for the relay's `retry_after`, waits, and sends the same bytes
+    /// again, so a resent message keeps its id. When the wait would end past
+    /// the rate-limit wait, returns [`MessageBoxError::RateLimited`] instead.
+    /// The relay checks the budget before any side effect, so a refused
+    /// request changed nothing.
+    pub(crate) async fn fetch_budgeted(
+        &self,
+        host: &str,
+        url: &str,
+        body: Vec<u8>,
+    ) -> Result<RelayResponse, MessageBoxError> {
+        let deadline = self.rate_limit_deadline();
+        loop {
+            self.wait_for_rate_limit(host, deadline).await?;
+            match self.fetch_ok(url, "POST", Some(body.clone())).await {
+                Err(refused @ MessageBoxError::RateLimited { .. }) => {
+                    self.hold_for_rate_limit(host, &refused);
+                }
+                answer => return answer,
+            }
         }
     }
 
@@ -273,7 +414,7 @@ mod tests {
     }
 
     /// The relay's 429 has no `code`; it is still a rate limit, and the wait
-    /// comes from the body, else the signed header, capped and defaulted.
+    /// comes from the body, else the signed header, bounded and defaulted.
     #[test]
     fn rate_limit_answers_carry_the_relay_wait() {
         let signed = [("x-bsv-retry-after", "9")];
@@ -290,6 +431,11 @@ mod tests {
             MAX_RETRY_AFTER
         );
         assert_eq!(retry_after(response(429, &[], b"")), DEFAULT_RETRY_AFTER);
+        assert_eq!(
+            retry_after(response(429, &[], &rate_limit_body(Some(0)))),
+            DEFAULT_RETRY_AFTER,
+            "a zero wait would resend at once"
+        );
         match response(429, &[], &rate_limit_body(Some(7))).error("u") {
             MessageBoxError::RateLimited { tier, .. } => {
                 assert_eq!(tier.as_deref(), Some("uncertified"))

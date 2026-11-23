@@ -552,8 +552,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let url = format!("{host}/sendMessage");
         // The relay has no duplicate refusal: it stores with INSERT IGNORE, so
         // a resend of an id whose row still exists is answered 200, and a
-        // resend after the row was acked and deleted is stored again.
-        let response = self.post_json(&url, body_bytes).await?;
+        // resend after the row was acked and deleted is stored again. A
+        // rate-limited send is resent with these same bytes, so the same id.
+        let response = self.post_budgeted(host, &url, body_bytes).await?;
 
         // 2xx but possibly a logical `{"status":"error",...}` payload.
         check_status_error(&response.body)?;
@@ -1164,7 +1165,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
-        let response = self.post_json(&url, body_bytes).await?;
+        let response = self.post_budgeted(host, &url, body_bytes).await?;
         // Strongest boundary available with AuthFetch: it has already buffered
         // `body: Vec<u8>`, but no JSON inspection or second body copy has occurred here.
         let list_response = parse_bounded_list_response(&response.body)?;
@@ -1283,7 +1284,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
-        let response = self.post_json(&url, body_bytes).await?;
+        let response = self.post_budgeted(host, &url, body_bytes).await?;
         // Keep the full and lite host paths on the same pre-deserialization bound.
         let list_response = parse_bounded_list_response(&response.body)?;
 
@@ -2695,6 +2696,86 @@ mod tests {
             .await
             .expect("an unpinned client trusts whoever answers");
         assert_eq!(id, "id-2");
+    }
+
+    fn rate_limited(retry_after: u64) -> serde_json::Value {
+        json!({"status":"error","reason":"rate_limited","description":"verified identity rate limit exceeded","tier":"uncertified","retry_after":retry_after})
+    }
+
+    fn accepted(id: &str) -> serde_json::Value {
+        json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":id}]})
+    }
+
+    fn sent_ids(relay: &ScriptedTransport) -> Vec<serde_json::Value> {
+        relay
+            .sent()
+            .into_iter()
+            .map(|r| r.body.unwrap()["message"]["messageId"].clone())
+            .collect()
+    }
+
+    /// A rate-limited send waits the relay's `retry_after` and is resent with
+    /// the same id. A wait longer than the client's limit is `RateLimited`,
+    /// and the relay stays held: the next send waits without a request.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_send_waits_and_keeps_its_id() {
+        let s = std::time::Duration::from_secs;
+        let relay = ScriptedTransport::new();
+        relay.push(429, &[("x-bsv-retry-after", "3")], rate_limited(3));
+        relay.push(200, &[], accepted("id-1"));
+        let client = scripted_client(&relay).with_rate_limit_wait(s(10));
+        let send = |id: &'static str| {
+            client.send_message_to_host(HOST, RECIPIENT, "inbox", "hi", true, false, Some(id), None)
+        };
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(send("id-1").await.expect("resent"), "id-1");
+        assert!(started.elapsed() >= s(3));
+        assert_eq!(sent_ids(&relay), [json!("id-1"), json!("id-1")]);
+
+        relay.push(429, &[], rate_limited(30));
+        let err = send("id-2").await.expect_err("past the wait");
+        assert!(
+            matches!(err, MessageBoxError::RateLimited { retry_after, .. } if retry_after == s(30)),
+            "{err:?}"
+        );
+        let err = send("id-3").await.expect_err("still held");
+        assert!(
+            matches!(err, MessageBoxError::RateLimited { .. }),
+            "{err:?}"
+        );
+        assert_eq!(relay.sent().len(), 3, "a held relay gets no request");
+    }
+
+    /// A live send the relay refused for its rate limit holds the relay, so
+    /// its HTTP fallback waits out `retry_after` instead of being refused too.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_live_send_waits_before_its_http_fallback() {
+        let relay = ScriptedTransport::new();
+        relay.push(200, &[], accepted("id-a"));
+        let client = scripted_client(&relay);
+        let refused = MessageBoxError::RateLimited {
+            retry_after: std::time::Duration::from_secs(4),
+            tier: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let mode = client
+            .finish_live_send(
+                Err(refused),
+                Some(HOST),
+                RECIPIENT,
+                "inbox",
+                "hello",
+                true,
+                false,
+                "id-a".to_string(),
+            )
+            .await
+            .expect("HTTP fallback");
+        assert_eq!(mode.message_id(), "id-a");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+        assert_eq!(sent_ids(&relay), [json!("id-a")]);
     }
 
     /// Only the not-yet-visible answer is retried; any other refusal is final.

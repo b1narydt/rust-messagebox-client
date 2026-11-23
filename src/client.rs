@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bsv::auth::clients::auth_fetch::AuthFetch;
 use bsv::remittance::types::PeerMessage;
@@ -91,10 +93,12 @@ where
 /// self-reference. On success the new socket replaces whatever was in
 /// `ws_state`; the old (dead) socket is dropped, tearing down its tasks. A
 /// failed dial (including a relay identity mismatch) leaves `ws_state` as it
-/// was and joins no room.
+/// was and joins no room. A successful one bumps `connections`, which tells
+/// each poll backstop to catch up once.
 async fn reconnect_ws<W>(
     ws_state: &Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
     subscriptions: &Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
+    connections: &AtomicU64,
     dial: &WsDial<W>,
 ) -> Result<(), MessageBoxError>
 where
@@ -120,6 +124,7 @@ where
     }
 
     *ws_state.lock().await = Some(ws);
+    connections.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
@@ -166,6 +171,12 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     ws_state: Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
     /// Ensures the reconnect supervisor task is spawned at most once per client.
     reconnect_supervisor: OnceCell<()>,
+    /// Counts successful WebSocket connects and reconnects (rooms rejoined).
+    /// Each poll backstop lists once when it changes.
+    ws_connections: Arc<AtomicU64>,
+    /// The longest the poll backstop waits between lists while the WebSocket
+    /// is connected.
+    poll_interval: Duration,
     /// Tracks which message box rooms have been joined via join_room.
     /// Updated on join_room (insert) and leave_room (remove).
     /// Arc allows sharing with background polling tasks.
@@ -198,6 +209,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             network,
             ws_state: Arc::new(Mutex::new(None)),
             reconnect_supervisor: OnceCell::new(),
+            ws_connections: Arc::new(AtomicU64::new(0)),
+            poll_interval: DEFAULT_POLL_INTERVAL,
             joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -246,6 +259,28 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// `list_certificates`, so the wallet must implement it (see the README).
     pub fn with_certificate_provider(mut self, provider: CertificateProvider) -> Self {
         self.certificate_provider = Some(provider);
+        self
+    }
+
+    /// Set the longest one send or list waits, in all, on the relay's rate
+    /// limit (default 60 s).
+    ///
+    /// The relay charges HTTP sends, WebSocket sends and lists to one budget
+    /// per identity and refuses past it with a wait (`retry_after`). The
+    /// client then holds every send and list to that relay for the wait, and
+    /// resends a refused send or list, same bytes and id, once it passes.
+    /// When the wait would run past this limit the call returns
+    /// [`MessageBoxError::RateLimited`] instead. `Duration::ZERO` never waits.
+    pub fn with_rate_limit_wait(mut self, wait: Duration) -> Self {
+        self.http = self.http.with_rate_limit_wait(wait);
+        self
+    }
+
+    /// Set the longest the poll backstop of
+    /// [`listen_for_live_messages`](Self::listen_for_live_messages) waits
+    /// between lists while the WebSocket is connected (default 15 s).
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
         self
     }
 
@@ -471,6 +506,18 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         self.http.fetch_ok(url, "POST", Some(body_bytes)).await
     }
 
+    /// POST a send or list to `url` on `host`, waiting out the relay's rate
+    /// limit and resending the same bytes after a refusal, within the
+    /// rate-limit wait ([`RelayHttp::fetch_budgeted`]).
+    pub(crate) async fn post_budgeted(
+        &self,
+        host: &str,
+        url: &str,
+        body_bytes: Vec<u8>,
+    ) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_budgeted(host, url, body_bytes).await
+    }
+
     /// POST JSON bytes to `url`, returning the response **regardless of HTTP
     /// status** so the caller can inspect the body on a non-2xx reply.
     pub(crate) async fn post_json_raw(
@@ -487,7 +534,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         mut self,
         transport: Arc<dyn crate::transport::HttpTransport>,
     ) -> Self {
-        self.http = RelayHttp::new(transport, self.expected_relay_key.clone());
+        self.http = self.http.with_transport(transport);
         self
     }
 
@@ -520,7 +567,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
 
         let dial = self.ws_dial(override_host).await?;
-        reconnect_ws(&self.ws_state, &self.subscriptions, &dial).await?;
+        reconnect_ws(
+            &self.ws_state,
+            &self.subscriptions,
+            &self.ws_connections,
+            &dial,
+        )
+        .await?;
 
         // Start the proactive reconnect supervisor (idempotent) so a later
         // half-open death is healed in the background, not on the next call.
@@ -554,6 +607,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let ws_state = self.ws_state.clone();
         let subscriptions = self.subscriptions.clone();
+        let ws_connections = self.ws_connections.clone();
 
         tokio::spawn(async move {
             loop {
@@ -584,7 +638,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     if subscriptions.lock().await.is_empty() {
                         break;
                     }
-                    match reconnect_ws(&ws_state, &subscriptions, &dial).await {
+                    match reconnect_ws(&ws_state, &subscriptions, &ws_connections, &dial).await {
                         Ok(()) => {
                             tracing::info!("WS reconnected proactively after half-open death");
                             break;
@@ -619,12 +673,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///    the callback when the server broadcasts a signed `sendMessage-{roomId}`.
     /// 2. **WebSocket `on_any` (fallback):** the same callback, for servers that
     ///    emit raw (unsigned) room events.
-    /// 3. **HTTP poll (backstop):** a background task that *stands down* for any
-    ///    interval in which WS push already delivered (so it does not poll every
-    ///    2 s when live push is healthy), and otherwise polls `/listMessages` to
-    ///    catch anything the WS paths missed — forcing a catch-up at least every
-    ///    `MAX_POLL_SKIPS` intervals. Stops when `leave_room` removes the room
-    ///    from `joined_rooms`.
+    /// 3. **HTTP poll (backstop):** a background task that lists the box over
+    ///    `/listMessages`. Lists cost the same relay rate budget as sends, so it
+    ///    lists sparingly: while the WebSocket is connected, once on each
+    ///    connect and reconnect (to catch up on what arrived while it was
+    ///    down), then at most every 15 s
+    ///    ([`with_poll_interval`](Self::with_poll_interval)); with no
+    ///    connected WebSocket, after 1 s, doubling to 8 s. It waits out a
+    ///    rate-limit refusal, and backs off after a failed list (up to 60 s),
+    ///    including a list too large to accept, which it logs as an error;
+    ///    live delivery carries on meanwhile. Stops when `leave_room` removes
+    ///    the room from `joined_rooms`.
     ///
     /// All paths deliver `PeerMessage` with decrypted body to the same callback.
     ///
@@ -679,11 +738,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // wins the race.
         let deduped = exactly_once(on_message);
 
-        // WS-only delivery counter. Bumped on every WebSocket delivery so the
-        // HTTP poll backstop below can detect healthy live-push and stand down,
-        // instead of hitting /listMessages every 2s for every active mailbox.
-        let ws_activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let ws_callback = record_ws_activity(deduped.clone(), ws_activity.clone());
+        let ws_callback = deduped.clone();
 
         {
             let guard = self.ws_state.lock().await;
@@ -702,15 +757,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         self.joined_rooms.lock().await.insert(room_id.clone());
 
-        // Spawn the HTTP poll BACKSTOP. With the server signing room broadcasts
-        // onto the client's authenticated primary path, live WS push is the fast
-        // path. The poll now exists only to (a) support servers that don't push
-        // and (b) recover if the WS connection silently stalls — so it stands
-        // down for any interval in which a WS delivery already occurred. This
-        // keeps redundant /listMessages load off the server under high-frequency,
-        // many-connection traffic while preserving a correctness backstop.
+        // Spawn the HTTP poll backstop (see the cadence on `PollCadence`).
         let poll_http = self.http.clone();
         let poll_joined_rooms = self.joined_rooms.clone();
+        let poll_ws_state = self.ws_state.clone();
+        let poll_connections = self.ws_connections.clone();
         let poll_host = self.host.clone();
         let poll_message_box = message_box.to_string();
         let poll_identity_key = identity_key.clone();
@@ -718,33 +769,32 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let poll_originator = self.originator.clone();
         let poll_room_id = room_id.clone();
         let poll_callback = deduped;
-        let poll_ws_activity = ws_activity;
+        let mut cadence = PollCadence::new(
+            self.poll_interval,
+            self.ws_connections.load(Ordering::Acquire),
+        );
 
         tokio::spawn(async move {
-            use std::sync::atomic::Ordering;
-            let mut last_activity = poll_ws_activity.load(Ordering::Relaxed);
-            let mut skipped: u32 = 0;
-
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
                 // Stop when the room is no longer active (leave_room was called)
                 if !poll_joined_rooms.lock().await.contains(&poll_room_id) {
                     break;
                 }
 
-                // Stand down while WS push is healthy, but force a catch-up at
-                // least every MAX_POLL_SKIPS intervals so partial push loss on an
-                // otherwise-active connection can't permanently suppress the poll.
-                let activity = poll_ws_activity.load(Ordering::Relaxed);
-                if !poll_should_run(activity, &mut last_activity, &mut skipped) {
+                let connected = poll_ws_state
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|ws| ws.is_connected());
+                let live = connected.then(|| poll_connections.load(Ordering::Acquire));
+                if !cadence.due(tokio::time::Instant::now(), live) {
+                    tokio::time::sleep(POLL_TICK).await;
                     continue;
                 }
 
-                // Backstop poll. Cheap no-op when the mailbox is simply idle; a
-                // genuine catch-up when live push stalled. The shared `deduped`
-                // callback suppresses anything WS already delivered.
-                match poll_list_messages(
+                // The shared `deduped` callback suppresses anything WS already
+                // delivered.
+                let listed = poll_list_messages(
                     &poll_http,
                     &poll_host,
                     &poll_message_box,
@@ -752,27 +802,39 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     &poll_wallet,
                     poll_originator.as_deref(),
                 )
-                .await
-                {
+                .await;
+                let failure = match listed {
                     Ok(messages) => {
                         for msg in messages {
                             poll_callback(msg);
                         }
+                        None
                     }
-                    // The poll IS the correctness backstop — never swallow its
-                    // error silently. A persistent failure here means both live
-                    // push (already stalled) and the backstop are down.
                     Err(e) => {
-                        tracing::warn!(
-                            room_id = %poll_room_id,
-                            error = %e,
-                            "poll backstop failed — message catch-up unavailable this interval"
-                        );
+                        // Only the list-size bound fails as Validation: the
+                        // box holds more than one list may carry, and the
+                        // relay does not paginate.
+                        if matches!(e, MessageBoxError::Validation(_)) {
+                            tracing::error!(
+                                room_id = %poll_room_id,
+                                error = %e,
+                                "poll backstop cannot list this box; live delivery continues"
+                            );
+                        } else {
+                            tracing::warn!(
+                                room_id = %poll_room_id,
+                                error = %e,
+                                "poll backstop failed; message catch-up delayed"
+                            );
+                        }
+                        Some(e)
                     }
-                }
-
-                // Refresh in case a WS delivery landed while we were polling.
-                last_activity = poll_ws_activity.load(Ordering::Relaxed);
+                };
+                cadence.listed(
+                    tokio::time::Instant::now(),
+                    live.is_some(),
+                    failure.as_ref(),
+                );
             }
         });
 
@@ -925,6 +987,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             },
         };
 
+        // A live send spends the same relay budget as HTTP, and a refusal on
+        // the socket fails every pending live send, so wait out a known hold.
+        self.http
+            .wait_for_rate_limit(
+                override_host.unwrap_or_else(|| self.host()),
+                self.http.rate_limit_deadline(),
+            )
+            .await?;
+
         // Emit — hold the lock only for the emit, not while awaiting the answer.
         let emitted = {
             let guard = self.ws_state.lock().await;
@@ -973,6 +1044,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<DeliveryMode, MessageBoxError> {
         if let Err(reason) = outcome {
             tracing::debug!(%reason, %message_id, "live send not accepted; sending over HTTP");
+            // A rate-limit refusal holds the relay, so the HTTP send below
+            // waits it out instead of being refused too.
+            self.http
+                .hold_for_rate_limit(override_host.unwrap_or_else(|| self.host()), &reason);
             let http_id = self
                 .send_persisted(
                     override_host,
@@ -1095,12 +1170,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 // Delivery callback wrappers
 // ---------------------------------------------------------------------------
 
-/// Maximum consecutive poll-backstop skips before a poll is forced regardless of
-/// WS activity. At the 2 s interval this caps the catch-up window at ~16 s, so a
-/// chatty room that keeps WS *activity* alive can never permanently suppress the
-/// backstop even if *individual* pushes are being lost.
-const MAX_POLL_SKIPS: u32 = 7;
-
 /// How long a live send waits for the relay to accept or refuse it before
 /// it falls back to HTTP.
 const LIVE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1133,36 +1202,105 @@ fn exactly_once(
     })
 }
 
-/// Wrap a callback so every invocation first bumps `activity`. Installed only on
-/// the WebSocket delivery path, so the HTTP poll backstop can tell when live
-/// push is healthy and stand down (see the poll loop in
-/// [`MessageBoxClient::listen_for_live_messages`]).
-fn record_ws_activity(
-    inner: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
-    activity: Arc<std::sync::atomic::AtomicU64>,
-) -> Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> {
-    Arc::new(move |msg: AuthenticatedPeerMessage| {
-        activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        inner(msg);
-    })
+/// How often the poll backstop wakes to decide whether to list.
+const POLL_TICK: Duration = Duration::from_secs(1);
+/// Default for [`MessageBoxClient::with_poll_interval`].
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Without a connected WebSocket the poll lists after `POLL_OFFLINE_MIN`,
+/// doubling up to `POLL_OFFLINE_MAX`.
+const POLL_OFFLINE_MIN: Duration = Duration::from_secs(1);
+const POLL_OFFLINE_MAX: Duration = Duration::from_secs(8);
+/// After a failed list the poll waits `POLL_ERROR_MIN`, doubling up to
+/// `POLL_ERROR_MAX`, on top of its usual cadence.
+const POLL_ERROR_MIN: Duration = Duration::from_secs(2);
+const POLL_ERROR_MAX: Duration = Duration::from_secs(60);
+
+/// When the poll backstop lists next.
+///
+/// Every list costs the relay rate budget that sends also spend (10 a
+/// minute for an uncertified key), so the poll lists only:
+/// - first thing, and once after every WebSocket connect or reconnect, to
+///   catch up on what arrived while the socket was down;
+/// - while the socket is connected, `live_interval` after the last list;
+/// - with no connected socket, `POLL_OFFLINE_MIN` after the last list,
+///   doubling to `POLL_OFFLINE_MAX`;
+/// - never before a rate-limit refusal's `retry_after` has passed, or before
+///   a growing back-off after a failed list.
+struct PollCadence {
+    live_interval: Duration,
+    /// The connection count at the last catch-up.
+    connections: u64,
+    last_list: Option<tokio::time::Instant>,
+    /// Lists in a row made with no connected socket.
+    offline_streak: u32,
+    error_wait: Option<Duration>,
+    not_before: Option<tokio::time::Instant>,
 }
 
-/// Decide whether the poll backstop should run this interval, given the current
-/// WS-activity counter vs the value at the last check.
-///
-/// Skips (returns `false`) while WS push is delivering — *unless* `MAX_POLL_SKIPS`
-/// consecutive skips have accrued, in which case it forces a poll so partial push
-/// loss on an otherwise-active connection can't permanently suppress catch-up.
-/// Updates `last_activity` and `skipped` in place.
-fn poll_should_run(current_activity: u64, last_activity: &mut u64, skipped: &mut u32) -> bool {
-    if current_activity != *last_activity && *skipped < MAX_POLL_SKIPS {
-        *last_activity = current_activity;
-        *skipped += 1;
-        return false; // WS push is healthy this interval — stand down
+impl PollCadence {
+    fn new(live_interval: Duration, connections: u64) -> Self {
+        Self {
+            live_interval,
+            connections,
+            last_list: None,
+            offline_streak: 0,
+            error_wait: None,
+            not_before: None,
+        }
     }
-    *last_activity = current_activity;
-    *skipped = 0;
-    true
+
+    /// Whether to list now. `live` is the connection count while the
+    /// WebSocket is connected, `None` while it is not.
+    fn due(&mut self, now: tokio::time::Instant, live: Option<u64>) -> bool {
+        if self.not_before.is_some_and(|t| now < t) {
+            return false;
+        }
+        let Some(last) = self.last_list else {
+            return true;
+        };
+        match live {
+            Some(connections) if connections != self.connections => {
+                self.connections = connections;
+                true
+            }
+            Some(_) => now >= last + self.live_interval,
+            None => now >= last + self.offline_wait(),
+        }
+    }
+
+    /// The wait before the next list with no connected socket: 1 s after a
+    /// connected list (or the first), then doubling up to `POLL_OFFLINE_MAX`.
+    fn offline_wait(&self) -> Duration {
+        let doublings = self.offline_streak.saturating_sub(1).min(31);
+        POLL_OFFLINE_MIN
+            .saturating_mul(1 << doublings)
+            .min(POLL_OFFLINE_MAX)
+    }
+
+    /// Record a list made at `now` while the socket was `live`, and how it
+    /// failed, if it did.
+    fn listed(&mut self, now: tokio::time::Instant, live: bool, failure: Option<&MessageBoxError>) {
+        self.last_list = Some(now);
+        self.offline_streak = if live {
+            0
+        } else {
+            self.offline_streak.saturating_add(1)
+        };
+        self.not_before = match failure {
+            None => {
+                self.error_wait = None;
+                None
+            }
+            Some(MessageBoxError::RateLimited { retry_after, .. }) => Some(now + *retry_after),
+            Some(_) => {
+                let wait = self
+                    .error_wait
+                    .map_or(POLL_ERROR_MIN, |w| (w * 2).min(POLL_ERROR_MAX));
+                self.error_wait = Some(wait);
+                Some(now + wait)
+            }
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,7 +1389,7 @@ where
     };
     let body_bytes = serde_json::to_vec(&params)?;
     let url = format!("{host}/listMessages");
-    let response = http.fetch_ok(&url, "POST", Some(body_bytes)).await?;
+    let response = http.fetch_budgeted(host, &url, body_bytes).await?;
 
     // Apply the same pre-deserialization page cap and single-pass success parser
     // as the public full/lite list paths.
@@ -1805,71 +1943,56 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2, "m1 once + m2 once");
     }
 
+    /// While the socket is connected the poll lists first thing, then once
+    /// per reconnect, and otherwise only every `live_interval`.
     #[test]
-    fn record_ws_activity_bumps_counter_and_forwards() {
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-        let activity = Arc::new(AtomicU64::new(0));
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
-            Arc::new(move |_m| {
-                c.fetch_add(1, Ordering::SeqCst);
-            });
-        let wrapped = super::record_ws_activity(inner, activity.clone());
+    fn a_connected_poll_lists_on_each_connect_then_every_interval() {
+        let s = std::time::Duration::from_secs;
+        let t0 = tokio::time::Instant::now();
+        let mut cadence = super::PollCadence::new(s(15), 1);
 
-        wrapped(peer_msg("m1"));
-        wrapped(peer_msg("m2"));
-
-        assert_eq!(
-            activity.load(Ordering::Relaxed),
-            2,
-            "counter bumped per delivery"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            2,
-            "inner callback forwarded each time"
-        );
+        assert!(cadence.due(t0, Some(1)), "first thing");
+        cadence.listed(t0, true, None);
+        assert!(!cadence.due(t0 + s(14), Some(1)));
+        assert!(cadence.due(t0 + s(15), Some(1)), "the safety net");
+        cadence.listed(t0 + s(15), true, None);
+        assert!(cadence.due(t0 + s(16), Some(2)), "a reconnect catches up");
+        cadence.listed(t0 + s(16), true, None);
+        assert!(!cadence.due(t0 + s(17), Some(2)), "once per reconnect");
     }
 
+    /// Without a socket the poll backs off 1 s doubling to 8 s; it waits out
+    /// a rate-limit refusal, and failed lists back off to 60 s, never spin.
     #[test]
-    fn poll_should_run_runs_when_ws_quiet() {
-        // current == last → WS delivered nothing this interval → poll runs.
-        let mut last = 5u64;
-        let mut skipped = 0u32;
-        assert!(super::poll_should_run(5, &mut last, &mut skipped));
-        assert_eq!(skipped, 0);
-    }
-
-    #[test]
-    fn poll_should_run_stands_down_when_ws_active() {
-        // current != last → WS delivered → stand down (within the skip budget).
-        let mut last = 5u64;
-        let mut skipped = 0u32;
-        assert!(!super::poll_should_run(6, &mut last, &mut skipped));
-        assert_eq!(last, 6, "last_activity advances to current");
-        assert_eq!(skipped, 1);
-    }
-
-    #[test]
-    fn poll_should_run_forces_catch_up_after_max_skips() {
-        // A perpetually-active connection must still be polled at least every
-        // MAX_POLL_SKIPS intervals so partial push loss can't suppress catch-up.
-        let mut last = 0u64;
-        let mut skipped = 0u32;
-        let mut runs = 0u32;
-        for tick in 1..=(super::MAX_POLL_SKIPS as u64 * 3) {
-            // WS "delivers" every interval → counter always changes.
-            if super::poll_should_run(tick, &mut last, &mut skipped) {
-                runs += 1;
-            }
+    fn a_poll_backs_off_offline_after_refusals_and_after_failures() {
+        let s = std::time::Duration::from_secs;
+        let just_before = |t: tokio::time::Instant| t - std::time::Duration::from_millis(1);
+        let mut t = tokio::time::Instant::now();
+        let mut cadence = super::PollCadence::new(s(15), 0);
+        assert!(cadence.due(t, None));
+        cadence.listed(t, false, None);
+        for wait in [1, 2, 4, 8, 8] {
+            assert!(!cadence.due(just_before(t + s(wait)), None), "{wait}s");
+            t += s(wait);
+            assert!(cadence.due(t, None), "{wait}s");
+            cadence.listed(t, false, None);
         }
-        // Over 3*MAX_POLL_SKIPS always-active intervals, the forced poll fires
-        // roughly every (MAX_POLL_SKIPS+1) intervals — at least twice.
-        assert!(
-            runs >= 2,
-            "forced catch-up must fire periodically, got {runs}"
-        );
+
+        let refused = MessageBoxError::RateLimited {
+            retry_after: s(30),
+            tier: None,
+        };
+        cadence.listed(t, false, Some(&refused));
+        assert!(!cadence.due(just_before(t + s(30)), None));
+        t += s(30);
+        assert!(cadence.due(t, None));
+
+        let too_big = MessageBoxError::Validation("listMessages response too large".into());
+        for _ in 0..6 {
+            cadence.listed(t, true, Some(&too_big));
+        }
+        assert!(!cadence.due(just_before(t + s(60)), Some(0)));
+        assert!(cadence.due(t + s(60), Some(0)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1900,38 +2023,5 @@ mod tests {
         }
         // 100 distinct ids, each delivered exactly once despite 8 racing tasks.
         assert_eq!(count.load(Ordering::SeqCst), 100);
-    }
-
-    #[test]
-    fn exactly_once_composes_with_record_ws_activity() {
-        // Mirrors the wiring in listen_for_live_messages: the WS path stamps
-        // activity then delivers through the shared dedup; the poll path shares
-        // the same dedup. A message delivered by WS must not be re-delivered by
-        // a later poll of the same id.
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-        let activity = Arc::new(AtomicU64::new(0));
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
-            Arc::new(move |_m| {
-                c.fetch_add(1, Ordering::SeqCst);
-            });
-        let deduped = super::exactly_once(inner);
-        let ws_path = super::record_ws_activity(deduped.clone(), activity.clone());
-        let poll_path = deduped;
-
-        ws_path(peer_msg("m1")); // delivered via WS, stamps activity
-        poll_path(peer_msg("m1")); // poll re-sees the same id → suppressed
-
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "delivered exactly once across paths"
-        );
-        assert_eq!(
-            activity.load(Ordering::Relaxed),
-            1,
-            "only the WS path stamps activity"
-        );
     }
 }

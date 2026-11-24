@@ -373,11 +373,11 @@ This crate targets full behavioral parity with `@bsv/message-box-client` v2.0.x.
 ## Testing
 
 ```bash
-# Run all offline tests (173 tests: 155 unit + 12 integration + 6 parity)
+# Run all offline tests (175 tests: 157 unit + 12 integration + 6 parity)
 cargo test
 
 # Run specific test suites
-cargo test --lib               # Unit tests (155)
+cargo test --lib               # Unit tests (157)
 cargo test --test integration  # Integration tests (12)
 cargo test --test parity       # Parity verification tests (6)
 

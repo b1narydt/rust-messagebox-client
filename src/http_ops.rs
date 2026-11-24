@@ -2799,4 +2799,50 @@ mod tests {
         );
         assert_eq!(relay.sent().len(), 1);
     }
+
+    /// The relay refuses a sender the recipient has not whitelisted with
+    /// `ERR_DELIVERY_BLOCKED`; a payment request says why instead. Any other
+    /// refusal keeps the relay's own code.
+    #[tokio::test]
+    async fn a_blocked_payment_request_names_the_whitelist() {
+        let recipient = ArcWallet::new()
+            .get_public_key(
+                GetPublicKeyArgs {
+                    identity_key: true,
+                    protocol_id: None,
+                    key_id: None,
+                    counterparty: None,
+                    privileged: false,
+                    privileged_reason: None,
+                    for_self: None,
+                    seek_permission: None,
+                },
+                None,
+            )
+            .await
+            .expect("get_public_key")
+            .public_key
+            .to_der_hex();
+        let relay = ScriptedTransport::new();
+        relay.push(
+            403,
+            &[],
+            json!({"status":"error","code":"ERR_DELIVERY_BLOCKED","description":"Blocked recipients: x"}),
+        );
+
+        relay.push(403, &[], json!({"error":"not_certified"}));
+        let client = scripted_client(&relay);
+        let request = || client.request_payment_to_host(&recipient, 1000, "rent", u64::MAX, HOST);
+
+        let err = request().await.expect_err("blocked");
+        assert!(
+            matches!(&err, MessageBoxError::Validation(why) if why.contains("whitelist")),
+            "{err:?}"
+        );
+        let err = request().await.expect_err("not certified");
+        assert!(
+            matches!(&err, MessageBoxError::Relay { code, .. } if code == "not_certified"),
+            "{err:?}"
+        );
+    }
 }

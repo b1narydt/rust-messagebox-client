@@ -444,6 +444,19 @@ mod tests {
         }
     }
 
+    /// A shorter refusal never cuts a longer hold short.
+    #[tokio::test(start_paused = true)]
+    async fn a_shorter_refusal_keeps_the_longer_hold() {
+        let gate = RateGate::default();
+        gate.hold("https://relay.example", Duration::from_secs(30), None);
+        gate.hold("https://relay.example", Duration::from_secs(5), None);
+        let started = tokio::time::Instant::now();
+        gate.wait("https://relay.example", started + MAX_RETRY_AFTER)
+            .await
+            .expect("within the deadline");
+        assert!(started.elapsed() >= Duration::from_secs(30));
+    }
+
     /// A pinned check fails closed when the server proved no key at all.
     #[test]
     fn a_pin_refuses_a_response_with_no_proven_key() {

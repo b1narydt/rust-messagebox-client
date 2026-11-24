@@ -867,7 +867,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// own room, then emits. Falls back to HTTP, with the same message id, if
     /// the connection cannot be established, the emit fails, the relay refuses
     /// the send (`messageFailed`), or no ack names this message within 10 s.
-    /// Before the emit it waits out a rate-limit hold on the relay, and returns
+    /// A pinned client whose socket meets a relay that proves another key
+    /// returns [`MessageBoxError::RelayIdentityMismatch`] and sends nothing
+    /// over HTTP. Before the emit it waits out a rate-limit hold on the relay, and returns
     /// [`MessageBoxError::RateLimited`] if that wait would pass
     /// [`with_rate_limit_wait`](Self::with_rate_limit_wait).
     ///
@@ -936,6 +938,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
         if let Err(e) = self.ensure_ws_connected(override_host).await {
+            // The server at this host is not the pinned relay: the send ends
+            // here, and is not resent over HTTP to the same server.
+            if matches!(e, MessageBoxError::RelayIdentityMismatch { .. }) {
+                return Err(e);
+            }
             eprintln!("Warning: WebSocket connection failed, falling back to HTTP: {e}");
             // Returns Persisted because no WS ack was received.
             let msg_id = self

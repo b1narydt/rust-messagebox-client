@@ -37,6 +37,7 @@ use super::tests::ArcWallet;
 use super::MessageBoxClient;
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
+use crate::transport::scripted::ScriptedTransport;
 use crate::websocket::CertificateProvider;
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000011";
@@ -224,6 +225,38 @@ async fn ws_send_lowercases_the_recipient() {
     assert_eq!(sent["roomId"], format!("{recipient}-inbox"));
     assert_eq!(sent["message"]["recipient"], recipient);
     sender.disconnect_web_socket().await.expect("disconnect");
+}
+
+/// A pinned live send whose socket meets a relay that proves another key
+/// ends with the mismatch and sends nothing over HTTP.
+#[tokio::test]
+async fn a_pinned_live_send_stops_at_a_relay_that_proves_another_key() {
+    let mut relay = Relay::boot(AuthSocketServer::new()).await;
+    let http = ScriptedTransport::new();
+    let sender = client(&relay.url)
+        .with_expected_relay_key(identity_of(OTHER_KEY).await)
+        .with_transport(http.clone());
+
+    let result = within(sender.send_live_message(
+        &identity_of(OTHER_KEY).await,
+        "inbox",
+        "hello",
+        true,
+        false,
+        Some("id-pinned"),
+        Some(&relay.url),
+    ))
+    .await;
+    assert!(
+        matches!(result, Err(MessageBoxError::RelayIdentityMismatch { .. })),
+        "{result:?}"
+    );
+    assert!(
+        http.sent().is_empty(),
+        "resent over HTTP: {:?}",
+        http.sent()
+    );
+    assert!(relay.settled_send().await.is_none(), "emitted to the relay");
 }
 
 /// A live send first waits out a known rate-limit hold on the relay. When

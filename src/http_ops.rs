@@ -1438,31 +1438,40 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// (same `join_all` pattern as `list_messages`). Returns Ok if ANY host succeeds;
     /// if every host fails, returns this client's own host's error.
     /// When `override_host` is Some, acks on that single host only.
+    ///
+    /// While the call runs, a subscription drops copies of these ids, so it
+    /// cannot delete a row ahead of this ack. Once the call answers, fails
+    /// or is cancelled, it acknowledges copies instead of delivering them.
+    /// `ERR_INVALID_ACKNOWLEDGMENT` is retried for 5 s, unless every id was
+    /// already acknowledged: then the row is most likely gone, and the call
+    /// makes one attempt.
     pub async fn acknowledge_message(
         &self,
         message_ids: Vec<String>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        {
-            let mut acked = crate::client::lock_ids(&self.acked_ids);
-            for id in &message_ids {
-                acked.insert(id.clone());
-            }
-        }
+        let flight = crate::client::AckInFlight::begin(&self.acked_ids, &message_ids);
+        let grace = if flight.repeat {
+            std::time::Duration::ZERO
+        } else {
+            ACK_GRACE
+        };
         let host = self.assert_initialized(override_host).await?;
 
         if override_host.is_some() {
-            return self.acknowledge_message_on_host(host, &message_ids).await;
+            return self
+                .acknowledge_message_on_host(host, &message_ids, grace)
+                .await;
         }
 
         // Multi-host fan-out: ack on all known hosts concurrently.
         let hosts = self.fan_out_hosts().await?;
         if hosts.len() == 1 {
             return self
-                .acknowledge_message_on_host(self.host(), &message_ids)
+                .acknowledge_message_on_host(self.host(), &message_ids, grace)
                 .await;
         }
-        self.acknowledge_message_on_hosts(&hosts, &message_ids)
+        self.acknowledge_message_on_hosts(&hosts, &message_ids, grace)
             .await
     }
 
@@ -1472,10 +1481,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         hosts: &[String],
         message_ids: &[String],
+        grace: std::time::Duration,
     ) -> Result<(), MessageBoxError> {
         let futures: Vec<_> = hosts
             .iter()
-            .map(|host| self.acknowledge_message_on_host(host, message_ids))
+            .map(|host| self.acknowledge_message_on_host(host, message_ids, grace))
             .collect();
         answers_or_first_error(join_all(futures).await).map(|_| ())
     }
@@ -1485,19 +1495,42 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         host: &str,
         message_ids: &[String],
+        grace: std::time::Duration,
     ) -> Result<(), MessageBoxError> {
-        acknowledge_on_host(&self.http, host, message_ids).await
+        acknowledge_on_host_within(&self.http, host, message_ids, grace).await
     }
 }
 
-/// Acknowledges `message_ids` on `host`. The relay pushes a live message
-/// before it stores it, so `ERR_INVALID_ACKNOWLEDGMENT` is retried for 5 s.
-pub(crate) async fn acknowledge_on_host(
+/// How long an ack retries `ERR_INVALID_ACKNOWLEDGMENT`: the relay pushes a
+/// live message before it stores it.
+const ACK_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Acknowledges a repeat of an acknowledged id on `host`, once. Not found
+/// means the row is gone, or is not stored yet; the poll lists a stored row
+/// again and this runs again, so it is not retried.
+pub(crate) async fn reacknowledge_on_host(http: &RelayHttp, host: &str, message_id: String) {
+    let ids = [message_id];
+    match acknowledge_on_host_within(http, host, &ids, std::time::Duration::ZERO).await {
+        Ok(()) => {}
+        Err(MessageBoxError::Relay {
+            status: 400, code, ..
+        }) if code == "ERR_INVALID_ACKNOWLEDGMENT" => {}
+        Err(e) => tracing::warn!(
+            message_id = %ids[0],
+            error = %e,
+            "could not acknowledge a repeat of an acknowledged message"
+        ),
+    }
+}
+
+/// Acknowledges `message_ids` on `host`, retrying `ERR_INVALID_ACKNOWLEDGMENT`
+/// until `grace` has passed. A zero `grace` makes one attempt.
+async fn acknowledge_on_host_within(
     http: &RelayHttp,
     host: &str,
     message_ids: &[String],
+    grace: std::time::Duration,
 ) -> Result<(), MessageBoxError> {
-    const PERSISTENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
     const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
     const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1506,7 +1539,7 @@ pub(crate) async fn acknowledge_on_host(
     };
     let body_bytes = serde_json::to_vec(&params)?;
     let url = format!("{host}/acknowledgeMessage");
-    let deadline = tokio::time::Instant::now() + PERSISTENCE_GRACE;
+    let deadline = tokio::time::Instant::now() + grace;
     let mut delay = INITIAL_RETRY_DELAY;
 
     loop {
@@ -2630,7 +2663,7 @@ mod tests {
         let client = scripted_client(&relay);
 
         client
-            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .acknowledge_message_on_host(HOST, &["m1".to_string()], super::ACK_GRACE)
             .await
             .expect("the second ack lands");
         let sent = relay.sent();
@@ -2653,7 +2686,7 @@ mod tests {
         let started = tokio::time::Instant::now();
 
         let err = client
-            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .acknowledge_message_on_host(HOST, &["m1".to_string()], super::ACK_GRACE)
             .await
             .expect_err("the row never appears");
         assert!(
@@ -2844,6 +2877,154 @@ mod tests {
         (url, lookups)
     }
 
+    /// An ack's ids are in flight until the relay answers, so a subscription
+    /// drops a copy instead of re-acking it; only then are they acknowledged.
+    #[tokio::test]
+    async fn an_acks_ids_are_in_flight_until_the_relay_answers() {
+        use crate::client::{AckLedger, AckState};
+        use crate::transport::{scripted::RELAY_KEY, HttpTransport, RelayResponse};
+        #[derive(Default)]
+        struct Observer {
+            ledger: std::sync::OnceLock<Arc<std::sync::Mutex<AckLedger>>>,
+            state_in_flight: std::sync::Mutex<Option<AckState>>,
+        }
+        #[async_trait::async_trait]
+        impl HttpTransport for Observer {
+            async fn fetch(
+                &self,
+                _url: &str,
+                _method: &str,
+                _body: Option<Vec<u8>>,
+                _headers: Option<std::collections::HashMap<String, String>>,
+            ) -> Result<RelayResponse, MessageBoxError> {
+                let ledger = self.ledger.get().expect("ledger wired");
+                *self.state_in_flight.lock().unwrap() =
+                    Some(crate::client::lock_ids(ledger).state("id-1"));
+                Ok(RelayResponse {
+                    status: 200,
+                    headers: Default::default(),
+                    body: br#"{"status":"success"}"#.to_vec(),
+                    server_identity_key: Some(RELAY_KEY.to_string()),
+                })
+            }
+        }
+        let relay = Arc::new(Observer::default());
+        let client = pinned_client(relay.clone());
+        let _ = relay.ledger.set(client.acked_ids.clone());
+
+        client
+            .acknowledge_message(vec!["id-1".to_string()], Some(HOST))
+            .await
+            .expect("ack");
+        assert_eq!(
+            *relay.state_in_flight.lock().unwrap(),
+            Some(AckState::InFlight)
+        );
+        assert_eq!(
+            crate::client::lock_ids(&client.acked_ids).state("id-1"),
+            AckState::Acked
+        );
+    }
+
+    /// An ack whose caller gives up still records its ids, so a later copy
+    /// of the row is acknowledged rather than left on the relay.
+    #[tokio::test]
+    async fn a_cancelled_ack_still_records_its_ids() {
+        use crate::client::AckState;
+        use crate::transport::{HttpTransport, RelayResponse};
+        struct Silent;
+        #[async_trait::async_trait]
+        impl HttpTransport for Silent {
+            async fn fetch(
+                &self,
+                _url: &str,
+                _method: &str,
+                _body: Option<Vec<u8>>,
+                _headers: Option<std::collections::HashMap<String, String>>,
+            ) -> Result<RelayResponse, MessageBoxError> {
+                std::future::pending().await
+            }
+        }
+        let client = pinned_client(Arc::new(Silent));
+
+        let ack = client.acknowledge_message(vec!["id-1".to_string()], Some(HOST));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), ack)
+                .await
+                .is_err(),
+            "the relay never answers"
+        );
+        assert_eq!(
+            crate::client::lock_ids(&client.acked_ids).state("id-1"),
+            AckState::Acked
+        );
+    }
+
+    /// An ack of ids that were all acknowledged before makes one attempt: a
+    /// subscription may have deleted the row since, so not found is not
+    /// retried.
+    #[tokio::test]
+    async fn an_ack_of_acknowledged_ids_makes_one_attempt() {
+        let relay = ScriptedTransport::new();
+        relay.push(
+            400,
+            &[],
+            json!({"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"}),
+        );
+        let client = pinned_client(relay.clone());
+        drop(crate::client::AckInFlight::begin(
+            &client.acked_ids,
+            &["id-1".to_string()],
+        ));
+
+        let error = client
+            .acknowledge_message(vec!["id-1".to_string()], Some(HOST))
+            .await
+            .expect_err("not found");
+        assert!(
+            matches!(&error, MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"),
+            "{error:?}"
+        );
+        assert_eq!(relay.sent().len(), 1);
+    }
+
+    fn pinned_client(
+        relay: Arc<dyn crate::transport::HttpTransport>,
+    ) -> crate::MessageBoxClient<ArcWallet> {
+        let client = crate::MessageBoxClient::new(
+            HOST.to_string(),
+            ArcWallet::new(),
+            None,
+            bsv::services::overlay_tools::Network::Local,
+        )
+        .with_expected_relay_key(crate::transport::scripted::RELAY_KEY)
+        .with_transport(relay);
+        client.init_once.set(()).expect("skip the advertisement");
+        client
+    }
+
+    /// A re-ack of a row that is already gone costs one request: it is not
+    /// retried through the persistence grace.
+    #[tokio::test]
+    async fn a_reack_of_a_row_already_gone_is_one_request() {
+        let relay = ScriptedTransport::new();
+        relay.push(
+            400,
+            &[],
+            json!({"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"}),
+        );
+        let client = crate::MessageBoxClient::new(
+            HOST.to_string(),
+            ArcWallet::new(),
+            None,
+            bsv::services::overlay_tools::Network::Local,
+        )
+        .with_transport(relay.clone());
+
+        super::reacknowledge_on_host(&client.http, HOST, "id-1".to_string()).await;
+        assert_eq!(relay.sent().len(), 1);
+    }
+
     /// A pinned client never asks the overlay for a host: its send, list and
     /// ack go to its own host alone. An unpinned client on the same tracker
     /// does ask it.
@@ -2879,8 +3060,9 @@ mod tests {
             .acknowledge_message(vec!["id-1".to_string()], None)
             .await
             .expect("ack");
-        assert!(
-            crate::client::lock_ids(&pinned.acked_ids).contains("id-1"),
+        assert_eq!(
+            crate::client::lock_ids(&pinned.acked_ids).state("id-1"),
+            crate::client::AckState::Acked,
             "an acknowledged id is remembered, so a later copy is acked, not delivered"
         );
         assert_eq!(
@@ -3124,7 +3306,7 @@ mod tests {
         let client = scripted_client(&relay);
 
         let err = client
-            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .acknowledge_message_on_host(HOST, &["m1".to_string()], super::ACK_GRACE)
             .await
             .expect_err("refused");
         assert!(
@@ -3173,7 +3355,7 @@ mod tests {
 
         refuse_both();
         let err = client
-            .acknowledge_message_on_hosts(&hosts, &["m1".to_string()])
+            .acknowledge_message_on_hosts(&hosts, &["m1".to_string()], super::ACK_GRACE)
             .await
             .expect_err("every host refused the ack");
         assert_eq!(code_of(err), hosts_code(2));

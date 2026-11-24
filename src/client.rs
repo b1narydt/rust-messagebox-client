@@ -224,10 +224,10 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// On WS reconnect, ensure_ws_connected replays joinRoom + re-subscribes
     /// each entry on the fresh socket.
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
-    /// The last [`ACKED_IDS`] ids passed to `acknowledge_message`. The relay
-    /// deletes a row on ack, so a later send of the same id is a new row; a
-    /// subscription acks that row instead of delivering it again.
-    pub(crate) acked_ids: Arc<std::sync::Mutex<BoundedIdSet>>,
+    /// The ids `acknowledge_message` is acknowledging now, and the last
+    /// [`ACKED_IDS`] it has acknowledged. A subscription drops a copy of the
+    /// first and acknowledges a copy of the second instead of delivering it.
+    pub(crate) acked_ids: Arc<std::sync::Mutex<AckLedger>>,
 }
 
 /// How many acknowledged ids a client remembers.
@@ -259,7 +259,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             poll_interval: DEFAULT_POLL_INTERVAL,
             joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
-            acked_ids: Arc::new(std::sync::Mutex::new(BoundedIdSet::new(ACKED_IDS))),
+            acked_ids: Arc::new(std::sync::Mutex::new(AckLedger::new(ACKED_IDS))),
         }
     }
 
@@ -397,6 +397,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     // -----------------------------------------------------------------------
     // Public getters (needed by http_ops)
     // -----------------------------------------------------------------------
+
+    /// Where `message_id` stands with this client's `acknowledge_message`
+    /// calls. A consumer that lists the box itself uses it to treat copies
+    /// the way a live listener does: deliver an `Unacked` one, drop an
+    /// `InFlight` one, and acknowledge an `Acked` one again.
+    pub fn acknowledgement(&self, message_id: &str) -> AckState {
+        lock_ids(&self.acked_ids).state(message_id)
+    }
 
     /// Return the trimmed host URL.
     pub fn host(&self) -> &str {
@@ -866,21 +874,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let reack = {
             let http = self.http.clone();
             let host = override_host.unwrap_or(self.host()).to_string();
-            let room_id = room_id.clone();
             Arc::new(move |id: String| {
                 let http = http.clone();
                 let host = host.clone();
-                let room_id = room_id.clone();
                 tokio::spawn(async move {
-                    let ids = [id];
-                    if let Err(e) = crate::http_ops::acknowledge_on_host(&http, &host, &ids).await {
-                        tracing::warn!(
-                            %room_id,
-                            message_id = %ids[0],
-                            error = %e,
-                            "could not acknowledge a repeat of an acknowledged message"
-                        );
-                    }
+                    crate::http_ops::reacknowledge_on_host(&http, &host, id).await;
                 });
             }) as Arc<dyn Fn(String) + Send + Sync>
         };
@@ -1358,21 +1356,31 @@ const LIVE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// serves. This suppresses duplicates only; delivery liveness comes from the
 /// WS + poll paths, not from this wrapper.
 ///
-/// An id in `acked` (one the client acknowledged) is never delivered again.
-/// The relay deleted that row on the ack, so the message now in the box is a
-/// later send of the same id: `reack` acknowledges it, or it would stay in the
-/// box. A repeat of an id the consumer has not acknowledged is only dropped:
-/// the consumer may still need that row.
+/// An id in `acked` is never delivered again:
+/// - While the client's own ack of it is in flight, a copy is dropped. That
+///   ack is about to delete the row.
+/// - Once that ack has answered, failed or been cancelled, `reack`
+///   acknowledges a copy. The row is either one the ack did not delete, or a
+///   later send of the same id, and either way it would otherwise stay in the
+///   box.
+///
+/// A repeat of an id the consumer has not acknowledged is only dropped: the
+/// consumer may still need that row.
 fn exactly_once(
     inner: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
-    acked: Arc<std::sync::Mutex<BoundedIdSet>>,
+    acked: Arc<std::sync::Mutex<AckLedger>>,
     reack: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> {
     let seen = Arc::new(std::sync::Mutex::new(BoundedIdSet::new(10_000)));
     Arc::new(move |msg: AuthenticatedPeerMessage| {
-        if lock_ids(&acked).contains(&msg.message_id) {
-            reack(msg.message_id);
-            return;
+        let state = lock_ids(&acked).state(&msg.message_id);
+        match state {
+            AckState::InFlight => return,
+            AckState::Acked => {
+                reack(msg.message_id);
+                return;
+            }
+            AckState::Unacked => {}
         }
         if lock_ids(&seen).insert(msg.message_id.clone()) {
             inner(msg);
@@ -1383,9 +1391,7 @@ fn exactly_once(
 /// Recover rather than panic on poison: a poisoned id set is harmless (worst
 /// case one duplicate delivery or ack), whereas panicking would kill the WS
 /// dispatcher or the spawned poll task and stop delivery entirely.
-pub(crate) fn lock_ids(
-    ids: &std::sync::Mutex<BoundedIdSet>,
-) -> std::sync::MutexGuard<'_, BoundedIdSet> {
+pub(crate) fn lock_ids<T>(ids: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     ids.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
@@ -1500,6 +1506,92 @@ impl PollCadence {
 // ---------------------------------------------------------------------------
 // Bounded dedup set
 // ---------------------------------------------------------------------------
+
+/// What a client has acknowledged, and what it is acknowledging now.
+pub(crate) struct AckLedger {
+    acked: BoundedIdSet,
+    /// How many `acknowledge_message` calls hold each id right now.
+    in_flight: HashMap<String, usize>,
+}
+
+/// Where a message id stands with this client's acknowledgements
+/// ([`MessageBoxClient::acknowledgement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckState {
+    /// No `acknowledge_message` call for it, or not among the last 10,000.
+    Unacked,
+    /// An `acknowledge_message` call for it has not finished. A copy of the
+    /// message seen now is dropped: that call is deleting the row.
+    InFlight,
+    /// An `acknowledge_message` call for it has answered, failed or been
+    /// cancelled. A copy of the message seen now is a row the relay still
+    /// holds, and should be acknowledged again.
+    Acked,
+}
+
+impl AckLedger {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            acked: BoundedIdSet::new(capacity),
+            in_flight: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn state(&self, id: &str) -> AckState {
+        if self.in_flight.contains_key(id) {
+            AckState::InFlight
+        } else if self.acked.contains(id) {
+            AckState::Acked
+        } else {
+            AckState::Unacked
+        }
+    }
+
+    fn finish(&mut self, ids: &[String]) {
+        for id in ids {
+            if let Some(count) = self.in_flight.get_mut(id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.in_flight.remove(id);
+                }
+            }
+            self.acked.insert(id.clone());
+        }
+    }
+}
+
+/// Holds ids in flight for one `acknowledge_message` call. Dropping it
+/// records them as acknowledged, so they are recorded whether the call
+/// answers, fails or is cancelled.
+pub(crate) struct AckInFlight {
+    ledger: Arc<std::sync::Mutex<AckLedger>>,
+    ids: Vec<String>,
+    /// Every id was already acknowledged, or held by another call, when this
+    /// call began.
+    pub(crate) repeat: bool,
+}
+
+impl AckInFlight {
+    pub(crate) fn begin(ledger: &Arc<std::sync::Mutex<AckLedger>>, ids: &[String]) -> Self {
+        let mut guard = lock_ids(ledger);
+        let repeat = !ids.is_empty() && ids.iter().all(|id| guard.state(id) != AckState::Unacked);
+        for id in ids {
+            *guard.in_flight.entry(id.clone()).or_default() += 1;
+        }
+        drop(guard);
+        Self {
+            ledger: ledger.clone(),
+            ids: ids.to_vec(),
+            repeat,
+        }
+    }
+}
+
+impl Drop for AckInFlight {
+    fn drop(&mut self) {
+        lock_ids(&self.ledger).finish(&self.ids);
+    }
+}
 
 /// A bounded set with FIFO eviction for deduplicating message IDs.
 ///
@@ -2194,12 +2286,13 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2, "m1 once + m2 once");
     }
 
-    fn no_acked_ids() -> Arc<std::sync::Mutex<super::BoundedIdSet>> {
-        Arc::new(std::sync::Mutex::new(super::BoundedIdSet::new(16)))
+    fn no_acked_ids() -> Arc<std::sync::Mutex<super::AckLedger>> {
+        Arc::new(std::sync::Mutex::new(super::AckLedger::new(16)))
     }
 
-    /// The relay deletes a row on ack, so a repeat of an acknowledged id is a
-    /// new row: it is acknowledged, never delivered. A repeat of an id the
+    /// A copy of an acknowledged id is acknowledged, never delivered. A copy
+    /// of an id whose ack is still in flight is dropped: that ack deletes the
+    /// row, and a re-ack racing it would make it miss. A repeat of an id the
     /// consumer has not acknowledged is only dropped, so its row stays.
     #[test]
     fn a_repeat_of_an_acknowledged_id_is_acknowledged_not_delivered() {
@@ -2218,7 +2311,13 @@ mod tests {
 
         deduped(peer_msg("held"));
         deduped(peer_msg("done"));
-        acked.lock().unwrap().insert("done".to_string());
+        // Acked from a list, never delivered here: dropped while in flight.
+        let flying = super::AckInFlight::begin(&acked, &["listed".to_string()]);
+        deduped(peer_msg("listed"));
+        // A second ack of a held id is a repeat: one attempt, no grace.
+        assert!(super::AckInFlight::begin(&acked, &["listed".to_string()]).repeat);
+        drop(flying);
+        drop(super::AckInFlight::begin(&acked, &["done".to_string()]));
         deduped(peer_msg("held"));
         deduped(peer_msg("done"));
 

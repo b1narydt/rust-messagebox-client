@@ -7,6 +7,34 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.6.2] — 2026-11-23
+
+### Fixed
+
+- **An ack no longer races the listener's re-ack of its own message**
+  (`src/http_ops.rs`, `src/client.rs`). 0.6.1 recorded ids as acknowledged
+  before the ack request went out. A copy of the row listed while that request
+  was in flight was then re-acked by the listener, which could delete the row
+  first; the caller's own ack got `ERR_INVALID_ACKNOWLEDGMENT` and retried it
+  for 5 s (about 20 requests).
+  - While an `acknowledge_message` call runs, its ids are in flight: the
+    listener drops a copy, and neither delivers nor re-acks it.
+  - The ids are recorded as acknowledged when the call ends, whether it
+    answered, failed or was cancelled.
+  - An ack of ids that were all acknowledged before, or are held by another
+    call, makes one attempt: the row may be gone already, so not found is not
+    retried.
+  - The listener's re-ack of a copy is one request. Not found means the row
+    is gone or not stored yet, and the poll lists a stored row again.
+
+### Added
+
+- `MessageBoxClient::acknowledgement(id)` returns the id's `AckState`
+  (`Unacked`, `InFlight` or `Acked`), so a caller that lists the box itself can
+  treat copies the way the listener does.
+
+---
+
 ## [0.6.1] — 2026-11-23
 
 ### Fixed

@@ -2645,8 +2645,9 @@ mod tests {
         let relay = ScriptedTransport::new();
         relay.push_from(IMPOSTOR, 200, &[], accepted("forged"));
         relay.push(200, &[], accepted("id-1"));
-        let pinned = scripted_client(&relay)
-            .with_expected_relay_key(format!(" {} ", RELAY_KEY.to_ascii_uppercase()));
+        let pinned = payment_client(ArcWallet::new(), None)
+            .with_expected_relay_key(format!(" {} ", RELAY_KEY.to_ascii_uppercase()))
+            .with_transport(relay.clone());
         let err = pinned
             .send_message_to_host(
                 HOST,

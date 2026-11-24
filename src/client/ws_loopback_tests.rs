@@ -3,9 +3,12 @@
 //! end-to-end tests boot it. The server stands in for the relay: it runs the
 //! BRC-103 handshake and the joinRoom rule, records each `sendMessage` and
 //! acks it the way the relay does.
+//!
+//! The pinned HTTP handshake runs against a stand-in for the relay's
+//! `/.well-known/auth` door: an SDK `Peer` behind axum.
 
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +19,10 @@ use authsocket::server::{
 use authsocket::server_io::{attach, emit_signed_to_socket, AppDispatcher};
 use bsv::auth::certificates::master::default_get_revocation_outpoint;
 use bsv::auth::certificates::{MasterCertificate, VerifiableCertificate};
-use bsv::auth::types::RequestedCertificateSet;
+use bsv::auth::peer::Peer;
+use bsv::auth::transports::Transport;
+use bsv::auth::types::{AuthMessage, MessageType, RequestedCertificateSet};
+use bsv::auth::AuthError;
 use bsv::primitives::private_key::PrivateKey;
 use bsv::primitives::public_key::PublicKey;
 use bsv::services::overlay_tools::Network;
@@ -288,6 +294,186 @@ async fn ws_answers_the_certificate_request_with_the_provider() {
     member.disconnect_web_socket().await.expect("disconnect");
 }
 
+/// Counts the relay's certificate requests and answers them with a
+/// membership certificate.
+fn counting_provider(asked: Arc<AtomicUsize>) -> CertificateProvider {
+    Arc::new(move |verifier, _requested| {
+        asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            Ok(vec![
+                membership_certificate(CLIENT_KEY, SERVER_KEY, &verifier).await,
+            ])
+        })
+    })
+}
+
+/// A relay that proved another key never reaches the certificate provider of
+/// a pinned client, whichever order the builders ran in; the connect fails as
+/// a pin mismatch. Pinned to the key the relay proves, the provider answers.
+#[tokio::test]
+async fn a_pinned_ws_provider_answers_only_the_pinned_relay() {
+    let server_key = identity_of(SERVER_KEY).await;
+    let other_key = identity_of(OTHER_KEY).await;
+    let core = AuthSocketServer::new();
+    core.set_certificates_to_request(membership_request(server_key.clone()));
+    core.set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+    let relay = Relay::boot(core).await;
+
+    let asked = Arc::new(AtomicUsize::new(0));
+    let pin_then_provider = client(&relay.url)
+        .with_expected_relay_key(&other_key)
+        .with_certificate_provider(counting_provider(asked.clone()));
+    let provider_then_pin = client(&relay.url)
+        .with_certificate_provider(counting_provider(asked.clone()))
+        .with_expected_relay_key(&other_key);
+    for pinned_elsewhere in [pin_then_provider, provider_then_pin] {
+        match within(pinned_elsewhere.join_room("inbox")).await {
+            Err(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
+                assert_eq!(observed.as_deref(), Some(server_key.as_str()));
+            }
+            other => panic!("expected RelayIdentityMismatch, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        0,
+        "another relay reached the provider"
+    );
+
+    let pinned_here = client(&relay.url)
+        .with_certificate_provider(counting_provider(asked.clone()))
+        .with_expected_relay_key(&server_key);
+    within(pinned_here.join_room("inbox"))
+        .await
+        .expect("the pinned relay's certificate request is answered");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    pinned_here
+        .disconnect_web_socket()
+        .await
+        .expect("disconnect");
+}
+
+/// Without a provider the WebSocket handshake proves certificates from the
+/// wallet. Pinned to another key, a pinned client's wallet is never asked
+/// to prove one to this relay, and the connect fails as a pin mismatch.
+/// Unpinned, the same wallet is asked.
+#[tokio::test]
+async fn a_pinned_ws_handshake_proves_nothing_to_another_relay() {
+    let server_key = identity_of(SERVER_KEY).await;
+    let core = AuthSocketServer::new();
+    core.set_certificates_to_request(membership_request(server_key.clone()));
+    core.set_certificate_authorizer(|_, _| async { CertificateAuthorizationDecision::Accept });
+    let relay = Relay::boot(core).await;
+    let certificate = issue_membership(CLIENT_KEY, SERVER_KEY).await.certificate;
+
+    let (wallet, probe) = ArcWallet::holding(CLIENT_KEY, certificate.clone());
+    let pinned = MessageBoxClient::new(relay.url.clone(), wallet, None, Network::Local)
+        .with_expected_relay_key(identity_of(OTHER_KEY).await);
+    match within(pinned.join_room("inbox")).await {
+        Err(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
+            assert_eq!(observed.as_deref(), Some(server_key.as_str()));
+        }
+        other => panic!("expected RelayIdentityMismatch, got {other:?}"),
+    }
+    assert_eq!(probe.proofs.load(Ordering::SeqCst), 0);
+
+    let (wallet, probe) = ArcWallet::holding(CLIENT_KEY, certificate);
+    let unpinned = MessageBoxClient::new(relay.url.clone(), wallet, None, Network::Local);
+    // The probe refuses the proof, so this connect fails too.
+    let _ = within(unpinned.join_room("inbox")).await;
+    assert_eq!(probe.proofs.load(Ordering::SeqCst), 1);
+}
+
+/// What the stand-in HTTP relay's peer sends: its handshake answers.
+#[derive(Default)]
+struct Outbox {
+    sent: std::sync::Mutex<Vec<AuthMessage>>,
+    inbox: std::sync::Mutex<Option<mpsc::Sender<AuthMessage>>>,
+}
+
+#[async_trait::async_trait]
+impl Transport for Outbox {
+    async fn send(&self, message: AuthMessage) -> Result<(), AuthError> {
+        self.sent.lock().expect("outbox").push(message);
+        Ok(())
+    }
+
+    fn subscribe(&self) -> mpsc::Receiver<AuthMessage> {
+        // Frames are dispatched straight into the peer; keep the sender so
+        // its receive task stays up.
+        let (sender, receiver) = mpsc::channel(1);
+        *self.inbox.lock().expect("inbox") = Some(sender);
+        receiver
+    }
+}
+
+/// Serve the relay's HTTP handshake door, `/.well-known/auth`, proving
+/// `SERVER_KEY` and asking for `requested`, on a loopback port. Any other
+/// request gets an unauthenticated answer, so a client request fails once
+/// its handshake is done.
+async fn boot_http_handshake(requested: RequestedCertificateSet) -> String {
+    let outbox = Arc::new(Outbox::default());
+    let peer = Arc::new(Peer::new(
+        ProtoWallet::new(PrivateKey::from_hex(SERVER_KEY).expect("server key")),
+        outbox.clone(),
+    ));
+    peer.set_certificates_to_request(requested);
+    let handshake = move |body: axum::body::Bytes| {
+        let (peer, outbox) = (peer.clone(), outbox.clone());
+        async move {
+            let Ok(message) = serde_json::from_slice::<AuthMessage>(&body) else {
+                return String::new();
+            };
+            if message.message_type != MessageType::InitialRequest {
+                return String::new();
+            }
+            peer.dispatch_message(message)
+                .await
+                .expect("initial request");
+            let answer = outbox.sent.lock().expect("outbox").pop().expect("answer");
+            serde_json::to_string(&answer).expect("answer json")
+        }
+    };
+    let app = axum::Router::new()
+        .route("/.well-known/auth", axum::routing::post(handshake))
+        .fallback(|| async { "not authenticated" });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+/// The HTTP handshake (`AuthFetch`) of a client pinned to another key never
+/// asks the wallet to prove a certificate to this relay. Pinned to the key
+/// the relay proves, it does.
+#[tokio::test]
+async fn a_pinned_http_handshake_proves_nothing_to_another_relay() {
+    let server_key = identity_of(SERVER_KEY).await;
+    let url = boot_http_handshake(membership_request(server_key.clone())).await;
+    let certificate = issue_membership(CLIENT_KEY, SERVER_KEY).await.certificate;
+    let list = format!("{url}/listMessages");
+
+    for (pin, proofs) in [(identity_of(OTHER_KEY).await, 0), (server_key, 1)] {
+        let (wallet, probe) = ArcWallet::holding(CLIENT_KEY, certificate.clone());
+        let pinned = MessageBoxClient::new(url.clone(), wallet, None, Network::Local)
+            .with_expected_relay_key(&pin);
+        let answer = within(pinned.http.fetch_raw(&list, "POST", Some(b"{}".to_vec()))).await;
+        assert!(
+            answer.is_err(),
+            "the stand-in answers no request: {answer:?}"
+        );
+        assert_eq!(
+            probe.proofs.load(Ordering::SeqCst),
+            proofs,
+            "proofs asked with the pin on {pin}"
+        );
+    }
+}
+
 /// One `membership` field of certificate type `[7; 32]` from `certifier`.
 fn membership_request(certifier: String) -> RequestedCertificateSet {
     let mut requested = RequestedCertificateSet {
@@ -301,21 +487,16 @@ fn membership_request(certifier: String) -> RequestedCertificateSet {
     requested
 }
 
-/// A `membership: active` certificate for `subject_key`, signed by
-/// `certifier_key`, with the field revealed to `verifier`.
-async fn membership_certificate(
-    subject_key: &str,
-    certifier_key: &str,
-    verifier: &str,
-) -> VerifiableCertificate {
-    let subject_wallet = ProtoWallet::new(PrivateKey::from_hex(subject_key).expect("subject"));
+/// A `membership: active` certificate of type `[7; 32]` for `subject_key`,
+/// signed by `certifier_key`.
+async fn issue_membership(subject_key: &str, certifier_key: &str) -> MasterCertificate {
     let subject = PublicKey::from_string(&identity_of(subject_key).await).expect("subject key");
     let certifier_wallet =
         ProtoWallet::new(PrivateKey::from_hex(certifier_key).expect("certifier"));
     let fields = [("membership".to_string(), "active".to_string())]
         .into_iter()
         .collect();
-    let master = MasterCertificate::issue_certificate_for_subject(
+    MasterCertificate::issue_certificate_for_subject(
         &CertificateType([7; 32]),
         &subject,
         fields,
@@ -324,7 +505,18 @@ async fn membership_certificate(
         Some(SerialNumber([9; 32])),
     )
     .await
-    .expect("issue membership certificate");
+    .expect("issue membership certificate")
+}
+
+/// A `membership: active` certificate for `subject_key`, signed by
+/// `certifier_key`, with the field revealed to `verifier`.
+async fn membership_certificate(
+    subject_key: &str,
+    certifier_key: &str,
+    verifier: &str,
+) -> VerifiableCertificate {
+    let subject_wallet = ProtoWallet::new(PrivateKey::from_hex(subject_key).expect("subject"));
+    let master = issue_membership(subject_key, certifier_key).await;
     let keyring = master
         .create_keyring_for_verifier(
             &PublicKey::from_string(verifier).expect("verifier key"),

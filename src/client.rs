@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
+use crate::pinned_wallet::PinnedWallet;
 use crate::transport::{RelayHttp, RelayResponse};
 use crate::types::{
     AuthenticatedPeerMessage, ListMessagesParams, WsSendMessageData, WsSendMessagePayload,
@@ -46,30 +47,40 @@ where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
     /// Connect and authenticate, answering a certificate request with the
-    /// provider when one is configured. With a relay identity pin, a server
-    /// that proves a different key is disconnected and the error returned.
+    /// provider when one is configured.
+    ///
+    /// With a relay identity pin the handshake runs on a [`PinnedWallet`] and
+    /// a guarded provider, so no certificate is proved to a server that
+    /// proved another key, and such a server, or one that proves a different
+    /// key after the handshake, ends the connect with
+    /// [`MessageBoxError::RelayIdentityMismatch`].
     async fn connect(&self) -> Result<crate::websocket::MessageBoxWebSocket, MessageBoxError> {
         use crate::websocket::MessageBoxWebSocket;
-        let ws = match &self.certificate_provider {
+        let wallet = PinnedWallet::new(self.wallet.clone(), self.expected_relay_key.clone());
+        let opened = match &self.certificate_provider {
             Some(provider) => {
                 MessageBoxWebSocket::connect_with_certificate_provider(
                     &self.url,
                     &self.identity_key,
-                    self.wallet.clone(),
+                    wallet.clone(),
                     self.originator.clone(),
-                    provider.clone(),
+                    wallet.guard_provider(provider.clone()),
                 )
-                .await?
+                .await
             }
             None => {
                 MessageBoxWebSocket::connect(
                     &self.url,
                     &self.identity_key,
-                    self.wallet.clone(),
+                    wallet.clone(),
                     self.originator.clone(),
                 )
-                .await?
+                .await
             }
+        };
+        let ws = match opened {
+            Ok(ws) => ws,
+            Err(e) => return Err(wallet.refusal().unwrap_or(e)),
         };
         if let Err(e) = crate::transport::check_relay_identity(
             self.expected_relay_key.as_deref(),
@@ -229,16 +240,24 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///   the BRC-103 handshake, or it is refused with
     ///   [`MessageBoxError::RelayIdentityMismatch`] before its body is used;
     /// - every WebSocket connect and reconnect checks the key the server
-    ///   proved, and on a mismatch disconnects and returns that error.
+    ///   proved, and on a mismatch disconnects and returns that error;
+    /// - during either handshake the client proves certificates (from the
+    ///   wallet or the [certificate provider](Self::with_certificate_provider))
+    ///   only to a server that proved this key, and never pays a `402`
+    ///   answer: the HTTP and WebSocket handshakes run on a wallet that
+    ///   refuses `create_action`.
     ///
-    /// This covers every host the client talks to, including a recipient's
-    /// relay found through the overlay: a pinned client reaches only its
-    /// pinned relay. A refused request has still reached the other server.
+    /// A refused HTTP request has still reached the other server: the pin is
+    /// checked on the answer.
     ///
     /// Without a pin the client trusts whichever relay answers the host.
     pub fn with_expected_relay_key(mut self, identity_key: impl AsRef<str>) -> Self {
         let key = crate::transport::normalize_identity_key(identity_key.as_ref());
-        self.http = self.http.with_expected_server_key(Some(key.clone()));
+        let auth_wallet = PinnedWallet::new(self.wallet.clone(), Some(key.clone()));
+        self.http = self
+            .http
+            .with_transport(Arc::new(AuthFetch::new(auth_wallet)))
+            .with_expected_server_key(Some(key.clone()));
         self.expected_relay_key = Some(key);
         self
     }
@@ -527,7 +546,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         self.http.fetch_raw(url, "POST", Some(body_bytes)).await
     }
 
-    /// Replace the HTTP transport (unit tests drive a scripted relay).
+    /// Replace the HTTP transport (unit tests drive a scripted relay). Call it
+    /// last: [`with_expected_relay_key`](Self::with_expected_relay_key)
+    /// installs its own transport.
     #[cfg(test)]
     pub(crate) fn with_transport(
         mut self,
@@ -1484,18 +1505,40 @@ mod tests {
     /// KeyDeriver.  Wrapping in Arc satisfies the Clone bound while sharing
     /// the same underlying wallet across the clone and the AuthFetch instance.
     #[derive(Clone)]
-    pub(super) struct ArcWallet(Arc<ProtoWallet>);
+    pub(super) struct ArcWallet(Arc<ProtoWallet>, Option<Arc<CertificateProbe>>);
+
+    /// One certificate the wallet lists, and a count of the proofs asked of
+    /// it. A proof is counted, then refused.
+    pub(super) struct CertificateProbe {
+        certificate: Certificate,
+        pub(super) proofs: std::sync::atomic::AtomicUsize,
+    }
 
     impl ArcWallet {
         fn new() -> Self {
             let key = PrivateKey::from_random().expect("random key");
-            ArcWallet(Arc::new(ProtoWallet::new(key)))
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None)
         }
 
         /// A wallet for a fixed private key (64 hex characters).
         pub(super) fn from_key_hex(key_hex: &str) -> Self {
             let key = PrivateKey::from_hex(key_hex).expect("private key hex");
-            ArcWallet(Arc::new(ProtoWallet::new(key)))
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None)
+        }
+
+        /// A wallet for a fixed key that holds `certificate` and counts the
+        /// proofs asked of it.
+        pub(super) fn holding(
+            key_hex: &str,
+            certificate: Certificate,
+        ) -> (Self, Arc<CertificateProbe>) {
+            let probe = Arc::new(CertificateProbe {
+                certificate,
+                proofs: Default::default(),
+            });
+            let mut wallet = Self::from_key_hex(key_hex);
+            wallet.1 = Some(probe.clone());
+            (wallet, probe)
         }
     }
 
@@ -1626,13 +1669,28 @@ mod tests {
             args: ListCertificatesArgs,
             orig: Option<&str>,
         ) -> Result<ListCertificatesResult, WalletError> {
-            self.0.list_certificates(args, orig).await
+            match &self.1 {
+                Some(probe) => Ok(ListCertificatesResult {
+                    total_certificates: 1,
+                    certificates: vec![CertificateResult {
+                        certificate: probe.certificate.clone(),
+                        keyring: None,
+                        verifier: None,
+                    }],
+                }),
+                None => self.0.list_certificates(args, orig).await,
+            }
         }
         async fn prove_certificate(
             &self,
             args: ProveCertificateArgs,
             orig: Option<&str>,
         ) -> Result<ProveCertificateResult, WalletError> {
+            if let Some(probe) = &self.1 {
+                probe
+                    .proofs
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.0.prove_certificate(args, orig).await
         }
         async fn relinquish_certificate(

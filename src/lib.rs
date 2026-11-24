@@ -8,6 +8,7 @@ pub mod http_ops;
 pub mod payment_requests;
 pub mod peer_pay;
 pub mod permissions;
+mod pinned_wallet;
 mod transport;
 pub mod types;
 pub mod websocket;

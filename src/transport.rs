@@ -283,8 +283,9 @@ impl RelayHttp {
         }
     }
 
-    /// The same handle over a different transport (tests drive a scripted relay).
-    #[cfg(test)]
+    /// The same handle over a different transport: the pinned client's
+    /// guarded `AuthFetch`, or a scripted relay in tests. Rate-limit holds and
+    /// the wait carry over.
     pub(crate) fn with_transport(self, transport: Arc<dyn HttpTransport>) -> Self {
         Self { transport, ..self }
     }

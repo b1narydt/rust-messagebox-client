@@ -68,6 +68,14 @@ behaviour" section describes the result.
   `accept_payment_from_host` and `request_payment_to_host`, which use only the
   named host.
 
+### Known limits
+
+- A refusal on the socket fails live sends the relay may already have
+  accepted, and each is resent over HTTP with its id: `messageFailed` names no
+  message (atlas-relay#27).
+- A box whose list exceeds 32 MiB cannot be listed or drained:
+  `/listMessages` has no limit or paging (atlas-relay#28).
+
 ### Fixed
 
 - **An ack that beats the relay's insert is retried** (`src/http_ops.rs`).

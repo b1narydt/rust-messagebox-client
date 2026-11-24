@@ -211,9 +211,9 @@ retries that answer, and only that one, for up to 5 s.
 which spends the rate budget: once on each WebSocket connect and reconnect,
 then every 15 s while connected (`with_poll_interval`); with no connected
 socket, after 1 s, doubling to 8 s. It waits out a rate-limit refusal and backs
-off, up to 60 s, after a failed list. The relay does not paginate, so a box
-whose list exceeds 32 MiB cannot be listed: the poll logs an error and lists
-again 60 s later, connected or not, while live delivery continues.
+off, up to 60 s, after a failed list. A list over 32 MiB fails (see Known
+limits): the poll logs an error and lists again 60 s later, connected or not,
+while live delivery continues.
 
 **Relay identity pin.** `with_expected_relay_key(key)` ties the client to its
 own host and to the relay there that proves `key`:
@@ -246,6 +246,13 @@ during the handshake.
 **Pinned-host payments.** `list_incoming_payments_from_host`,
 `accept_payment_from_host` and `request_payment_to_host` use only the named
 host: no overlay lookup and no multi-host fan-out.
+
+**Known limits.** Both wait on relay changes.
+- A refusal on the socket fails live sends the relay may already have
+  accepted, and each is resent over HTTP with its id: `messageFailed` names no
+  message (atlas-relay#27).
+- A box whose list exceeds 32 MiB cannot be listed or drained:
+  `/listMessages` has no limit or paging (atlas-relay#28).
 
 ## API Reference
 

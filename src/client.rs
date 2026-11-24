@@ -929,10 +929,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// wait for a rate-limit hold before the emit and the waits in the HTTP
     /// fallback all end by it; a hold that would outlast it returns
     /// [`MessageBoxError::RateLimited`]. The 10 s ack wait and network time
-    /// are on top, so the call can run that much longer than the wait.
+    /// are on top, so the call can run that much longer than the wait. The
+    /// wait before the emit, and the hold a refusal on the socket sets, are on
+    /// the relay the socket is open to.
     ///
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
-    /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
+    /// The WS path uses the open socket, or opens one to `override_host` (else
+    /// `self.host()`); overlay resolution affects the fallback path.
     ///
     /// Mirrors TS `sendLiveMessage(params, overrideHost?)` which accepts the full
     /// `SendMessageParams` including `skipEncryption`, `checkPermissions`, and `messageId`.

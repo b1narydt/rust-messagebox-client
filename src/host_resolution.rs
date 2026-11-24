@@ -396,9 +396,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         platform: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<RegisterDeviceResponse, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         let request = RegisterDeviceRequest {
             fcm_token: fcm_token.to_string(),
             device_id: device_id.map(String::from),
@@ -428,9 +426,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         override_host: Option<&str>,
     ) -> Result<Vec<RegisteredDevice>, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         let url = format!("{base}/devices");
         let response = self.get_json(&url).await?;
 

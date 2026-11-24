@@ -223,9 +223,9 @@ own host and to the relay there that proves `key`:
   and acknowledges on its own host alone. A call that names another host (an
   `override_host`, a `_from_host` / `_to_host` method, `init`'s
   `target_host`, or `anoint_host`) returns `RelayHostRefused` before any
-  request, payment or
-  advertisement. Hosts compare by scheme, host, port
-  and path, ignoring case, a default port and a trailing slash.
+  request, payment or advertisement, including the overlay lookup a first
+  call makes to initialize. Hosts compare by scheme, host, port and path,
+  ignoring case, a default port and a trailing slash.
 - Over HTTP and the WebSocket, the wallet signs a message only for a server
   that proved `key` in the BRC-103 handshake. A server that proved another
   key gets the handshake and nothing after it: the request is never signed,

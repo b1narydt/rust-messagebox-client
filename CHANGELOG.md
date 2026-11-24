@@ -59,7 +59,8 @@ behaviour" section describes the result.
   multi-host list and ack fan-out, and refuses any other named host, including
   `init`'s `target_host` and `anoint_host`'s, with the new
   `MessageBoxError::RelayHostRefused { pinned, requested }` before any request,
-  payment or advertisement. Its HTTP and WebSocket channels sign a request only for a server
+  payment or advertisement, including the overlay lookup a first call makes to
+  initialize. Its HTTP and WebSocket channels sign a request only for a server
   that proved the pinned key, so a request is never sent to one that proved
   another; they prove certificates only to the pinned key, never pay a `402`,
   and reveal no key linkage.

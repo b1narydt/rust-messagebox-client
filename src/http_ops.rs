@@ -484,7 +484,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
-        self.assert_initialized().await?;
+        self.assert_initialized(override_host).await?;
         let host = match override_host {
             Some(h) => h.to_string(),
             None => self.resolve_host_for_recipient(recipient).await?,
@@ -556,6 +556,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         payment: Option<MessagePayment>,
         rate_deadline: tokio::time::Instant,
     ) -> Result<String, MessageBoxError> {
+        // A pinned client refuses another host before it encrypts, quotes or
+        // pays anything for it.
+        let host = self.relay_host(Some(host))?;
         // Encrypt body (or use as-is when skipEncryption is true).
         let wire_body = if skip_encryption {
             body.to_string()
@@ -844,7 +847,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         params: &SendListParams,
         override_host: Option<&str>,
     ) -> Result<SendListResult, MessageBoxError> {
-        self.assert_initialized().await?;
+        self.assert_initialized(override_host).await?;
 
         let skip_enc = params.skip_encryption.unwrap_or(false);
 
@@ -1211,9 +1214,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_box: &str,
         override_host: Option<&str>,
     ) -> Result<Vec<PaymentAwareServerPeerMessage>, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let host = override_host.unwrap_or_else(|| self.host());
+        let host = self.assert_initialized(override_host).await?;
         let params = ListMessagesParams {
             message_box: message_box.to_string(),
         };
@@ -1279,9 +1280,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         accept_payments: bool,
         override_host: Option<&str>,
     ) -> Result<Vec<PaymentAwarePeerMessage>, MessageBoxError> {
-        self.assert_initialized().await?;
+        let host = self.assert_initialized(override_host).await?;
 
-        if let Some(host) = override_host {
+        if override_host.is_some() {
             return self
                 .list_messages_detailed_from_host(host, message_box, accept_payments)
                 .await;
@@ -1441,9 +1442,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_ids: Vec<String>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        self.assert_initialized().await?;
+        let host = self.assert_initialized(override_host).await?;
 
-        if let Some(host) = override_host {
+        if override_host.is_some() {
             return self.acknowledge_message_on_host(host, &message_ids).await;
         }
 
@@ -2881,6 +2882,129 @@ mod tests {
             .await
             .expect("its own host when the overlay has none");
         assert!(lookups.load(SeqCst) > 0, "the tracker saw no lookup");
+    }
+
+    /// A pinned client refuses a call naming another host before any work
+    /// for it: no overlay lookup, no advertisement, no request, and the
+    /// one-time init still unrun.
+    #[tokio::test]
+    async fn a_pinned_client_refuses_another_host_before_it_initializes() {
+        use crate::transport::scripted::RELAY_KEY;
+        use crate::types::{SendListParams, SetPermissionParams};
+        use std::sync::atomic::Ordering::SeqCst;
+        const OTHER: Option<&str> = Some("https://other.example");
+        let (tracker, lookups) = counting_tracker().await;
+        let network = bsv::services::overlay_tools::Network::Custom(vec![tracker]);
+        let relay = ScriptedTransport::new();
+        let pinned =
+            crate::MessageBoxClient::new(HOST.to_string(), ArcWallet::new(), None, network)
+                .with_expected_relay_key(RELAY_KEY)
+                .with_transport(relay.clone());
+        let list = SendListParams {
+            recipients: vec![RECIPIENT.to_string()],
+            message_box: "inbox".to_string(),
+            body: "hi".to_string(),
+            skip_encryption: None,
+        };
+        let permission = SetPermissionParams {
+            message_box: "inbox".to_string(),
+            sender: None,
+            recipient_fee: 0,
+        };
+
+        let calls: Vec<(&str, Result<(), MessageBoxError>)> = vec![
+            (
+                "send_message",
+                pinned
+                    .send_message(RECIPIENT, "inbox", "hi", false, true, None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "send_notification",
+                pinned
+                    .send_notification(RECIPIENT, "hi", OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "send_message_to_recipients",
+                pinned
+                    .send_message_to_recipients(&list, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "get_message_box_quote_multi",
+                pinned
+                    .get_message_box_quote_multi(&[RECIPIENT], "inbox", OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "get_message_box_quote",
+                pinned
+                    .get_message_box_quote(RECIPIENT, "inbox", OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "list_messages_lite",
+                pinned.list_messages_lite("inbox", OTHER).await.map(drop),
+            ),
+            (
+                "list_messages",
+                pinned.list_messages("inbox", false, OTHER).await.map(drop),
+            ),
+            (
+                "acknowledge_message",
+                pinned
+                    .acknowledge_message(vec!["id-1".to_string()], OTHER)
+                    .await,
+            ),
+            (
+                "register_device",
+                pinned
+                    .register_device("token", None, None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "list_registered_devices",
+                pinned.list_registered_devices(OTHER).await.map(drop),
+            ),
+            (
+                "set_message_box_permission",
+                pinned.set_message_box_permission(permission, OTHER).await,
+            ),
+            (
+                "get_message_box_permission",
+                pinned
+                    .get_message_box_permission(RECIPIENT, "inbox", None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "list_message_box_permissions",
+                pinned
+                    .list_message_box_permissions(None, None, None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            ("leave_room", pinned.leave_room("inbox", OTHER).await),
+        ];
+        for (call, result) in calls {
+            assert!(
+                matches!(result, Err(MessageBoxError::RelayHostRefused { .. })),
+                "{call}: {result:?}"
+            );
+        }
+        assert_eq!(lookups.load(SeqCst), 0, "a refused call asked the overlay");
+        assert!(relay.sent().is_empty(), "{:?}", relay.sent());
+        assert!(
+            pinned.init_once.get().is_none(),
+            "a refused call ran the init"
+        );
     }
 
     fn rate_limited(retry_after: u64) -> serde_json::Value {

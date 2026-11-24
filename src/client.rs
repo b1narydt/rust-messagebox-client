@@ -270,9 +270,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///   (an `override_host`, a `_from_host` / `_to_host` method,
     ///   [`init`](Self::init)'s `target_host`, or `anoint_host`) returns
     ///   [`MessageBoxError::RelayHostRefused`] before any request, payment
-    ///   or advertisement; hosts are
-    ///   compared by scheme, host, port and path, ignoring case, a default
-    ///   port and a trailing slash;
+    ///   or advertisement, the overlay lookup of the first call's init
+    ///   included; hosts are compared by scheme, host, port and path,
+    ///   ignoring case, a default port and a trailing slash;
     /// - the HTTP and WebSocket auth channels run on a wallet that signs a
     ///   message only for a server that proved this key in the BRC-103
     ///   handshake. A request to a server that proved another key is never
@@ -450,7 +450,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     // Initialization guard
     // -----------------------------------------------------------------------
 
-    /// Ensure the client is initialized before performing any HTTP operation.
+    /// Ensure the client is initialized before performing any HTTP operation
+    /// against `override_host` (or the client's own host), and return the
+    /// host that operation goes to.
+    ///
+    /// A pinned client refuses another host here, through
+    /// [`relay_host`](Self::relay_host), before the init: so a refused call
+    /// asks no overlay and advertises nothing.
     ///
     /// Uses `init_once.get_or_try_init` so the full init path runs at most once
     /// even under concurrent callers — matching the TS `initializeConnection`
@@ -462,7 +468,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// 3. If no matching ad exists, call `anoint_host`.
     /// 4. CRITICAL TS PARITY: catch anoint errors and continue — TS logs
     ///    "Failed to anoint host, continuing with default functionality".
-    pub(crate) async fn assert_initialized(&self) -> Result<(), MessageBoxError> {
+    pub(crate) async fn assert_initialized<'a>(
+        &'a self,
+        override_host: Option<&'a str>,
+    ) -> Result<&'a str, MessageBoxError> {
+        let host = self.relay_host(override_host)?;
         self.init_once
             .get_or_try_init(|| async {
                 let identity_key = self.get_identity_key().await?;
@@ -483,7 +493,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 Ok::<(), MessageBoxError>(())
             })
             .await?;
-        Ok(())
+        Ok(host)
     }
 
     /// Initialize the client — ensures overlay advertisement exists.
@@ -514,7 +524,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     .await?;
                 Ok(())
             }
-            None => self.assert_initialized().await,
+            None => {
+                self.assert_initialized(None).await?;
+                Ok(())
+            }
         }
     }
 
@@ -1228,7 +1241,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let host = match override_host {
             Some(host) => host.to_string(),
             None => {
-                self.assert_initialized().await?;
+                self.assert_initialized(None).await?;
                 self.resolve_host_for_recipient(recipient).await?
             }
         };
@@ -1251,13 +1264,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Mirrors TS `leaveRoom(messageBox)`. Constructs the room ID as
     /// `{identityKey}-{messageBox}` and emits `leaveRoom` to the server.
     /// No-op if the WebSocket is not connected.
-    /// `override_host` is reserved for future multi-host WS routing.
+    /// `override_host` is reserved for future multi-host WS routing; a pinned
+    /// client refuses another host, as everywhere else.
     pub async fn leave_room(
         &self,
         message_box: &str,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        let _ = override_host;
+        self.relay_host(override_host)?;
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
         // Tear down LOCAL subscription state FIRST and UNCONDITIONALLY, before the

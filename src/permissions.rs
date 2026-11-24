@@ -46,9 +46,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         params: SetPermissionParams,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{base}/permissions/set");
         let response = self.post_json(&url, body_bytes).await?;
@@ -69,9 +67,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         sender: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<Option<MessageBoxPermission>, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         // NOTE: query param key is camelCase `messageBox` — not snake_case.
         let mut url = format!(
             "{base}/permissions/get?recipient={}&messageBox={}",
@@ -100,9 +96,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         offset: Option<u32>,
         override_host: Option<&str>,
     ) -> Result<Vec<MessageBoxPermission>, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         let mut url = format!("{base}/permissions/list");
         let mut params: Vec<String> = Vec::new();
 
@@ -140,9 +134,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_box: &str,
         override_host: Option<&str>,
     ) -> Result<MessageBoxQuote, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         // NOTE: query param key is camelCase `messageBox` here.
         let url = format!(
             "{base}/permissions/quote?recipient={}&messageBox={}",
@@ -279,6 +271,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<crate::types::MessageBoxMultiQuote, MessageBoxError> {
         use crate::types::{MessageBoxMultiQuote, RecipientQuote};
         use std::collections::HashMap;
+
+        // A pinned client refuses another host here, not as one failed quote
+        // per recipient.
+        let override_host = override_host
+            .map(|h| self.relay_host(Some(h)))
+            .transpose()?;
 
         let mut quotes_by_recipient: Vec<RecipientQuote> = Vec::new();
         let mut blocked_recipients: Vec<String> = Vec::new();

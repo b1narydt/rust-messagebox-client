@@ -131,6 +131,7 @@ impl AppDispatcher<ProtoWallet> for AckSends {
 struct Relay {
     url: String,
     core: SharedAuthSocketServer<ProtoWallet>,
+    io: SocketIo,
     sends: mpsc::UnboundedReceiver<Value>,
 }
 
@@ -169,6 +170,7 @@ impl Relay {
         Relay {
             url: format!("http://{addr}"),
             core,
+            io,
             sends,
         }
     }
@@ -470,8 +472,37 @@ async fn a_live_send_spends_the_budget_of_the_relay_its_socket_serves() {
     sender.disconnect_web_socket().await.expect("disconnect");
 }
 
-/// A reconnect that replaces the socket fails the sends still waiting on the
-/// old one at once: no answer can reach them there, and each should take its
+/// Two live sends on a client with no socket open one socket between them,
+/// and the relay acks both on it.
+#[tokio::test]
+async fn concurrent_live_sends_open_one_socket() {
+    let relay = Relay::boot(AuthSocketServer::new()).await;
+    let recipient = identity_of(OTHER_KEY).await;
+    let sender = client(&relay.url);
+    let send = |id| {
+        sender.send_live_message(
+            &recipient,
+            "inbox",
+            "hello",
+            true,
+            false,
+            Some(id),
+            Some(&relay.url),
+        )
+    };
+
+    let (a, b) = within(async { tokio::join!(send("id-a"), send("id-b")) }).await;
+    for mode in [a, b] {
+        assert!(matches!(mode, Ok(DeliveryMode::Live { .. })), "{mode:?}");
+    }
+    assert_eq!(sender.ws_connections.load(Ordering::Acquire), 1);
+    tokio::time::sleep(SETTLE).await;
+    assert_eq!(relay.io.sockets().expect("sockets").len(), 1);
+    sender.disconnect_web_socket().await.expect("disconnect");
+}
+
+/// A reconnect that replaces a dead socket fails the sends still waiting on
+/// it at once: no answer can reach them there, and each should take its
 /// HTTP fallback now, not after its ack timeout.
 #[tokio::test]
 async fn a_reconnect_fails_the_sends_waiting_on_the_old_socket() {
@@ -498,12 +529,20 @@ async fn a_reconnect_fails_the_sends_waiting_on_the_old_socket() {
         relay.settled_send().await.is_some(),
         "the relay got the send"
     );
+    relay.io.disconnect().expect("the relay drops the socket");
+    within(async {
+        while sender.is_ws_connected().await == Some(true) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
 
     let dial = sender.ws_dial(None).await.expect("dial");
     within(reconnect_ws(
         &sender.ws_state,
         &sender.subscriptions,
         &sender.ws_connections,
+        &sender.ws_dial_lock,
         &dial,
     ))
     .await

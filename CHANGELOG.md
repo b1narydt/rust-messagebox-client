@@ -28,9 +28,11 @@ behaviour" section describes the result.
   answer, and dropping it withdraws that waiter and no other.
   `remove_pending_ack` is removed. The relay's ack names the message (the
   earlier note that it does not was wrong), and its refusal, `messageFailed`,
-  names none, so a refusal fails every pending live send on the socket. A
-  reconnect that replaces the socket fails the sends still waiting on the old
-  one at once. A refused, unanswered or failed emit falls back to HTTP with
+  names none, so a refusal fails every pending live send on the socket. One
+  WebSocket dial runs at a time, so concurrent sends on a cold client share
+  one socket. A reconnect replaces only a dead socket; it closes that socket
+  and fails the sends still waiting on it at once. A refused, unanswered or
+  failed emit falls back to HTTP with
   the same message id. The WebSocket room and recipient are sent lowercase, as the relay joins
   rooms lowercase and compares them exactly.
 - **Sends and lists honour the relay's rate budget** (`src/transport.rs`,

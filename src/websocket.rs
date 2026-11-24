@@ -418,16 +418,16 @@ impl MessageBoxWebSocket {
         Ok(ack)
     }
 
-    /// Fail every send still waiting for the relay's answer on this socket,
-    /// with `why`.
-    pub(crate) fn fail_pending_sends(&self, why: &str) {
-        lock_waiters(&self.pending_acks).fail_all(|| MessageBoxError::WebSocket(why.to_string()));
-    }
-
     /// Disconnect from the server and clear all state. Every send still
     /// waiting for the relay's answer fails.
     pub async fn disconnect(&self) -> Result<(), MessageBoxError> {
-        self.fail_pending_sends("disconnected");
+        self.close("disconnected").await
+    }
+
+    /// [`disconnect`](Self::disconnect), failing the sends still waiting for
+    /// the relay's answer with `why`.
+    pub(crate) async fn close(&self, why: &str) -> Result<(), MessageBoxError> {
+        lock_waiters(&self.pending_acks).fail_all(|| MessageBoxError::WebSocket(why.to_string()));
         self.subscriptions.lock().await.clear();
         self.joined_rooms.lock().await.clear();
         self.ws

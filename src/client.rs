@@ -95,26 +95,39 @@ where
     }
 }
 
-/// Establish a fresh WebSocket connection and swap it into `ws_state`, replaying
-/// joinRoom + re-subscribe for every active subscription.
+/// Unless `ws_state` holds a connected socket, establish a fresh WebSocket
+/// connection and swap it into `ws_state`, replaying joinRoom + re-subscribe
+/// for every active subscription.
 ///
 /// Shared by `ensure_ws_connected` (lazy/on-demand connect) and the reconnect
 /// supervisor (proactive heal). Lives as a free function — taking `Arc` handles
 /// rather than `&self` — so the `'static` supervisor task can call it without a
-/// self-reference. On success the new socket replaces whatever was in
-/// `ws_state`; the old (dead) socket is dropped, tearing down its tasks. A
-/// failed dial (including a relay identity mismatch) leaves `ws_state` as it
-/// was and joins no room. A successful one bumps `connections`, which tells
-/// each poll backstop to catch up once.
+/// self-reference. `dial_lock` is held from the check to the swap, so
+/// concurrent callers dial once: a caller that finds a connected socket once
+/// it holds the lock uses that socket. The socket a dial replaces is one that
+/// was found dead (or none); it is closed, failing the sends still waiting on
+/// it. A failed dial (including a relay identity mismatch) leaves `ws_state`
+/// as it was and joins no room. A successful one bumps `connections`, which
+/// tells each poll backstop to catch up once.
 async fn reconnect_ws<W>(
     ws_state: &Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
     subscriptions: &Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
     connections: &AtomicU64,
+    dial_lock: &Mutex<()>,
     dial: &WsDial<W>,
 ) -> Result<(), MessageBoxError>
 where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
+    let _dialing = dial_lock.lock().await;
+    let connected = ws_state
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|ws| ws.is_connected());
+    if connected {
+        return Ok(());
+    }
     let ws = dial.connect().await?;
 
     // Replay subscriptions on the fresh socket so the general_msg_dispatcher
@@ -139,7 +152,12 @@ where
     // timeout.
     let replaced = ws_state.lock().await.replace(ws);
     if let Some(old) = replaced {
-        old.fail_pending_sends("the socket was replaced before the relay answered");
+        if let Err(e) = old
+            .close("the socket was replaced before the relay answered")
+            .await
+        {
+            tracing::warn!(error = %e, "closing the replaced socket failed");
+        }
     }
     connections.fetch_add(1, Ordering::AcqRel);
     Ok(())
@@ -186,6 +204,9 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// `Arc` so the background reconnect supervisor task can share it and swap a
     /// freshly reconnected socket in without a self-reference.
     ws_state: Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
+    /// Held by [`reconnect_ws`] from its connected check to its swap, so one
+    /// WebSocket dial runs at a time.
+    ws_dial_lock: Arc<Mutex<()>>,
     /// Ensures the reconnect supervisor task is spawned at most once per client.
     reconnect_supervisor: OnceCell<()>,
     /// Counts successful WebSocket connects and reconnects (rooms rejoined).
@@ -225,6 +246,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             init_once: OnceCell::new(),
             network,
             ws_state: Arc::new(Mutex::new(None)),
+            ws_dial_lock: Arc::default(),
             reconnect_supervisor: OnceCell::new(),
             ws_connections: Arc::new(AtomicU64::new(0)),
             poll_interval: DEFAULT_POLL_INTERVAL,
@@ -653,6 +675,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             &self.ws_state,
             &self.subscriptions,
             &self.ws_connections,
+            &self.ws_dial_lock,
             &dial,
         )
         .await?;
@@ -690,6 +713,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let ws_state = self.ws_state.clone();
         let subscriptions = self.subscriptions.clone();
         let ws_connections = self.ws_connections.clone();
+        let ws_dial_lock = self.ws_dial_lock.clone();
 
         tokio::spawn(async move {
             loop {
@@ -720,7 +744,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     if subscriptions.lock().await.is_empty() {
                         break;
                     }
-                    match reconnect_ws(&ws_state, &subscriptions, &ws_connections, &dial).await {
+                    match reconnect_ws(
+                        &ws_state,
+                        &subscriptions,
+                        &ws_connections,
+                        &ws_dial_lock,
+                        &dial,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             tracing::info!("WS reconnected proactively after half-open death");
                             break;
@@ -995,22 +1027,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
 
-        // Auto-connect or reconnect — if the WebSocket is disconnected, drop the
-        // stale connection and establish a fresh one with a new BRC-103 handshake.
-        // This handles proxy timeouts and server restarts without falling through
-        // to the slower HTTP fallback path.
-        {
-            let guard = self.ws_state.lock().await;
-            if guard.as_ref().map(|ws| !ws.is_connected()).unwrap_or(false) {
-                drop(guard);
-                // Stale connection — tear down and reconnect
-                if let Err(e) = self.disconnect_web_socket().await {
-                    eprintln!(
-                        "Warning: stale WebSocket disconnect failed (proceeding to reconnect): {e}"
-                    );
-                }
-            }
-        }
+        // Auto-connect or reconnect — a disconnected socket is replaced with a
+        // fresh one and a new BRC-103 handshake. This handles proxy timeouts
+        // and server restarts without falling through to the slower HTTP
+        // fallback path.
         if let Err(e) = self.ensure_ws_connected(override_host).await {
             // A pinned client named another host, or the server at this host
             // is not the pinned relay: the send ends here, with nothing sent

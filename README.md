@@ -198,8 +198,10 @@ host the call names when an earlier call opened the socket. The wait before
 the emit and the fallback's waits share one `with_rate_limit_wait`, counted
 from the start of the call; the 10 s ack wait and network time are on top. A
 refusal (`messageFailed`) names no message, so it fails every pending live
-send on that socket. A reconnect that replaces the socket fails the sends
-still waiting on the old one at once, and each falls back to HTTP. The relay
+send on that socket. One WebSocket dial runs at a time, so concurrent sends on
+a cold client share one socket. A reconnect replaces only a dead socket; it
+closes that socket and fails the sends still waiting on it at once, and each
+falls back to HTTP. The relay
 is not exactly-once: it keeps one row per id only until the recipient
 acknowledges it, so receivers dedup by message id.
 

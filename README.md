@@ -206,12 +206,15 @@ is not exactly-once: it keeps one row per id only until the recipient
 acknowledges it, and a resend after that is a new row. A live listener
 delivers each id once (it remembers the last 10,000 per subscription). A copy
 of an id this client already acknowledged is acknowledged again on the
-listener's host and not delivered, so it does not sit on the relay. Callers of
+listener's host, once, and not delivered, so it does not sit on the relay. An
+id counts as acknowledged once its `acknowledge_message` call has answered,
+so a copy listed while that call is in flight is only dropped. Callers of
 `list_messages` dedup by message id themselves.
 
 **Acknowledgements.** The relay pushes a live message before it stores it. An
 ack that arrives first is answered `ERR_INVALID_ACKNOWLEDGMENT`; the client
-retries that answer, and only that one, for up to 5 s.
+retries that answer, and only that one, for up to 5 s. A re-ack of a repeat
+is not retried: the poll lists a row that is stored later, and acks it then.
 
 **Poll backstop.** `listen_for_live_messages` also lists the box over HTTP,
 which spends the rate budget: once on each WebSocket connect and reconnect,

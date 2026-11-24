@@ -1443,27 +1443,35 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_ids: Vec<String>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        let result = async {
+            let host = self.assert_initialized(override_host).await?;
+
+            if override_host.is_some() {
+                return self.acknowledge_message_on_host(host, &message_ids).await;
+            }
+
+            // Multi-host fan-out: ack on all known hosts concurrently.
+            let hosts = self.fan_out_hosts().await?;
+            if hosts.len() == 1 {
+                return self
+                    .acknowledge_message_on_host(self.host(), &message_ids)
+                    .await;
+            }
+            self.acknowledge_message_on_hosts(&hosts, &message_ids)
+                .await
+        }
+        .await;
+        // Recorded once the relay answers, not before: while the ack is in
+        // flight a listed or pushed copy of the row is only dropped, so the
+        // listener cannot re-ack and delete the row ahead of this call. Also
+        // recorded when the ack fails, so a later copy is still acknowledged.
         {
             let mut acked = crate::client::lock_ids(&self.acked_ids);
             for id in &message_ids {
                 acked.insert(id.clone());
             }
         }
-        let host = self.assert_initialized(override_host).await?;
-
-        if override_host.is_some() {
-            return self.acknowledge_message_on_host(host, &message_ids).await;
-        }
-
-        // Multi-host fan-out: ack on all known hosts concurrently.
-        let hosts = self.fan_out_hosts().await?;
-        if hosts.len() == 1 {
-            return self
-                .acknowledge_message_on_host(self.host(), &message_ids)
-                .await;
-        }
-        self.acknowledge_message_on_hosts(&hosts, &message_ids)
-            .await
+        result
     }
 
     /// Acknowledges `message_ids` on every host in `hosts` at once. Fails
@@ -1490,6 +1498,24 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     }
 }
 
+/// Acknowledges a repeat of an acknowledged id on `host`, once. Not found
+/// means the row is gone, or is not stored yet; the poll lists a stored row
+/// again and this runs again, so it is not retried.
+pub(crate) async fn reacknowledge_on_host(http: &RelayHttp, host: &str, message_id: String) {
+    let ids = [message_id];
+    match acknowledge_on_host_within(http, host, &ids, std::time::Duration::ZERO).await {
+        Ok(()) => {}
+        Err(MessageBoxError::Relay {
+            status: 400, code, ..
+        }) if code == "ERR_INVALID_ACKNOWLEDGMENT" => {}
+        Err(e) => tracing::warn!(
+            message_id = %ids[0],
+            error = %e,
+            "could not acknowledge a repeat of an acknowledged message"
+        ),
+    }
+}
+
 /// Acknowledges `message_ids` on `host`. The relay pushes a live message
 /// before it stores it, so `ERR_INVALID_ACKNOWLEDGMENT` is retried for 5 s.
 pub(crate) async fn acknowledge_on_host(
@@ -1497,7 +1523,17 @@ pub(crate) async fn acknowledge_on_host(
     host: &str,
     message_ids: &[String],
 ) -> Result<(), MessageBoxError> {
-    const PERSISTENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    acknowledge_on_host_within(http, host, message_ids, std::time::Duration::from_secs(5)).await
+}
+
+/// Acknowledges `message_ids` on `host`, retrying `ERR_INVALID_ACKNOWLEDGMENT`
+/// until `grace` has passed. A zero `grace` makes one attempt.
+async fn acknowledge_on_host_within(
+    http: &RelayHttp,
+    host: &str,
+    message_ids: &[String],
+    grace: std::time::Duration,
+) -> Result<(), MessageBoxError> {
     const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
     const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1506,7 +1542,7 @@ pub(crate) async fn acknowledge_on_host(
     };
     let body_bytes = serde_json::to_vec(&params)?;
     let url = format!("{host}/acknowledgeMessage");
-    let deadline = tokio::time::Instant::now() + PERSISTENCE_GRACE;
+    let deadline = tokio::time::Instant::now() + grace;
     let mut delay = INITIAL_RETRY_DELAY;
 
     loop {
@@ -2842,6 +2878,81 @@ mod tests {
             }
         });
         (url, lookups)
+    }
+
+    /// An ack's ids are recorded as acknowledged only once the relay answers.
+    /// Recorded earlier, a copy listed while the ack is in flight is re-acked
+    /// by the listener, which can delete the row first and turn this ack into
+    /// five seconds of not-found retries.
+    #[tokio::test]
+    async fn an_ack_records_its_ids_only_after_the_relay_answers() {
+        use crate::transport::{scripted::RELAY_KEY, HttpTransport, RelayResponse};
+        type Ids = Arc<std::sync::Mutex<crate::client::BoundedIdSet>>;
+        #[derive(Default)]
+        struct Observer {
+            acked: std::sync::OnceLock<Ids>,
+            recorded_in_flight: std::sync::Mutex<Option<bool>>,
+        }
+        #[async_trait::async_trait]
+        impl HttpTransport for Observer {
+            async fn fetch(
+                &self,
+                _url: &str,
+                _method: &str,
+                _body: Option<Vec<u8>>,
+                _headers: Option<std::collections::HashMap<String, String>>,
+            ) -> Result<RelayResponse, MessageBoxError> {
+                let acked = self.acked.get().expect("acked ids wired");
+                *self.recorded_in_flight.lock().unwrap() =
+                    Some(crate::client::lock_ids(acked).contains("id-1"));
+                Ok(RelayResponse {
+                    status: 200,
+                    headers: Default::default(),
+                    body: br#"{"status":"success"}"#.to_vec(),
+                    server_identity_key: Some(RELAY_KEY.to_string()),
+                })
+            }
+        }
+        let relay = Arc::new(Observer::default());
+        let client = crate::MessageBoxClient::new(
+            HOST.to_string(),
+            ArcWallet::new(),
+            None,
+            bsv::services::overlay_tools::Network::Local,
+        )
+        .with_expected_relay_key(RELAY_KEY)
+        .with_transport(relay.clone());
+        client.init_once.set(()).expect("skip the advertisement");
+        let _ = relay.acked.set(client.acked_ids.clone());
+
+        client
+            .acknowledge_message(vec!["id-1".to_string()], Some(HOST))
+            .await
+            .expect("ack");
+        assert_eq!(*relay.recorded_in_flight.lock().unwrap(), Some(false));
+        assert!(crate::client::lock_ids(&client.acked_ids).contains("id-1"));
+    }
+
+    /// A re-ack of a row that is already gone costs one request: it is not
+    /// retried through the persistence grace.
+    #[tokio::test]
+    async fn a_reack_of_a_row_already_gone_is_one_request() {
+        let relay = ScriptedTransport::new();
+        relay.push(
+            400,
+            &[],
+            json!({"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"}),
+        );
+        let client = crate::MessageBoxClient::new(
+            HOST.to_string(),
+            ArcWallet::new(),
+            None,
+            bsv::services::overlay_tools::Network::Local,
+        )
+        .with_transport(relay.clone());
+
+        super::reacknowledge_on_host(&client.http, HOST, "id-1".to_string()).await;
+        assert_eq!(relay.sent().len(), 1);
     }
 
     /// A pinned client never asks the overlay for a host: its send, list and

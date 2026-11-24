@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.6.2] — 2026-11-23
+
+### Fixed
+
+- **An ack no longer races the listener's re-ack of its own message**
+  (`src/http_ops.rs`, `src/client.rs`). 0.6.1 recorded ids as acknowledged
+  before the ack request went out. A copy of the row listed while that request
+  was in flight was then re-acked by the listener, which could delete the row
+  first; the caller's own ack got `ERR_INVALID_ACKNOWLEDGMENT` and retried it
+  for 5 s (about 20 requests). Ids are now recorded once the ack answers,
+  success or failure. A re-ack of a repeat is one request; not found means
+  the row is gone or not stored yet, and the poll lists a stored row again.
+
+---
+
 ## [0.6.1] — 2026-11-23
 
 ### Fixed

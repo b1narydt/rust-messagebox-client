@@ -866,21 +866,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let reack = {
             let http = self.http.clone();
             let host = override_host.unwrap_or(self.host()).to_string();
-            let room_id = room_id.clone();
             Arc::new(move |id: String| {
                 let http = http.clone();
                 let host = host.clone();
-                let room_id = room_id.clone();
                 tokio::spawn(async move {
-                    let ids = [id];
-                    if let Err(e) = crate::http_ops::acknowledge_on_host(&http, &host, &ids).await {
-                        tracing::warn!(
-                            %room_id,
-                            message_id = %ids[0],
-                            error = %e,
-                            "could not acknowledge a repeat of an acknowledged message"
-                        );
-                    }
+                    crate::http_ops::reacknowledge_on_host(&http, &host, id).await;
                 });
             }) as Arc<dyn Fn(String) + Send + Sync>
         };

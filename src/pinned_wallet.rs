@@ -17,9 +17,11 @@
 //! [`CertificateProvider`] the same way.
 //!
 //! The auth channels report a refusal only as text inside their own error.
-//! Each refusal for a server carries [`REFUSED_SERVER`] and that server's key
-//! in its text, and [`PinnedWallet::classify`] reads the failure back as the
-//! pin mismatch behind it, from that one error alone.
+//! Each refusal for a server carries this wallet's marker, which holds a random
+//! token made when the wallet is, and that server's key in its text.
+//! [`PinnedWallet::classify`] reads the failure back as the pin mismatch behind
+//! it, from that one error alone. A server cannot forge the marker into an
+//! error it causes, because it never sees the token.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,21 +36,26 @@ use crate::error::MessageBoxError;
 use crate::transport::{normalize_identity_key, HttpTransport, RelayResponse};
 use crate::websocket::CertificateProvider;
 
-/// What the text of every refusal for a server other than the pin carries,
-/// followed by that server's key (hex).
-const REFUSED_SERVER: &str = "the relay pin refuses server ";
-
 /// The caller's wallet, as handed to the relay auth channel.
 #[derive(Clone)]
 pub(crate) struct PinnedWallet<W> {
     inner: W,
     /// The relay identity pin, normalised. `None` delegates every call.
     pin: Option<String>,
+    /// What the text of every refusal for a server other than the pin
+    /// carries, followed by that server's key (hex). It holds a random token,
+    /// so text from the network cannot contain it.
+    marker: Arc<str>,
 }
 
 impl<W> PinnedWallet<W> {
     pub(crate) fn new(inner: W, pin: Option<String>) -> Self {
-        Self { inner, pin }
+        let token: String = rand::random::<[u8; 16]>()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let marker = format!("the relay pin [{token}] refuses server ").into();
+        Self { inner, pin, marker }
     }
 
     /// Whether the pin allows proving a certificate to, or signing for, the
@@ -62,7 +69,8 @@ impl<W> PinnedWallet<W> {
     /// The text of a refusal of `what` for the server `peer`.
     fn refusal_text(&self, what: &str, peer: &str) -> String {
         format!(
-            "{what} refused: {REFUSED_SERVER}{peer}; the client is pinned to relay {}",
+            "{what} refused: {}{peer}; the client is pinned to relay {}",
+            self.marker,
             self.pin.as_deref().unwrap_or_default()
         )
     }
@@ -86,10 +94,13 @@ impl<W> PinnedWallet<W> {
         let (MessageBoxError::Auth(text) | MessageBoxError::WebSocket(text)) = &error else {
             return error;
         };
-        let Some((_, rest)) = text.split_once(REFUSED_SERVER) else {
+        let Some((_, rest)) = text.split_once(&*self.marker) else {
             return error;
         };
         let peer: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        if peer.is_empty() {
+            return error;
+        }
         MessageBoxError::RelayIdentityMismatch {
             expected: pin.clone(),
             observed: Some(normalize_identity_key(&peer)),
@@ -491,6 +502,33 @@ mod tests {
             matches!(&unrelated, MessageBoxError::Auth(text) if text == "connection reset"),
             "{unrelated:?}"
         );
+    }
+
+    /// A server that puts refusal-like text in an error it causes (a handshake
+    /// body is copied into the error) is not read as the pin mismatch: it does
+    /// not know this wallet's token. Neither is a marker with no key after it.
+    #[test]
+    fn a_server_cannot_forge_a_refusal() {
+        let wallet = pinned_to(&key(2));
+        let forged = format!(
+            "handshake failed: 500 the relay pin refuses server {}",
+            key(3).to_der_hex()
+        );
+        let read = wallet.classify(MessageBoxError::Auth(forged.clone()));
+        assert!(
+            matches!(&read, MessageBoxError::Auth(text) if *text == forged),
+            "{read:?}"
+        );
+
+        // Another wallet's marker is not this wallet's.
+        let other = pinned_to(&key(2));
+        let theirs = other.refusal_text("signature", &key(3).to_der_hex());
+        let read = wallet.classify(MessageBoxError::Auth(theirs));
+        assert!(matches!(read, MessageBoxError::Auth(_)), "{read:?}");
+
+        let no_key = format!("handshake failed: {}zz", wallet.marker);
+        let read = wallet.classify(MessageBoxError::Auth(no_key));
+        assert!(matches!(read, MessageBoxError::Auth(_)), "{read:?}");
     }
 
     #[tokio::test]

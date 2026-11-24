@@ -1025,14 +1025,20 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // joins `${myIdentityKey}-${messageBox}`.
         let identity_key = self.get_identity_key().await?;
         let my_room = format!("{identity_key}-{message_box}");
-        let joined = {
+        // The socket may be open to another host than this call names (an
+        // earlier call opened it); its live sends spend that relay's budget.
+        let socket_host = {
             let guard = self.ws_state.lock().await;
-            match *guard {
-                Some(ref ws) => ws.join_room(&my_room).await.is_ok(),
-                None => false,
+            match guard.as_ref() {
+                Some(ws) => ws
+                    .join_room(&my_room)
+                    .await
+                    .ok()
+                    .map(|()| ws.url().to_string()),
+                None => None,
             }
         };
-        if !joined {
+        let Some(socket_host) = socket_host else {
             let msg_id = self
                 .send_persisted(
                     override_host,
@@ -1046,7 +1052,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 )
                 .await?;
             return Ok(DeliveryMode::Persisted { message_id: msg_id });
-        }
+        };
 
         // Encrypt (unless skip_encryption) and resolve message ID for the WebSocket path
         let encrypted = if skip_encryption {
@@ -1081,9 +1087,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
 
         // A live send spends the same relay budget as HTTP, and a refusal on
-        // the socket fails every pending live send, so wait out a known hold.
+        // the socket fails every pending live send, so wait out a known hold
+        // on the socket's relay.
         self.http
-            .wait_for_rate_limit(override_host.unwrap_or_else(|| self.host()), rate_deadline)
+            .wait_for_rate_limit(&socket_host, rate_deadline)
             .await?;
 
         // Emit — hold the lock only for the emit, not while awaiting the answer.
@@ -1100,6 +1107,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
         self.finish_live_send(
             outcome,
+            &socket_host,
             override_host,
             recipient,
             message_box,
@@ -1122,12 +1130,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// exactly-once: it collapses a resend only while the first row still
     /// exists (INSERT IGNORE), and an ack deletes that row.
     ///
-    /// The HTTP send waits on the rate limit only until `rate_deadline`, the
-    /// live send's own deadline.
+    /// A rate-limit refusal holds `socket_host`, the relay the socket is open
+    /// to. The HTTP send waits on the rate limit only until `rate_deadline`,
+    /// the live send's own deadline.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_live_send(
         &self,
         outcome: Result<(), MessageBoxError>,
+        socket_host: &str,
         override_host: Option<&str>,
         recipient: &str,
         message_box: &str,
@@ -1139,10 +1149,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ) -> Result<DeliveryMode, MessageBoxError> {
         if let Err(reason) = outcome {
             tracing::debug!(%reason, %message_id, "live send not accepted; sending over HTTP");
-            // A rate-limit refusal holds the relay, so the HTTP send below
-            // waits it out instead of being refused too.
-            self.http
-                .hold_for_rate_limit(override_host.unwrap_or_else(|| self.host()), &reason);
+            // A rate-limit refusal holds the socket's relay, so an HTTP send
+            // below to that relay waits it out instead of being refused too.
+            self.http.hold_for_rate_limit(socket_host, &reason);
             let http_id = self
                 .send_persisted(
                     override_host,

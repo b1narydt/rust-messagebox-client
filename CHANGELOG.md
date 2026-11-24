@@ -37,7 +37,8 @@ behaviour" section describes the result.
   the same id, within `with_rate_limit_wait` (default 60 s); past it the call
   returns `RateLimited`. A call can now wait up to that long. A live send's
   wait before its emit and its HTTP fallback share that one wait; its 10 s
-  ack wait and network time are on top.
+  ack wait and network time are on top. A live send waits on, and a refusal
+  on the socket holds, the relay the socket is open to.
 - **The poll backstop lists sparingly** (`src/client.rs`). It replaces the 2 s
   poll that stood down on WebSocket activity: one list on each WebSocket
   connect and reconnect, then every 15 s while connected

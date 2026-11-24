@@ -397,6 +397,71 @@ async fn a_live_send_and_its_fallback_share_one_rate_deadline() {
     sender.disconnect_web_socket().await.expect("disconnect");
 }
 
+/// A socket open to one relay serves a live send that names another host.
+/// The first relay's rate refusal holds that relay, not the named host, and a
+/// held relay stops the next live send before it reaches the socket.
+#[tokio::test]
+async fn a_live_send_spends_the_budget_of_the_relay_its_socket_serves() {
+    let mut relay = Relay::boot_answering(
+        AuthSocketServer::new(),
+        Some(json!({ "reason": "rate_limited", "retry_after": 30 })),
+    )
+    .await;
+    let other = "http://127.0.0.1:9";
+    let http = ScriptedTransport::new();
+    http.push(
+        200,
+        &[],
+        json!({"status":"success","message":"sent","results":[{"messageId":"id-a"}]}),
+    );
+    let sender = client(&relay.url)
+        .with_rate_limit_wait(Duration::ZERO)
+        .with_transport(http.clone());
+    within(sender.initialize_connection(None))
+        .await
+        .expect("socket at the relay");
+    let recipient = identity_of(OTHER_KEY).await;
+    let send = |id| {
+        sender.send_live_message(
+            &recipient,
+            "inbox",
+            "hello",
+            true,
+            false,
+            Some(id),
+            Some(other),
+        )
+    };
+
+    let first = within(send("id-a")).await;
+    assert!(
+        matches!(first, Ok(DeliveryMode::Persisted { .. })),
+        "{first:?}"
+    );
+    assert!(relay.settled_send().await.is_some(), "sent on the socket");
+    let fallback: Vec<_> = http.sent().into_iter().map(|r| r.url).collect();
+    assert_eq!(fallback.len(), 1, "{fallback:?}");
+    assert!(fallback[0].starts_with(other), "{fallback:?}");
+    let now = tokio::time::Instant::now();
+    assert!(
+        sender
+            .http
+            .wait_for_rate_limit(&relay.url, now)
+            .await
+            .is_err(),
+        "the socket's relay is held"
+    );
+
+    let second = within(send("id-b")).await;
+    assert!(
+        matches!(second, Err(MessageBoxError::RateLimited { .. })),
+        "{second:?}"
+    );
+    assert!(relay.settled_send().await.is_none(), "sent to a held relay");
+    assert_eq!(http.sent().len(), 1, "{:?}", http.sent());
+    sender.disconnect_web_socket().await.expect("disconnect");
+}
+
 /// The relay's certificate request on the WebSocket handshake is answered by
 /// the configured provider, and the client then joins its room.
 #[tokio::test]

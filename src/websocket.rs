@@ -196,6 +196,8 @@ pub struct MessageBoxWebSocket {
     pending_acks: PendingAcks,
     /// Rooms tracked locally so `leave_room` can clear subscriptions.
     joined_rooms: Arc<Mutex<HashSet<String>>>,
+    /// The URL this socket was opened to.
+    url: String,
 }
 
 impl MessageBoxWebSocket {
@@ -327,7 +329,14 @@ impl MessageBoxWebSocket {
             subscriptions,
             pending_acks,
             joined_rooms,
+            url: url.to_string(),
         })
+    }
+
+    /// The URL this socket was opened to: the relay whose rate budget its
+    /// live sends spend.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
     }
 
     /// Return true if the connection is currently authenticated.

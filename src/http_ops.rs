@@ -2656,6 +2656,7 @@ mod tests {
             let mode = client
                 .finish_live_send(
                     outcome,
+                    HOST,
                     Some(HOST),
                     RECIPIENT,
                     "inbox",
@@ -2924,6 +2925,7 @@ mod tests {
         let mode = client
             .finish_live_send(
                 Err(refused),
+                HOST,
                 Some(HOST),
                 RECIPIENT,
                 "inbox",

@@ -187,10 +187,12 @@ resends the same bytes, so the same message id. When the wait would pass
 returns `RateLimited` instead. A send to more recipients than the key's
 per-minute budget is always refused.
 
-**Live sends.** `send_live_message` first waits out a rate-limit hold, then
-emits over the WebSocket and waits up to 10 s for the relay's ack naming that
-message. If the emit fails, the relay refuses, or no ack arrives, it sends over
-HTTP with the same message id. The wait before the emit and the fallback's
+**Live sends.** `send_live_message` first waits out a rate-limit hold on the
+relay its WebSocket is open to, then emits over the WebSocket and waits up to
+10 s for the relay's ack naming that message. If the emit fails, the relay
+refuses, or no ack arrives, it sends over HTTP with the same message id. A
+rate-limit refusal on the socket holds the socket's relay, which is not the
+host the call names when an earlier call opened the socket. The wait before the emit and the fallback's
 waits share one `with_rate_limit_wait`, counted from the start of the call;
 the 10 s ack wait and network time are on top. A refusal (`messageFailed`) names no message, so
 it fails every pending live send on that socket. The relay is not
@@ -407,7 +409,7 @@ Offline tests use `ProtoWallet` instances — no live server required. Coverage 
 - Payment token shape and derivation encoding
 - Relay answers driven through a scripted HTTP transport: error codes, rate-limit waits and resends, the ack retry, the identity pin
 - Live-send ack matching and the poll backstop's cadence
-- WebSocket guards against authsocket's own server on a loopback port: the identity pin, the lowercase recipient, the rate-limit hold before a live send and the one rate deadline it shares with its fallback, the certificate provider
+- WebSocket guards against authsocket's own server on a loopback port: the identity pin, the lowercase recipient, the rate-limit hold before a live send, kept on the socket's relay, and the one rate deadline it shares with its fallback, the certificate provider
 - Critical pitfall guards (snake_case params, header extraction, recipient population)
 
 Live server tests validate 30+ operations against the production Babbage MessageBox service, including messaging, encryption, permissions, payments, overlay queries, host resolution, and device registration.

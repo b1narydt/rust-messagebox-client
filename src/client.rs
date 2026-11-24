@@ -180,7 +180,7 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// BRC-31 authenticated HTTP, behind the client's one HTTP door. Cheap to
     /// clone, so background polling tasks share the same session without a
     /// lock; N requests can be in flight at once.
-    http: RelayHttp,
+    pub(crate) http: RelayHttp,
     /// Wallet retained for direct encrypt / decrypt calls in `http_ops`.
     wallet: W,
     /// Optional originator string forwarded to wallet operations.
@@ -224,7 +224,14 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// On WS reconnect, ensure_ws_connected replays joinRoom + re-subscribes
     /// each entry on the fresh socket.
     subscriptions: Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
+    /// The last [`ACKED_IDS`] ids passed to `acknowledge_message`. The relay
+    /// deletes a row on ack, so a later send of the same id is a new row; a
+    /// subscription acks that row instead of delivering it again.
+    pub(crate) acked_ids: Arc<std::sync::Mutex<BoundedIdSet>>,
 }
+
+/// How many acknowledged ids a client remembers.
+const ACKED_IDS: usize = 10_000;
 
 impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Construct a new `MessageBoxClient`.
@@ -252,6 +259,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             poll_interval: DEFAULT_POLL_INTERVAL,
             joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            acked_ids: Arc::new(std::sync::Mutex::new(BoundedIdSet::new(ACKED_IDS))),
         }
     }
 
@@ -633,16 +641,6 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await
     }
 
-    /// POST JSON bytes to `url`, returning the response **regardless of HTTP
-    /// status** so the caller can inspect the body on a non-2xx reply.
-    pub(crate) async fn post_json_raw(
-        &self,
-        url: &str,
-        body_bytes: Vec<u8>,
-    ) -> Result<RelayResponse, MessageBoxError> {
-        self.http.fetch_raw(url, "POST", Some(body_bytes)).await
-    }
-
     /// Replace the HTTP transport (unit tests drive a scripted relay). Call it
     /// last: [`with_expected_relay_key`](Self::with_expected_relay_key)
     /// installs its own transport.
@@ -865,7 +863,28 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // dispatcher, WS `on_any` fallback, HTTP poll). Wrap once so a
         // `message_id` reaches the user at most once regardless of which path
         // wins the race.
-        let deduped = exactly_once(on_message);
+        let reack = {
+            let http = self.http.clone();
+            let host = override_host.unwrap_or(self.host()).to_string();
+            let room_id = room_id.clone();
+            Arc::new(move |id: String| {
+                let http = http.clone();
+                let host = host.clone();
+                let room_id = room_id.clone();
+                tokio::spawn(async move {
+                    let ids = [id];
+                    if let Err(e) = crate::http_ops::acknowledge_on_host(&http, &host, &ids).await {
+                        tracing::warn!(
+                            %room_id,
+                            message_id = %ids[0],
+                            error = %e,
+                            "could not acknowledge a repeat of an acknowledged message"
+                        );
+                    }
+                });
+            }) as Arc<dyn Fn(String) + Send + Sync>
+        };
+        let deduped = exactly_once(on_message, self.acked_ids.clone(), reack);
 
         let ws_callback = deduped.clone();
 
@@ -1338,22 +1357,36 @@ const LIVE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// still slip through — acceptable for the single-use-mailbox traffic this
 /// serves. This suppresses duplicates only; delivery liveness comes from the
 /// WS + poll paths, not from this wrapper.
+///
+/// An id in `acked` (one the client acknowledged) is never delivered again.
+/// The relay deleted that row on the ack, so the message now in the box is a
+/// later send of the same id: `reack` acknowledges it, or it would stay in the
+/// box. A repeat of an id the consumer has not acknowledged is only dropped:
+/// the consumer may still need that row.
 fn exactly_once(
     inner: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
+    acked: Arc<std::sync::Mutex<BoundedIdSet>>,
+    reack: Arc<dyn Fn(String) + Send + Sync>,
 ) -> Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> {
     let seen = Arc::new(std::sync::Mutex::new(BoundedIdSet::new(10_000)));
     Arc::new(move |msg: AuthenticatedPeerMessage| {
-        // Recover rather than panic on poison: a poisoned dedup set is harmless
-        // (worst case one duplicate delivery), whereas panicking here would kill
-        // the WS dispatcher or the spawned poll task and stop delivery entirely.
-        let fresh = match seen.lock() {
-            Ok(mut g) => g.insert(msg.message_id.clone()),
-            Err(poisoned) => poisoned.into_inner().insert(msg.message_id.clone()),
-        };
-        if fresh {
+        if lock_ids(&acked).contains(&msg.message_id) {
+            reack(msg.message_id);
+            return;
+        }
+        if lock_ids(&seen).insert(msg.message_id.clone()) {
             inner(msg);
         }
     })
+}
+
+/// Recover rather than panic on poison: a poisoned id set is harmless (worst
+/// case one duplicate delivery or ack), whereas panicking would kill the WS
+/// dispatcher or the spawned poll task and stop delivery entirely.
+pub(crate) fn lock_ids(
+    ids: &std::sync::Mutex<BoundedIdSet>,
+) -> std::sync::MutexGuard<'_, BoundedIdSet> {
+    ids.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// How often the poll backstop wakes to decide whether to list.
@@ -1473,14 +1506,14 @@ impl PollCadence {
 /// Prevents unbounded memory growth in the HTTP polling fallback task.
 /// When the set reaches `capacity`, the oldest entry is evicted before
 /// inserting the new one.
-struct BoundedIdSet {
+pub(crate) struct BoundedIdSet {
     set: HashSet<String>,
     order: VecDeque<String>,
     capacity: usize,
 }
 
 impl BoundedIdSet {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "BoundedIdSet capacity must be at least 1");
         Self {
             set: HashSet::with_capacity(capacity),
@@ -1490,7 +1523,7 @@ impl BoundedIdSet {
     }
 
     /// Insert an ID. Returns `true` if the ID was new (not previously seen).
-    fn insert(&mut self, id: String) -> bool {
+    pub(crate) fn insert(&mut self, id: String) -> bool {
         if self.set.contains(&id) {
             return false;
         }
@@ -1516,8 +1549,7 @@ impl BoundedIdSet {
     }
 
     /// Returns true if the given ID is currently in the set.
-    #[cfg(test)]
-    fn contains(&self, id: &str) -> bool {
+    pub(crate) fn contains(&self, id: &str) -> bool {
         self.set.contains(id)
     }
 }
@@ -2150,7 +2182,7 @@ mod tests {
             Arc::new(move |_m| {
                 c.fetch_add(1, Ordering::SeqCst);
             });
-        let deduped = super::exactly_once(inner);
+        let deduped = super::exactly_once(inner, no_acked_ids(), Arc::new(|_| {}));
 
         // Same id arriving on three "paths" (WS dispatcher, WS on_any, poll).
         deduped(peer_msg("m1"));
@@ -2160,6 +2192,38 @@ mod tests {
         deduped(peer_msg("m2"));
 
         assert_eq!(count.load(Ordering::SeqCst), 2, "m1 once + m2 once");
+    }
+
+    fn no_acked_ids() -> Arc<std::sync::Mutex<super::BoundedIdSet>> {
+        Arc::new(std::sync::Mutex::new(super::BoundedIdSet::new(16)))
+    }
+
+    /// The relay deletes a row on ack, so a repeat of an acknowledged id is a
+    /// new row: it is acknowledged, never delivered. A repeat of an id the
+    /// consumer has not acknowledged is only dropped, so its row stays.
+    #[test]
+    fn a_repeat_of_an_acknowledged_id_is_acknowledged_not_delivered() {
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let reacked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let d = delivered.clone();
+        let r = reacked.clone();
+        let acked = no_acked_ids();
+        let deduped = super::exactly_once(
+            Arc::new(move |m: crate::types::AuthenticatedPeerMessage| {
+                d.lock().unwrap().push(m.message_id)
+            }),
+            acked.clone(),
+            Arc::new(move |id| r.lock().unwrap().push(id)),
+        );
+
+        deduped(peer_msg("held"));
+        deduped(peer_msg("done"));
+        acked.lock().unwrap().insert("done".to_string());
+        deduped(peer_msg("held"));
+        deduped(peer_msg("done"));
+
+        assert_eq!(*delivered.lock().unwrap(), ["held", "done"]);
+        assert_eq!(*reacked.lock().unwrap(), ["done"]);
     }
 
     /// While the socket is connected the poll lists first thing, then once
@@ -2240,7 +2304,7 @@ mod tests {
             Arc::new(move |_m| {
                 c.fetch_add(1, Ordering::SeqCst);
             });
-        let deduped = super::exactly_once(inner);
+        let deduped = super::exactly_once(inner, no_acked_ids(), Arc::new(|_| {}));
 
         let mut handles = Vec::new();
         for _ in 0..8 {

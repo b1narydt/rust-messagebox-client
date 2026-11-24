@@ -14,6 +14,7 @@ use crate::client::check_status_error;
 use crate::client::MessageBoxClient;
 use crate::encryption;
 use crate::error::MessageBoxError;
+use crate::transport::RelayHttp;
 use crate::types::{
     AcknowledgeMessageParams, FailedRecipient, ListMessagePaymentOutcome, ListMessagesParams,
     ListMessagesResponse, MessagePayment, MessagePaymentOutput, PaymentAwarePeerMessage,
@@ -1442,6 +1443,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_ids: Vec<String>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        {
+            let mut acked = crate::client::lock_ids(&self.acked_ids);
+            for id in &message_ids {
+                acked.insert(id.clone());
+            }
+        }
         let host = self.assert_initialized(override_host).await?;
 
         if override_host.is_some() {
@@ -1479,42 +1486,54 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         host: &str,
         message_ids: &[String],
     ) -> Result<(), MessageBoxError> {
-        const PERSISTENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-        const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
-        const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+        acknowledge_on_host(&self.http, host, message_ids).await
+    }
+}
 
-        let params = AcknowledgeMessageParams {
-            message_ids: message_ids.to_vec(),
-        };
-        let body_bytes = serde_json::to_vec(&params)?;
-        let url = format!("{host}/acknowledgeMessage");
-        let deadline = tokio::time::Instant::now() + PERSISTENCE_GRACE;
-        let mut delay = INITIAL_RETRY_DELAY;
+/// Acknowledges `message_ids` on `host`. The relay pushes a live message
+/// before it stores it, so `ERR_INVALID_ACKNOWLEDGMENT` is retried for 5 s.
+pub(crate) async fn acknowledge_on_host(
+    http: &RelayHttp,
+    host: &str,
+    message_ids: &[String],
+) -> Result<(), MessageBoxError> {
+    const PERSISTENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+    const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
-        loop {
-            // Atlas uses push-live-first + persist-async. Inspect the structured
-            // 400 response so only the exact "row is not visible yet" outcome is
-            // retried. Other validation, auth, and server failures remain fatal.
-            let response = self.post_json_raw(&url, body_bytes.clone()).await?;
-            if response.is_success() {
-                check_status_error(&response.body)?;
-                return Ok(());
-            }
-            let error = response.error(&url);
-            if !matches!(
-                &error,
-                MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"
-            ) {
-                return Err(error);
-            }
+    let params = AcknowledgeMessageParams {
+        message_ids: message_ids.to_vec(),
+    };
+    let body_bytes = serde_json::to_vec(&params)?;
+    let url = format!("{host}/acknowledgeMessage");
+    let deadline = tokio::time::Instant::now() + PERSISTENCE_GRACE;
+    let mut delay = INITIAL_RETRY_DELAY;
 
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Err(error);
-            }
-            tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))).await;
-            delay = (delay * 2).min(MAX_RETRY_DELAY);
+    loop {
+        // Atlas uses push-live-first + persist-async. Inspect the structured
+        // 400 response so only the exact "row is not visible yet" outcome is
+        // retried. Other validation, auth, and server failures remain fatal.
+        let response = http
+            .fetch_raw(&url, "POST", Some(body_bytes.clone()))
+            .await?;
+        if response.is_success() {
+            check_status_error(&response.body)?;
+            return Ok(());
         }
+        let error = response.error(&url);
+        if !matches!(
+            &error,
+            MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"
+        ) {
+            return Err(error);
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(error);
+        }
+        tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))).await;
+        delay = (delay * 2).min(MAX_RETRY_DELAY);
     }
 }
 
@@ -2860,6 +2879,10 @@ mod tests {
             .acknowledge_message(vec!["id-1".to_string()], None)
             .await
             .expect("ack");
+        assert!(
+            crate::client::lock_ids(&pinned.acked_ids).contains("id-1"),
+            "an acknowledged id is remembered, so a later copy is acked, not delivered"
+        );
         assert_eq!(
             lookups.load(SeqCst),
             0,

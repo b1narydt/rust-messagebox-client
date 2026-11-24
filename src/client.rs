@@ -1300,7 +1300,8 @@ const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
 const POLL_OFFLINE_MIN: Duration = Duration::from_secs(1);
 const POLL_OFFLINE_MAX: Duration = Duration::from_secs(8);
 /// After a failed list the poll waits `POLL_ERROR_MIN`, doubling up to
-/// `POLL_ERROR_MAX`, on top of its usual cadence.
+/// `POLL_ERROR_MAX`, on top of its usual cadence; after an oversize list,
+/// `POLL_ERROR_MAX` at once.
 const POLL_ERROR_MIN: Duration = Duration::from_secs(2);
 const POLL_ERROR_MAX: Duration = Duration::from_secs(60);
 
@@ -1313,8 +1314,9 @@ const POLL_ERROR_MAX: Duration = Duration::from_secs(60);
 /// - while the socket is connected, `live_interval` after the last list;
 /// - with no connected socket, `POLL_OFFLINE_MIN` after the last list,
 ///   doubling to `POLL_OFFLINE_MAX`;
-/// - never before a rate-limit refusal's `retry_after` has passed, or before
-///   a growing back-off after a failed list.
+/// - never before a rate-limit refusal's `retry_after` has passed, before a
+///   growing back-off after a failed list, or within 60 s of an oversize
+///   list, connected or not.
 struct PollCadence {
     live_interval: Duration,
     /// The connection count at the last catch-up.
@@ -1381,6 +1383,9 @@ impl PollCadence {
                 None
             }
             Some(MessageBoxError::RateLimited { retry_after, .. }) => Some(now + *retry_after),
+            // The box is over the list bound and stays so until messages are
+            // acknowledged; a reconnect does not shorten the wait.
+            Some(MessageBoxError::Validation(_)) => Some(now + POLL_ERROR_MAX),
             Some(_) => {
                 let wait = self
                     .error_wait
@@ -2099,7 +2104,8 @@ mod tests {
     }
 
     /// Without a socket the poll backs off 1 s doubling to 8 s; it waits out
-    /// a rate-limit refusal, and failed lists back off to 60 s, never spin.
+    /// a rate-limit refusal. One oversize list holds it 60 s, through a
+    /// reconnect.
     #[test]
     fn a_poll_backs_off_offline_after_refusals_and_after_failures() {
         let s = std::time::Duration::from_secs;
@@ -2125,11 +2131,10 @@ mod tests {
         assert!(cadence.due(t, None));
 
         let too_big = MessageBoxError::Validation("listMessages response too large".into());
-        for _ in 0..6 {
-            cadence.listed(t, true, Some(&too_big));
-        }
+        cadence.listed(t, true, Some(&too_big));
         assert!(!cadence.due(just_before(t + s(60)), Some(0)));
-        assert!(cadence.due(t + s(60), Some(0)));
+        assert!(!cadence.due(just_before(t + s(60)), Some(1)), "a reconnect");
+        assert!(cadence.due(t + s(60), Some(1)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

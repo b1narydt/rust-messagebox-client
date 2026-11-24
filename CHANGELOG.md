@@ -43,7 +43,8 @@ behaviour" section describes the result.
   connect and reconnect, then every 15 s while connected
   (`with_poll_interval`); with no connected socket, after 1 s, doubling to 8 s.
   It waits out a rate-limit refusal and backs off up to 60 s after a failed
-  list. An oversize list (over the 32 MiB bound) is logged as an error.
+  list. An oversize list (over the 32 MiB bound) is logged as an error, and
+  the poll then waits 60 s before it lists again, connected or not.
 
 ### Added
 

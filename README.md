@@ -206,8 +206,8 @@ which spends the rate budget: once on each WebSocket connect and reconnect,
 then every 15 s while connected (`with_poll_interval`); with no connected
 socket, after 1 s, doubling to 8 s. It waits out a rate-limit refusal and backs
 off, up to 60 s, after a failed list. The relay does not paginate, so a box
-whose list exceeds 32 MiB cannot be listed: the poll logs an error and retries
-at most once a minute while live delivery continues.
+whose list exceeds 32 MiB cannot be listed: the poll logs an error and lists
+again 60 s later, connected or not, while live delivery continues.
 
 **Relay identity pin.** `with_expected_relay_key(key)` ties the client to its
 own host and to the relay there that proves `key`:

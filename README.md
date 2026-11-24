@@ -207,12 +207,23 @@ off, up to 60 s, after a failed list. The relay does not paginate, so a box
 whose list exceeds 32 MiB cannot be listed: the poll logs an error and retries
 at most once a minute while live delivery continues.
 
-**Relay identity pin.** `with_expected_relay_key(key)` requires every HTTP
-answer and every WebSocket connect to come from a server that proved that key
-in the BRC-103 handshake, else `RelayIdentityMismatch`; a server that proved
-no key fails too. The pin covers every host, including a recipient's relay
-found through the overlay. Without a pin the client trusts whichever relay
-answers the host.
+**Relay identity pin.** `with_expected_relay_key(key)` ties the client to its
+own host and to the relay there that proves `key`:
+- It talks only to its own host. It looks up no host on the overlay, and lists
+  and acknowledges on its own host alone. A call that names another host (an
+  `override_host`, or a `_from_host` / `_to_host` method) returns
+  `RelayHostRefused` before any request. Hosts compare by scheme, host, port
+  and path, ignoring case, a default port and a trailing slash.
+- Every HTTP answer must come from a server that proved `key` in the BRC-103
+  handshake, else `RelayIdentityMismatch`; a server that proved no key fails
+  too. The request has already reached that server.
+- Every WebSocket connect and reconnect is checked the same way and
+  disconnects on a mismatch. A live send then returns the error and sends
+  nothing over HTTP.
+- In either handshake the client proves certificates only to a server that
+  proved `key`, and never pays a `402` answer.
+
+Without a pin the client trusts whichever relay answers the host.
 
 **Certificates.** A relay with its identity gate armed asks for a certificate
 during the handshake.

@@ -317,12 +317,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// acknowledge it only on that host.
     ///
     /// This keeps a pinned-relay workflow from fanning the acknowledgement out
-    /// to every host advertised for the wallet identity.
+    /// to every host advertised for the wallet identity. A pinned client
+    /// refuses another host with [`MessageBoxError::RelayHostRefused`] before
+    /// it internalizes the payment.
     pub async fn accept_payment_from_host(
         &self,
         payment: &IncomingPayment,
         host: &str,
     ) -> Result<(), MessageBoxError> {
+        let host = self.relay_host(Some(host))?;
         let message_id = payment.message_id.clone();
         self.accept_payment_with_ack(payment, || async move {
             self.acknowledge_message(vec![message_id], Some(host)).await
@@ -2411,6 +2414,43 @@ mod tests {
             !acknowledged.load(Ordering::SeqCst),
             "relay message must remain when the wallet declines"
         );
+    }
+
+    /// A pinned client takes a payment only at its own host: another host is
+    /// refused before the wallet stores anything. Its own host spelled with
+    /// other case, its default port and a trailing slash is its own host.
+    #[tokio::test]
+    async fn a_pinned_client_accepts_payments_only_at_its_own_host() {
+        use crate::transport::scripted::{ScriptedTransport, RELAY_KEY};
+        let wallet = ArcWallet::internalize_answering(true);
+        let payment = wallet.incoming_payment(5000).await;
+        let relay = ScriptedTransport::new();
+        relay.push(200, &[], serde_json::json!({"status":"success"}));
+        let client = client_for(wallet.clone())
+            .with_expected_relay_key(RELAY_KEY)
+            .with_transport(relay.clone());
+        client.init_once.set(()).expect("skip the advertisement");
+
+        let err = client
+            .accept_payment_from_host(&payment, "https://other.example")
+            .await
+            .expect_err("another host");
+        assert!(
+            matches!(err, MessageBoxError::RelayHostRefused { .. }),
+            "{err:?}"
+        );
+        assert!(
+            wallet.internalize_observations().is_empty(),
+            "stored a payment from another host"
+        );
+
+        client
+            .accept_payment_from_host(&payment, "HTTPS://Example.com:443/")
+            .await
+            .expect("its own host");
+        assert_eq!(wallet.internalize_observations().len(), 1);
+        let urls: Vec<String> = relay.sent().into_iter().map(|r| r.url).collect();
+        assert_eq!(urls, ["https://example.com/acknowledgeMessage"]);
     }
 
     #[tokio::test]

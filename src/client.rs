@@ -235,31 +235,62 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Pin the relay's identity key (hex; case and surrounding whitespace are
     /// ignored).
     ///
-    /// Once pinned, the client trusts only that relay:
+    /// Once pinned, the client talks only to its own host and trusts only a
+    /// server there that proves this key:
+    /// - it does not look up a recipient's relay on the overlay, and lists and
+    ///   acknowledges on its own host alone. A call that names another host
+    ///   (an `override_host`, or a `_from_host` / `_to_host` method) returns
+    ///   [`MessageBoxError::RelayHostRefused`] before any request; hosts are
+    ///   compared by scheme, host, port and path, ignoring case, a default
+    ///   port and a trailing slash;
     /// - every HTTP response must come from a server that proved this key in
     ///   the BRC-103 handshake, or it is refused with
-    ///   [`MessageBoxError::RelayIdentityMismatch`] before its body is used;
+    ///   [`MessageBoxError::RelayIdentityMismatch`] before its body is used.
+    ///   The request has still reached that server;
     /// - every WebSocket connect and reconnect checks the key the server
-    ///   proved, and on a mismatch disconnects and returns that error;
+    ///   proved, and on a mismatch disconnects and returns that error. A live
+    ///   send then fails with it rather than falling back to HTTP;
     /// - during either handshake the client proves certificates (from the
     ///   wallet or the [certificate provider](Self::with_certificate_provider))
     ///   only to a server that proved this key, and never pays a `402`
     ///   answer: the HTTP and WebSocket handshakes run on a wallet that
     ///   refuses `create_action`.
     ///
-    /// A refused HTTP request has still reached the other server: the pin is
-    /// checked on the answer.
-    ///
-    /// Without a pin the client trusts whichever relay answers the host.
+    /// Without a pin the client trusts whichever relay answers each host.
     pub fn with_expected_relay_key(mut self, identity_key: impl AsRef<str>) -> Self {
         let key = crate::transport::normalize_identity_key(identity_key.as_ref());
         let auth_wallet = PinnedWallet::new(self.wallet.clone(), Some(key.clone()));
         self.http = self
             .http
             .with_transport(Arc::new(AuthFetch::new(auth_wallet)))
-            .with_expected_server_key(Some(key.clone()));
+            .with_pin(key.clone(), self.host.clone());
         self.expected_relay_key = Some(key);
         self
+    }
+
+    /// The host a call goes to: `explicit`, else this client's own host.
+    ///
+    /// A pinned client uses its own host, and refuses an explicit host that
+    /// is not that host with [`MessageBoxError::RelayHostRefused`] (see
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key)).
+    pub(crate) fn relay_host<'a>(
+        &'a self,
+        explicit: Option<&'a str>,
+    ) -> Result<&'a str, MessageBoxError> {
+        match explicit {
+            Some(host) if self.expected_relay_key.is_some() => {
+                if crate::transport::same_host(host, &self.host) {
+                    Ok(self.host())
+                } else {
+                    Err(MessageBoxError::RelayHostRefused {
+                        pinned: self.host.clone(),
+                        requested: host.to_string(),
+                    })
+                }
+            }
+            Some(host) => Ok(host),
+            None => Ok(self.host()),
+        }
     }
 
     /// The relay identity pin, if one is set (normalised lowercase hex).
@@ -572,6 +603,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client opens and uses a socket only at its own host.
+        self.relay_host(override_host)?;
         // Fast path: already connected.
         if self
             .ws_state
@@ -938,9 +971,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             }
         }
         if let Err(e) = self.ensure_ws_connected(override_host).await {
-            // The server at this host is not the pinned relay: the send ends
-            // here, and is not resent over HTTP to the same server.
-            if matches!(e, MessageBoxError::RelayIdentityMismatch { .. }) {
+            // A pinned client named another host, or the server at this host
+            // is not the pinned relay: the send ends here, with nothing sent
+            // over HTTP.
+            if matches!(
+                e,
+                MessageBoxError::RelayIdentityMismatch { .. }
+                    | MessageBoxError::RelayHostRefused { .. }
+            ) {
                 return Err(e);
             }
             eprintln!("Warning: WebSocket connection failed, falling back to HTTP: {e}");

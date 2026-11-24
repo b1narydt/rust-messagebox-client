@@ -259,6 +259,48 @@ async fn a_pinned_live_send_stops_at_a_relay_that_proves_another_key() {
     assert!(relay.settled_send().await.is_none(), "emitted to the relay");
 }
 
+/// A pinned client with its socket open at its own relay connects to and
+/// sends to no other host: a call that names one is refused, and nothing
+/// goes out on the open socket or over HTTP.
+#[tokio::test]
+async fn a_pinned_client_uses_no_socket_for_another_host() {
+    let mut relay = Relay::boot(AuthSocketServer::new()).await;
+    let http = ScriptedTransport::new();
+    let sender = client(&relay.url)
+        .with_expected_relay_key(identity_of(SERVER_KEY).await)
+        .with_transport(http.clone());
+    within(sender.initialize_connection(None))
+        .await
+        .expect("the pinned relay");
+
+    let other = "http://127.0.0.1:9";
+    let connected = within(sender.initialize_connection(Some(other))).await;
+    assert!(
+        matches!(connected, Err(MessageBoxError::RelayHostRefused { .. })),
+        "{connected:?}"
+    );
+    let sent = within(sender.send_live_message(
+        &identity_of(OTHER_KEY).await,
+        "inbox",
+        "hello",
+        true,
+        false,
+        Some("id-elsewhere"),
+        Some(other),
+    ))
+    .await;
+    assert!(
+        matches!(sent, Err(MessageBoxError::RelayHostRefused { .. })),
+        "{sent:?}"
+    );
+    assert!(http.sent().is_empty(), "sent over HTTP: {:?}", http.sent());
+    assert!(
+        relay.settled_send().await.is_none(),
+        "sent on the pinned socket"
+    );
+    sender.disconnect_web_socket().await.expect("disconnect");
+}
+
 /// A live send first waits out a known rate-limit hold on the relay. When
 /// the hold outlasts the rate-limit wait it returns `RateLimited` and emits
 /// nothing.

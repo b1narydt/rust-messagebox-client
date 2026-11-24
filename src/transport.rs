@@ -157,6 +157,37 @@ pub(crate) fn normalize_identity_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
 }
 
+/// A relay host URL in the form two spellings of one host share: scheme and
+/// host lowercase, the scheme's default port dropped, no trailing slash.
+fn normalize_host(host: &str) -> String {
+    let host = host.trim();
+    match url::Url::parse(host) {
+        Ok(url) => {
+            let mut normal = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+            if let Some(port) = url.port() {
+                normal.push_str(&format!(":{port}"));
+            }
+            normal.push_str(url.path().trim_end_matches('/'));
+            normal
+        }
+        Err(_) => host.trim_end_matches('/').to_ascii_lowercase(),
+    }
+}
+
+/// Whether `a` and `b` name one relay host, after [`normalize_host`].
+pub(crate) fn same_host(a: &str, b: &str) -> bool {
+    normalize_host(a) == normalize_host(b)
+}
+
+/// Whether `url` is the relay host `host` or a path on it, after
+/// [`normalize_host`].
+pub(crate) fn is_on_host(url: &str, host: &str) -> bool {
+    let url = normalize_host(url);
+    let host = normalize_host(host);
+    url.strip_prefix(&host)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// Check a server's proven identity against the pin. With no pin every server
 /// passes; with a pin, a different key or no key at all is refused.
 pub(crate) fn check_relay_identity(
@@ -248,6 +279,9 @@ pub(crate) struct RelayHttp {
     /// The relay identity pin, normalised. `None` trusts whichever server
     /// answers.
     expected_server_key: Option<String>,
+    /// With a pin, the client's own host: a request to any other URL is
+    /// refused before it is sent.
+    pinned_host: Option<String>,
     /// Rate-limit holds, shared by every clone.
     rate_gate: RateGate,
     /// How long one send or list waits, in all, on the rate limit.
@@ -262,15 +296,19 @@ impl RelayHttp {
         Self {
             transport,
             expected_server_key,
+            pinned_host: None,
             rate_gate: RateGate::default(),
             rate_limit_wait: DEFAULT_RATE_LIMIT_WAIT,
         }
     }
 
-    /// The same transport with a different pin.
-    pub(crate) fn with_expected_server_key(self, expected_server_key: Option<String>) -> Self {
+    /// The same handle pinned to the relay at `host` that proves
+    /// `server_key` (normalised): requests to any other URL are refused, and
+    /// answers from any other server are errors.
+    pub(crate) fn with_pin(self, server_key: String, host: String) -> Self {
         Self {
-            expected_server_key,
+            expected_server_key: Some(server_key),
+            pinned_host: Some(host),
             ..self
         }
     }
@@ -341,15 +379,24 @@ impl RelayHttp {
     /// Send one request and return the response whatever its status.
     /// A request with a body is sent as `application/json`.
     ///
-    /// With a pin, a response from any other server is an error before its
-    /// status or body is looked at. The request itself has already reached
-    /// that server.
+    /// With a pin, a request to a URL off the pinned host is refused with
+    /// [`MessageBoxError::RelayHostRefused`] before it is sent, and a response
+    /// from a server that proves another key is an error before its status or
+    /// body is looked at (that request has already reached the server).
     pub(crate) async fn fetch_raw(
         &self,
         url: &str,
         method: &str,
         body: Option<Vec<u8>>,
     ) -> Result<RelayResponse, MessageBoxError> {
+        if let Some(host) = &self.pinned_host {
+            if !is_on_host(url, host) {
+                return Err(MessageBoxError::RelayHostRefused {
+                    pinned: host.clone(),
+                    requested: url.to_string(),
+                });
+            }
+        }
         let headers = body
             .as_ref()
             .map(|_| HashMap::from([("content-type".to_string(), "application/json".to_string())]));

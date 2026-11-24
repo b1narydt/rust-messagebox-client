@@ -245,10 +245,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// first matching host. Falls back to `self.host` when:
     /// - No advertisements exist for the recipient, or
     /// - The overlay is unreachable (query_advertisements always returns Ok)
+    ///
+    /// A client pinned with
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key) returns its
+    /// own host without asking the overlay.
     pub async fn resolve_host_for_recipient(
         &self,
         recipient: &str,
     ) -> Result<String, MessageBoxError> {
+        if self.expected_relay_key().is_some() {
+            return Ok(self.host().to_string());
+        }
         let ads = self.query_advertisements(Some(recipient), None).await?;
         if let Some(ad) = ads.into_iter().next() {
             Ok(ad.host)

@@ -32,6 +32,8 @@ futures-util = "0.3"
 hex = "0.4"
 rand = "0.8"
 tracing = "0.1"
+# Compares relay host URLs for the relay pin (already in the graph via reqwest).
+url = "2.5"
 
 [dev-dependencies]
 wiremock = "0.6"

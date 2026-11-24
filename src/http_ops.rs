@@ -1230,21 +1230,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 .await;
         }
 
-        let identity_key = self.get_identity_key().await?;
-        let ads = self
-            .query_advertisements(Some(&identity_key), None)
-            .await
-            .unwrap_or_default();
-        let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
-        host_set.insert(self.host().to_string());
-
-        if host_set.len() == 1 {
+        let hosts = self.fan_out_hosts().await?;
+        if hosts.len() == 1 {
             return self
                 .list_messages_detailed_from_host(self.host(), message_box, accept_payments)
                 .await;
         }
 
-        let futures: Vec<_> = host_set
+        let futures: Vec<_> = hosts
             .iter()
             .map(|host| self.list_messages_detailed_from_host(host, message_box, accept_payments))
             .collect();
@@ -1256,7 +1249,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         if successful.is_empty() {
             return Err(MessageBoxError::Http(
                 0,
-                format!("list_messages: all {} hosts failed", host_set.len()),
+                format!("list_messages: all {} hosts failed", hosts.len()),
             ));
         }
 
@@ -1266,6 +1259,29 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .flatten()
             .filter(|receipt| seen.insert(receipt.message.message_id.clone()))
             .collect())
+    }
+
+    /// The hosts a list or acknowledgement without an `override_host` goes
+    /// to: this client's own host first, then each other host the overlay
+    /// advertises for this identity. A client pinned with
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key) uses its own
+    /// host alone and does not ask the overlay.
+    async fn fan_out_hosts(&self) -> Result<Vec<String>, MessageBoxError> {
+        let mut hosts = vec![self.host().to_string()];
+        if self.expected_relay_key().is_some() {
+            return Ok(hosts);
+        }
+        let identity_key = self.get_identity_key().await?;
+        let ads = self
+            .query_advertisements(Some(&identity_key), None)
+            .await
+            .unwrap_or_default();
+        for ad in ads {
+            if !hosts.contains(&ad.host) {
+                hosts.push(ad.host);
+            }
+        }
+        Ok(hosts)
     }
 
     /// Retrieve detailed messages from a single explicit host.
@@ -1371,23 +1387,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         }
 
         // Multi-host fan-out: ack on all known hosts concurrently.
-        let identity_key = self.get_identity_key().await?;
-        let ads = self
-            .query_advertisements(Some(&identity_key), None)
-            .await
-            .unwrap_or_default();
-
-        let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
-        host_set.insert(self.host().to_string());
-
-        if host_set.len() == 1 {
+        let hosts = self.fan_out_hosts().await?;
+        if hosts.len() == 1 {
             return self
                 .acknowledge_message_on_host(self.host(), &message_ids)
                 .await;
         }
 
         // Fan out in parallel — return Ok if at least one succeeds.
-        let futures: Vec<_> = host_set
+        let futures: Vec<_> = hosts
             .iter()
             .map(|h| self.acknowledge_message_on_host(h, &message_ids))
             .collect();
@@ -1400,7 +1408,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         } else {
             Err(MessageBoxError::Http(
                 0,
-                format!("acknowledge_message: all {} hosts failed", host_set.len()),
+                format!("acknowledge_message: all {} hosts failed", hosts.len()),
             ))
         }
     }
@@ -1937,7 +1945,7 @@ mod tests {
         originator: Option<&str>,
     ) -> crate::MessageBoxClient<ArcWallet> {
         crate::MessageBoxClient::new(
-            "https://unused.example".to_string(),
+            HOST.to_string(),
             wallet,
             originator.map(str::to_owned),
             bsv::services::overlay_tools::Network::Mainnet,
@@ -2697,6 +2705,121 @@ mod tests {
             .await
             .expect("an unpinned client trusts whoever answers");
         assert_eq!(id, "id-2");
+    }
+
+    /// A pinned client sends nothing to another host: a call that names one,
+    /// even a host that only begins with the pinned one, is refused before
+    /// any request. Its own host spelled another way is its own host.
+    #[tokio::test]
+    async fn a_pinned_client_sends_nothing_to_another_host() {
+        use crate::transport::scripted::RELAY_KEY;
+        let relay = ScriptedTransport::new();
+        relay.push(200, &[], json!({"status":"success","messages":[]}));
+        let pinned = payment_client(ArcWallet::new(), None)
+            .with_expected_relay_key(RELAY_KEY)
+            .with_transport(relay.clone());
+        pinned.init_once.set(()).expect("skip the advertisement");
+
+        for other in [
+            "https://other.example",
+            "https://relay.example.evil",
+            "http://relay.example",
+            "https://relay.example:8443",
+        ] {
+            let err = pinned
+                .list_messages("inbox", false, Some(other))
+                .await
+                .expect_err("another host");
+            assert!(
+                matches!(&err, MessageBoxError::RelayHostRefused { requested, .. } if requested.starts_with(other)),
+                "{other}: {err:?}"
+            );
+        }
+        assert!(relay.sent().is_empty(), "{:?}", relay.sent());
+
+        pinned
+            .list_messages("inbox", false, Some("HTTPS://Relay.Example:443"))
+            .await
+            .expect("the pinned host");
+        assert_eq!(relay.sent().len(), 1);
+    }
+
+    /// An overlay tracker on a loopback port that counts the connections it
+    /// is sent and answers none. The URL is `https` because the resolver
+    /// refuses plain HTTP; the connection is counted before any TLS.
+    async fn counting_tracker() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("https://{}", listener.local_addr().expect("addr"));
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = lookups.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        (url, lookups)
+    }
+
+    /// A pinned client never asks the overlay for a host: its send, list and
+    /// ack go to its own host alone. An unpinned client on the same tracker
+    /// does ask it.
+    #[tokio::test]
+    async fn a_pinned_client_never_asks_the_overlay_for_a_host() {
+        use crate::transport::scripted::RELAY_KEY;
+        use std::sync::atomic::Ordering::SeqCst;
+        let (tracker, lookups) = counting_tracker().await;
+        let network = bsv::services::overlay_tools::Network::Custom(vec![tracker]);
+        let relay = ScriptedTransport::new();
+        relay.push(
+            200,
+            &[],
+            json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":"id-1"}]}),
+        );
+        relay.push(200, &[], json!({"status":"success","messages":[]}));
+        relay.push(200, &[], json!({"status":"success"}));
+        let pinned =
+            crate::MessageBoxClient::new(HOST.to_string(), ArcWallet::new(), None, network.clone())
+                .with_expected_relay_key(RELAY_KEY)
+                .with_transport(relay.clone());
+        pinned.init_once.set(()).expect("skip the advertisement");
+
+        pinned
+            .send_message(RECIPIENT, "inbox", "hi", true, false, Some("id-1"), None)
+            .await
+            .expect("send");
+        pinned
+            .list_messages("inbox", false, None)
+            .await
+            .expect("list");
+        pinned
+            .acknowledge_message(vec!["id-1".to_string()], None)
+            .await
+            .expect("ack");
+        assert_eq!(
+            lookups.load(SeqCst),
+            0,
+            "the pinned client asked the overlay"
+        );
+        let urls: Vec<String> = relay.sent().into_iter().map(|r| r.url).collect();
+        assert_eq!(
+            urls,
+            [
+                format!("{HOST}/sendMessage"),
+                format!("{HOST}/listMessages"),
+                format!("{HOST}/acknowledgeMessage"),
+            ]
+        );
+
+        let unpinned =
+            crate::MessageBoxClient::new(HOST.to_string(), ArcWallet::new(), None, network);
+        unpinned
+            .resolve_host_for_recipient(RECIPIENT)
+            .await
+            .expect("its own host when the overlay has none");
+        assert!(lookups.load(SeqCst) > 0, "the tracker saw no lookup");
     }
 
     fn rate_limited(retry_after: u64) -> serde_json::Value {

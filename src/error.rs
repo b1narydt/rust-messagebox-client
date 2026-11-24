@@ -46,6 +46,13 @@ pub enum MessageBoxError {
         expected: String,
         observed: Option<String>,
     },
+    /// The client was pinned to one relay
+    /// ([`MessageBoxClient::with_expected_relay_key`](crate::MessageBoxClient::with_expected_relay_key))
+    /// and a call named another host. A pinned client talks only to its own
+    /// host, so nothing was sent to `requested`. `pinned` is the client's
+    /// host; `requested` is the host or URL that was refused.
+    #[error("relay host refused: the client is pinned to {pinned}, not {requested}")]
+    RelayHostRefused { pinned: String, requested: String },
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("JSON parse error: {0}")]

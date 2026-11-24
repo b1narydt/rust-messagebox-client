@@ -46,7 +46,12 @@ behaviour" section describes the result.
 ### Added
 
 - `MessageBoxClient::with_expected_relay_key` and `expected_relay_key`: pin the
-  relay's identity key on every HTTP answer and WebSocket connect.
+  relay's identity key on every HTTP answer and WebSocket connect. A pinned
+  client talks only to its own host: it skips overlay host lookup and the
+  multi-host list and ack fan-out, and refuses any other named host with the
+  new `MessageBoxError::RelayHostRefused { pinned, requested }` before any
+  request. Its handshakes prove certificates only to the pinned key and never
+  pay a `402`.
 - `MessageBoxClient::with_certificate_provider`,
   `MessageBoxWebSocket::connect_with_certificate_provider`, and the
   `websocket::CertificateProvider` re-export: answer the relay's certificate

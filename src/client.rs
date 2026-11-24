@@ -1466,6 +1466,9 @@ pub(crate) fn check_status_error(body: &[u8]) -> Result<(), MessageBoxError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod ws_loopback_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bsv::primitives::private_key::PrivateKey;
@@ -1481,11 +1484,17 @@ mod tests {
     /// KeyDeriver.  Wrapping in Arc satisfies the Clone bound while sharing
     /// the same underlying wallet across the clone and the AuthFetch instance.
     #[derive(Clone)]
-    struct ArcWallet(Arc<ProtoWallet>);
+    pub(super) struct ArcWallet(Arc<ProtoWallet>);
 
     impl ArcWallet {
         fn new() -> Self {
             let key = PrivateKey::from_random().expect("random key");
+            ArcWallet(Arc::new(ProtoWallet::new(key)))
+        }
+
+        /// A wallet for a fixed private key (64 hex characters).
+        pub(super) fn from_key_hex(key_hex: &str) -> Self {
+            let key = PrivateKey::from_hex(key_hex).expect("private key hex");
             ArcWallet(Arc::new(ProtoWallet::new(key)))
         }
     }

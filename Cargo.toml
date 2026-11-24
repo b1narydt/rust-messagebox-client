@@ -36,4 +36,9 @@ tracing = "0.1"
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1", features = ["test-util", "net"] }
+# Loopback relay for the WebSocket tests: authsocket's own server (socketioxide
+# behind axum), at the versions authsocket's own tests use.
+authsocket = { version = "0.5.0", features = ["client", "server"] }
+axum = "0.8"
+socketioxide = "0.15"

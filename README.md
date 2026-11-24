@@ -373,11 +373,11 @@ This crate targets full behavioral parity with `@bsv/message-box-client` v2.0.x.
 ## Testing
 
 ```bash
-# Run all offline tests (175 tests: 157 unit + 12 integration + 6 parity)
+# Run all offline tests (179 tests: 161 unit + 12 integration + 6 parity)
 cargo test
 
 # Run specific test suites
-cargo test --lib               # Unit tests (157)
+cargo test --lib               # Unit tests (161)
 cargo test --test integration  # Integration tests (12)
 cargo test --test parity       # Parity verification tests (6)
 
@@ -394,6 +394,7 @@ Offline tests use `ProtoWallet` instances — no live server required. Coverage 
 - Payment token shape and derivation encoding
 - Relay answers driven through a scripted HTTP transport: error codes, rate-limit waits and resends, the ack retry, the identity pin
 - Live-send ack matching and the poll backstop's cadence
+- WebSocket guards against authsocket's own server on a loopback port: the identity pin, the lowercase recipient, the rate-limit hold before a live send, the certificate provider
 - Critical pitfall guards (snake_case params, header extraction, recipient population)
 
 Live server tests validate 30+ operations against the production Babbage MessageBox service, including messaging, encryption, permissions, payments, overlay queries, host resolution, and device registration.

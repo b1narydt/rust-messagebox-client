@@ -40,6 +40,28 @@ pub(crate) fn dedup_messages(results: Vec<Vec<PeerMessage>>) -> Vec<PeerMessage>
     out
 }
 
+/// The answers of one call made to several hosts, in host order. When every
+/// host failed, the first host's error instead, so the caller sees the relay's
+/// own refusal (`RateLimited`, `Relay { code, .. }`) rather than a summary.
+fn answers_or_first_error<T>(
+    outcomes: Vec<Result<T, MessageBoxError>>,
+) -> Result<Vec<T>, MessageBoxError> {
+    let mut answers = Vec::new();
+    let mut first_error = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(answer) => answers.push(answer),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        Some(e) if answers.is_empty() => Err(e),
+        _ => Ok(answers),
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ServerPayment {
@@ -1229,7 +1251,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// Multi-host: queries all hosts advertised by this identity concurrently and
     /// deduplicates results by `message_id`. Matches TS `Promise.allSettled` semantics:
-    /// if at least one host succeeds, partial results are returned.
+    /// if at least one host succeeds, partial results are returned. If every host
+    /// fails, returns this client's own host's error.
     ///
     /// NOTE: This handles the server delivery-fee payment wrapper, NOT PeerPay
     /// PaymentTokens (peer-to-peer). PeerPay tokens are handled by `list_incoming_payments`.
@@ -1270,25 +1293,26 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 .list_messages_detailed_from_host(self.host(), message_box, accept_payments)
                 .await;
         }
+        self.list_messages_detailed_on_hosts(&hosts, message_box, accept_payments)
+            .await
+    }
 
+    /// Lists `message_box` on every host in `hosts` at once and keeps the
+    /// first copy of each message id. Fails only when every host fails, with
+    /// the first host's error.
+    async fn list_messages_detailed_on_hosts(
+        &self,
+        hosts: &[String],
+        message_box: &str,
+        accept_payments: bool,
+    ) -> Result<Vec<PaymentAwarePeerMessage>, MessageBoxError> {
         let futures: Vec<_> = hosts
             .iter()
             .map(|host| self.list_messages_detailed_from_host(host, message_box, accept_payments))
             .collect();
-        let successful: Vec<Vec<PaymentAwarePeerMessage>> = join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-            .collect();
-        if successful.is_empty() {
-            return Err(MessageBoxError::Http(
-                0,
-                format!("list_messages: all {} hosts failed", hosts.len()),
-            ));
-        }
-
+        let listed = answers_or_first_error(join_all(futures).await)?;
         let mut seen = HashSet::new();
-        Ok(successful
+        Ok(listed
             .into_iter()
             .flatten()
             .filter(|receipt| seen.insert(receipt.message.message_id.clone()))
@@ -1409,7 +1433,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Mark messages as acknowledged (read) by their IDs.
     ///
     /// TS PARITY: When `override_host` is None, fans out to ALL advertised hosts in parallel
-    /// (same `join_all` pattern as `list_messages`). Returns Ok if ANY host succeeds.
+    /// (same `join_all` pattern as `list_messages`). Returns Ok if ANY host succeeds;
+    /// if every host fails, returns this client's own host's error.
     /// When `override_host` is Some, acks on that single host only.
     pub async fn acknowledge_message(
         &self,
@@ -1429,24 +1454,22 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 .acknowledge_message_on_host(self.host(), &message_ids)
                 .await;
         }
+        self.acknowledge_message_on_hosts(&hosts, &message_ids)
+            .await
+    }
 
-        // Fan out in parallel — return Ok if at least one succeeds.
+    /// Acknowledges `message_ids` on every host in `hosts` at once. Fails
+    /// only when every host fails, with the first host's error.
+    async fn acknowledge_message_on_hosts(
+        &self,
+        hosts: &[String],
+        message_ids: &[String],
+    ) -> Result<(), MessageBoxError> {
         let futures: Vec<_> = hosts
             .iter()
-            .map(|h| self.acknowledge_message_on_host(h, &message_ids))
+            .map(|host| self.acknowledge_message_on_host(host, message_ids))
             .collect();
-
-        let outcomes = join_all(futures).await;
-        let any_ok = outcomes.iter().any(|r| r.is_ok());
-
-        if any_ok {
-            Ok(())
-        } else {
-            Err(MessageBoxError::Http(
-                0,
-                format!("acknowledge_message: all {} hosts failed", hosts.len()),
-            ))
-        }
+        answers_or_first_error(join_all(futures).await).map(|_| ())
     }
 
     /// Acknowledge messages on a single explicit host.
@@ -2962,6 +2985,51 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(relay.sent().len(), 1);
+    }
+
+    /// When every host fails a fanned-out list or ack, the call returns the
+    /// first host's own refusal, not a summary of the failures.
+    #[tokio::test]
+    async fn a_call_every_host_refuses_returns_the_first_hosts_refusal() {
+        let hosts = [HOST.to_string(), "https://other.example".to_string()];
+        let codes = ["ERR_ONE", "ERR_TWO"];
+        let relay = ScriptedTransport::new();
+        let client = scripted_client(&relay);
+        let refuse_both = || {
+            for code in codes {
+                relay.push(
+                    400,
+                    &[],
+                    json!({"status":"error","code":code,"description":"refused"}),
+                );
+            }
+        };
+        // Answers go out in request order: HOST's is the one its request took.
+        let hosts_code = |from: usize| {
+            let at = relay.sent()[from..]
+                .iter()
+                .position(|r| r.url.starts_with(HOST))
+                .expect("HOST was asked");
+            codes[at]
+        };
+        let code_of = |err: MessageBoxError| match err {
+            MessageBoxError::Relay { code, .. } => code,
+            other => panic!("{other:?}"),
+        };
+
+        refuse_both();
+        let err = client
+            .list_messages_detailed_on_hosts(&hosts, "inbox", false)
+            .await
+            .expect_err("every host refused the list");
+        assert_eq!(code_of(err), hosts_code(0));
+
+        refuse_both();
+        let err = client
+            .acknowledge_message_on_hosts(&hosts, &["m1".to_string()])
+            .await
+            .expect_err("every host refused the ack");
+        assert_eq!(code_of(err), hosts_code(2));
     }
 
     /// The relay refuses a sender the recipient has not whitelisted with

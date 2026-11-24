@@ -175,7 +175,9 @@ What the client does against the Atlas relay.
 `MessageBoxError::Relay { status, code, description }` with the relay's code
 (`ERR_DELIVERY_BLOCKED`, `not_certified`, ...). A rate-limit refusal that
 outlasts the client's wait returns `RateLimited { retry_after, tier }`.
-`Http(status, url)` is left for answers whose body names no code.
+`Http(status, url)` is left for answers whose body names no code. A list or
+acknowledgement sent to several hosts fails only when every host fails, with
+the client's own host's error.
 
 **Rate budget.** The relay charges HTTP sends, WebSocket sends and lists to one
 budget per identity: 10 a minute for an uncertified key, 300 for a certified
@@ -192,10 +194,11 @@ relay its WebSocket is open to, then emits over the WebSocket and waits up to
 10 s for the relay's ack naming that message. If the emit fails, the relay
 refuses, or no ack arrives, it sends over HTTP with the same message id. A
 rate-limit refusal on the socket holds the socket's relay, which is not the
-host the call names when an earlier call opened the socket. The wait before the emit and the fallback's
-waits share one `with_rate_limit_wait`, counted from the start of the call;
-the 10 s ack wait and network time are on top. A refusal (`messageFailed`) names no message, so
-it fails every pending live send on that socket. The relay is not
+host the call names when an earlier call opened the socket. The wait before
+the emit and the fallback's waits share one `with_rate_limit_wait`, counted
+from the start of the call; the 10 s ack wait and network time are on top. A
+refusal (`messageFailed`) names no message, so it fails every pending live
+send on that socket. The relay is not
 exactly-once: it keeps one row per id only until the recipient acknowledges
 it, so receivers dedup by message id.
 

@@ -20,7 +20,8 @@ behaviour" section describes the result.
   gate's `error` such as `not_certified`), `RateLimited { retry_after, tier }`
   and `RelayIdentityMismatch { expected, observed }`. A relay JSON error that
   was `Http(status, url)` is now `Relay` or `RateLimited`; `Http` remains for a
-  body that names no code.
+  body that names no code. A list or ack sent to several hosts that every
+  host fails returns the client's own host's error, not `Http(0, ...)`.
 - **Live-send answers are matched by message id** (`src/websocket.rs`).
   `MessageBoxWebSocket::emit_send_message(&self, &WsSendMessageData)` now
   returns a `LiveSendAck`; `LiveSendAck::wait(timeout)` gives the relay's

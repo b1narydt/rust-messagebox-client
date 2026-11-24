@@ -14,11 +14,15 @@
 //! refuses both key-linkage reveals, which the auth channel never needs.
 //! Every other call goes to the caller's wallet unchanged. Without a pin it
 //! changes nothing. [`PinnedWallet::guard_provider`] guards a configured
-//! [`CertificateProvider`] the same way, and [`PinnedFetch`] reports a refusal
-//! on the HTTP channel as the pin mismatch behind it.
+//! [`CertificateProvider`] the same way.
+//!
+//! The auth channels report a refusal only as text inside their own error.
+//! Each refusal for a server carries [`REFUSED_SERVER`] and that server's key
+//! in its text, and [`PinnedWallet::classify`] reads the failure back as the
+//! pin mismatch behind it, from that one error alone.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bsv::auth::clients::auth_fetch::AuthFetch;
@@ -30,52 +34,37 @@ use crate::error::MessageBoxError;
 use crate::transport::{normalize_identity_key, HttpTransport, RelayResponse};
 use crate::websocket::CertificateProvider;
 
+/// What the text of every refusal for a server other than the pin carries,
+/// followed by that server's key (hex).
+const REFUSED_SERVER: &str = "the relay pin refuses server ";
+
 /// The caller's wallet, as handed to the relay auth channel.
 #[derive(Clone)]
 pub(crate) struct PinnedWallet<W> {
     inner: W,
     /// The relay identity pin, normalised. `None` delegates every call.
     pin: Option<String>,
-    /// The last server a proof or signature was refused for, until
-    /// [`refusal`](Self::refusal) reports it.
-    refused: Arc<Mutex<Option<String>>>,
 }
 
 impl<W> PinnedWallet<W> {
     pub(crate) fn new(inner: W, pin: Option<String>) -> Self {
-        Self {
-            inner,
-            pin,
-            refused: Arc::default(),
-        }
+        Self { inner, pin }
     }
 
     /// Whether the pin allows proving a certificate to, or signing for, the
-    /// server `peer` (hex). A refused server is recorded for
-    /// [`refusal`](Self::refusal).
+    /// server `peer` (hex).
     fn may_answer(&self, peer: &str) -> bool {
-        match &self.pin {
-            Some(pin) if normalize_identity_key(peer) != *pin => {
-                *self.refused.lock().unwrap_or_else(|p| p.into_inner()) = Some(peer.to_string());
-                false
-            }
-            _ => true,
-        }
+        self.pin
+            .as_ref()
+            .is_none_or(|pin| normalize_identity_key(peer) == *pin)
     }
 
-    /// The pin mismatch behind the last refused proof or signature, if there
-    /// was one: the server had proved a key other than the pin. Each refusal
-    /// is reported once.
-    pub(crate) fn refusal(&self) -> Option<MessageBoxError> {
-        let peer = self
-            .refused
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()?;
-        Some(MessageBoxError::RelayIdentityMismatch {
-            expected: self.pin.clone().unwrap_or_default(),
-            observed: Some(normalize_identity_key(&peer)),
-        })
+    /// The text of a refusal of `what` for the server `peer`.
+    fn refusal_text(&self, what: &str, peer: &str) -> String {
+        format!(
+            "{what} refused: {REFUSED_SERVER}{peer}; the client is pinned to relay {}",
+            self.pin.as_deref().unwrap_or_default()
+        )
     }
 
     /// The error for a call the pin refuses.
@@ -84,6 +73,27 @@ impl<W> PinnedWallet<W> {
             "{what} refused: the client is pinned to relay {}",
             self.pin.as_deref().unwrap_or_default()
         ))
+    }
+
+    /// `error` as [`MessageBoxError::RelayIdentityMismatch`] when it is an
+    /// auth channel failure whose own text carries this wallet's refusal: the
+    /// server it names had proved a key other than the pin. Any other error
+    /// unchanged.
+    pub(crate) fn classify(&self, error: MessageBoxError) -> MessageBoxError {
+        let Some(pin) = &self.pin else {
+            return error;
+        };
+        let (MessageBoxError::Auth(text) | MessageBoxError::WebSocket(text)) = &error else {
+            return error;
+        };
+        let Some((_, rest)) = text.split_once(REFUSED_SERVER) else {
+            return error;
+        };
+        let peer: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+        MessageBoxError::RelayIdentityMismatch {
+            expected: pin.clone(),
+            observed: Some(normalize_identity_key(&peer)),
+        }
     }
 
     /// `provider`, refusing without calling it any verifier but the pinned
@@ -98,10 +108,7 @@ impl<W> PinnedWallet<W> {
         let guard = self.clone();
         Arc::new(move |verifier, requested| {
             if !guard.may_answer(&verifier) {
-                let message = format!(
-                    "certificate request from {verifier} refused: the client is pinned to relay {}",
-                    guard.pin.as_deref().unwrap_or_default()
-                );
+                let message = guard.refusal_text("certificate request", &verifier);
                 return Box::pin(async move { Err(message) });
             }
             provider(verifier, requested)
@@ -133,7 +140,9 @@ where
     ) -> Result<ProveCertificateResult, WalletError> {
         let verifier = args.verifier.to_der_hex();
         if !self.may_answer(&verifier) {
-            return Err(self.refused_by_pin(&format!("certificate proof for {verifier}")));
+            return Err(WalletError::Internal(
+                self.refusal_text("certificate proof", &verifier),
+            ));
         }
         self.inner.prove_certificate(args, orig).await
     }
@@ -150,7 +159,7 @@ where
         ) {
             let peer = peer.to_der_hex();
             if !self.may_answer(&peer) {
-                return Err(self.refused_by_pin(&format!("signature for {peer}")));
+                return Err(WalletError::Internal(self.refusal_text("signature", &peer)));
             }
         }
         self.inner.create_signature(args, orig).await
@@ -364,7 +373,7 @@ where
     ) -> Result<RelayResponse, MessageBoxError> {
         HttpTransport::fetch(&self.fetch, url, method, body, headers)
             .await
-            .map_err(|e| self.wallet.refusal().unwrap_or(e))
+            .map_err(|e| self.wallet.classify(e))
     }
 }
 
@@ -432,6 +441,42 @@ mod tests {
         }
     }
 
+    /// `refused` is the wallet's refusal, and the auth channel's failure
+    /// carrying it reads back as the pin mismatch with `server`'s key.
+    fn assert_reads_as_mismatch<T: std::fmt::Debug>(
+        wallet: &PinnedWallet<Arc<ProtoWallet>>,
+        refused: Result<T, WalletError>,
+        server: &PublicKey,
+    ) {
+        let refused = match refused {
+            Err(e @ WalletError::Internal(_)) => e,
+            other => panic!("expected the refusal, got {other:?}"),
+        };
+        match wallet.classify(MessageBoxError::Auth(format!(
+            "handshake failed: {refused}"
+        ))) {
+            MessageBoxError::RelayIdentityMismatch { observed, .. } => {
+                assert_eq!(observed, Some(server.to_der_hex()));
+            }
+            other => panic!("expected the pin mismatch, got {other:?}"),
+        }
+    }
+
+    /// Each failure is read by itself: another channel's refusal, before or
+    /// at the same time, never turns an unrelated failure into a mismatch.
+    #[tokio::test]
+    async fn only_a_failure_carrying_a_refusal_reads_as_the_pin_mismatch() {
+        let wallet = pinned_to(&key(2));
+        let refused = wallet.create_signature(signature_for(&key(3)), None).await;
+        assert!(refused.is_err(), "{refused:?}");
+
+        let unrelated = wallet.classify(MessageBoxError::Auth("connection reset".to_string()));
+        assert!(
+            matches!(&unrelated, MessageBoxError::Auth(text) if text == "connection reset"),
+            "{unrelated:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_pinned_wallet_signs_only_for_the_pinned_relay() {
         let relay = key(2);
@@ -439,17 +484,7 @@ mod tests {
         let wallet = pinned_to(&relay);
 
         let refused = wallet.create_signature(signature_for(&other), None).await;
-        assert!(
-            matches!(refused, Err(WalletError::Internal(_))),
-            "{refused:?}"
-        );
-        match wallet.refusal() {
-            Some(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
-                assert_eq!(observed, Some(other.to_der_hex()));
-            }
-            other => panic!("expected the refusal, got {other:?}"),
-        }
-        assert!(wallet.refusal().is_none(), "a refusal is reported once");
+        assert_reads_as_mismatch(&wallet, refused, &other);
 
         let signed = wallet.create_signature(signature_for(&relay), None).await;
         assert!(signed.is_ok(), "{signed:?}");
@@ -515,16 +550,7 @@ mod tests {
         let wallet = pinned_to(&relay);
 
         let refused = wallet.prove_certificate(proof_for(&other), None).await;
-        assert!(
-            matches!(refused, Err(WalletError::Internal(_))),
-            "{refused:?}"
-        );
-        match wallet.refusal() {
-            Some(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
-                assert_eq!(observed, Some(other.to_der_hex()));
-            }
-            other => panic!("expected the refusal, got {other:?}"),
-        }
+        assert_reads_as_mismatch(&wallet, refused, &other);
 
         let delegated = wallet.prove_certificate(proof_for(&relay), None).await;
         assert!(

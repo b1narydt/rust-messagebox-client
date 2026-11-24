@@ -80,7 +80,7 @@ where
         };
         let ws = match opened {
             Ok(ws) => ws,
-            Err(e) => return Err(wallet.refusal().unwrap_or(e)),
+            Err(e) => return Err(wallet.classify(e)),
         };
         if let Err(e) = crate::transport::check_relay_identity(
             self.expected_relay_key.as_deref(),

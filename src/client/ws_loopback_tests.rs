@@ -704,14 +704,17 @@ impl Transport for Outbox {
 /// request is counted and gets an unauthenticated answer, so a client request
 /// fails once its handshake is done. Returns the URL and that count.
 async fn boot_http_handshake(requested: RequestedCertificateSet) -> (String, Arc<AtomicUsize>) {
-    let outbox = Arc::new(Outbox::default());
-    let peer = Arc::new(Peer::new(
-        ProtoWallet::new(PrivateKey::from_hex(SERVER_KEY).expect("server key")),
-        outbox.clone(),
-    ));
-    peer.set_certificates_to_request(requested);
+    boot_http_handshake_proving(requested, Arc::new(std::sync::Mutex::new(SERVER_KEY))).await
+}
+
+/// [`boot_http_handshake`], proving the key `proves` holds when each
+/// handshake starts.
+async fn boot_http_handshake_proving(
+    requested: RequestedCertificateSet,
+    proves: Arc<std::sync::Mutex<&'static str>>,
+) -> (String, Arc<AtomicUsize>) {
     let handshake = move |body: axum::body::Bytes| {
-        let (peer, outbox) = (peer.clone(), outbox.clone());
+        let (requested, proves) = (requested.clone(), proves.clone());
         async move {
             let Ok(message) = serde_json::from_slice::<AuthMessage>(&body) else {
                 return String::new();
@@ -719,6 +722,13 @@ async fn boot_http_handshake(requested: RequestedCertificateSet) -> (String, Arc
             if message.message_type != MessageType::InitialRequest {
                 return String::new();
             }
+            let key = *proves.lock().expect("key");
+            let outbox = Arc::new(Outbox::default());
+            let peer = Peer::new(
+                ProtoWallet::new(PrivateKey::from_hex(key).expect("server key")),
+                outbox.clone(),
+            );
+            peer.set_certificates_to_request(requested);
             peer.dispatch_message(message)
                 .await
                 .expect("initial request");
@@ -769,6 +779,33 @@ async fn a_pinned_http_handshake_proves_nothing_to_another_relay() {
             "proofs asked with the pin on {pin}"
         );
     }
+}
+
+/// A refusal does not stick to the URL: once the relay there proves the
+/// pinned key, the same client handshakes again and its request reaches the
+/// relay. (The stand-in answers no request, so the request still fails.)
+#[tokio::test]
+async fn a_pinned_client_handshakes_again_after_a_refusal() {
+    let proves = Arc::new(std::sync::Mutex::new(OTHER_KEY));
+    let (url, requests) =
+        boot_http_handshake_proving(RequestedCertificateSet::default(), proves.clone()).await;
+    let pinned = client(&url).with_expected_relay_key(identity_of(SERVER_KEY).await);
+    let list = format!("{url}/listMessages");
+
+    let refused = within(pinned.http.fetch_raw(&list, "POST", Some(b"{}".to_vec()))).await;
+    assert!(
+        matches!(refused, Err(MessageBoxError::RelayIdentityMismatch { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+    *proves.lock().expect("key") = SERVER_KEY;
+    let _ = within(pinned.http.fetch_raw(&list, "POST", Some(b"{}".to_vec()))).await;
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the request reached the relay now proving the pin"
+    );
 }
 
 /// A client pinned to another key never sends a request to the relay that

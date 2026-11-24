@@ -338,12 +338,18 @@ where
 
 /// `AuthFetch` on a [`PinnedWallet`]. A request that fails because the wallet
 /// refused a proof or a signature for a server that proved another key fails
-/// with [`MessageBoxError::RelayIdentityMismatch`].
+/// with [`MessageBoxError::RelayIdentityMismatch`], and the `AuthFetch` is
+/// replaced with a fresh one.
+///
+/// `AuthFetch` keeps the server it handshook with for each base URL and drops
+/// it only on a stale session. Kept, a refused server would be refused on every
+/// later request there, even once the pinned relay answers at that URL; the
+/// fresh `AuthFetch` handshakes again.
 pub(crate) struct PinnedFetch<W>
 where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
-    fetch: AuthFetch<PinnedWallet<W>>,
+    fetch: std::sync::RwLock<Arc<AuthFetch<PinnedWallet<W>>>>,
     wallet: PinnedWallet<W>,
 }
 
@@ -353,7 +359,7 @@ where
 {
     pub(crate) fn new(wallet: PinnedWallet<W>) -> Self {
         Self {
-            fetch: AuthFetch::new(wallet.clone()),
+            fetch: std::sync::RwLock::new(Arc::new(AuthFetch::new(wallet.clone()))),
             wallet,
         }
     }
@@ -371,9 +377,19 @@ where
         body: Option<Vec<u8>>,
         headers: Option<HashMap<String, String>>,
     ) -> Result<RelayResponse, MessageBoxError> {
-        HttpTransport::fetch(&self.fetch, url, method, body, headers)
-            .await
-            .map_err(|e| self.wallet.classify(e))
+        let fetch = self.fetch.read().unwrap_or_else(|p| p.into_inner()).clone();
+        let error = match HttpTransport::fetch(fetch.as_ref(), url, method, body, headers).await {
+            Ok(answer) => return Ok(answer),
+            Err(e) => self.wallet.classify(e),
+        };
+        if matches!(error, MessageBoxError::RelayIdentityMismatch { .. }) {
+            let mut current = self.fetch.write().unwrap_or_else(|p| p.into_inner());
+            // Another request may have replaced it already.
+            if Arc::ptr_eq(&current, &fetch) {
+                *current = Arc::new(AuthFetch::new(self.wallet.clone()));
+            }
+        }
+        Err(error)
     }
 }
 

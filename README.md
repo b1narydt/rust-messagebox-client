@@ -228,7 +228,9 @@ own host and to the relay there that proves `key`:
 - Over HTTP and the WebSocket, the wallet signs a message only for a server
   that proved `key` in the BRC-103 handshake. A server that proved another
   key gets the handshake and nothing after it: the request is never signed,
-  so never sent, and the call returns `RelayIdentityMismatch`.
+  so never sent, and the call returns `RelayIdentityMismatch`. The next
+  request handshakes again, so it reaches the pinned relay once that relay
+  answers the host.
 - Every HTTP answer must also come from a server that proved `key`, else
   `RelayIdentityMismatch`; a server that proved no key fails too.
 - Every WebSocket connect and reconnect is checked the same way and

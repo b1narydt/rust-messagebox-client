@@ -749,35 +749,40 @@ mod tests {
     type InternalizeObservations =
         Arc<std::sync::Mutex<Vec<(InternalizeActionArgs, Option<String>)>>>;
 
+    /// The last field counts `create_action` calls: payments attempted.
     #[derive(Clone)]
-    struct ArcWallet(Arc<ProtoWallet>, InternalizeMode, InternalizeObservations);
+    struct ArcWallet(
+        Arc<ProtoWallet>,
+        InternalizeMode,
+        InternalizeObservations,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
 
     impl ArcWallet {
-        fn new() -> Self {
+        fn with_mode(mode: InternalizeMode) -> Self {
             let key = PrivateKey::from_random().expect("random key");
             ArcWallet(
                 Arc::new(ProtoWallet::new(key)),
-                InternalizeMode::Passthrough,
-                Arc::new(std::sync::Mutex::new(Vec::new())),
+                mode,
+                Arc::default(),
+                Arc::default(),
             )
+        }
+
+        fn new() -> Self {
+            Self::with_mode(InternalizeMode::Passthrough)
         }
 
         fn failing_internalize(message: &'static str) -> Self {
-            let key = PrivateKey::from_random().expect("random key");
-            ArcWallet(
-                Arc::new(ProtoWallet::new(key)),
-                InternalizeMode::Fail(message),
-                Arc::new(std::sync::Mutex::new(Vec::new())),
-            )
+            Self::with_mode(InternalizeMode::Fail(message))
         }
 
         fn internalize_answering(accepted: bool) -> Self {
-            let key = PrivateKey::from_random().expect("random key");
-            ArcWallet(
-                Arc::new(ProtoWallet::new(key)),
-                InternalizeMode::Answer { accepted },
-                Arc::new(std::sync::Mutex::new(Vec::new())),
-            )
+            Self::with_mode(InternalizeMode::Answer { accepted })
+        }
+
+        fn actions(&self) -> usize {
+            self.3.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn internalize_originators(&self) -> Vec<Option<String>> {
@@ -865,6 +870,7 @@ mod tests {
             args: CreateActionArgs,
             orig: Option<&str>,
         ) -> Result<CreateActionResult, WalletError> {
+            self.3.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.0.create_action(args, orig).await
         }
         async fn sign_action(
@@ -2451,6 +2457,55 @@ mod tests {
         assert_eq!(wallet.internalize_observations().len(), 1);
         let urls: Vec<String> = relay.sent().into_iter().map(|r| r.url).collect();
         assert_eq!(urls, ["https://example.com/acknowledgeMessage"]);
+    }
+
+    /// A pinned client refuses a payment request call that names another
+    /// host before it pays or sends anything: refused only after paying, the
+    /// caller would retry and pay twice.
+    #[tokio::test]
+    async fn a_pinned_client_pays_nothing_through_another_host() {
+        use crate::transport::scripted::{ScriptedTransport, RELAY_KEY};
+        use crate::types::IncomingPaymentRequest;
+        let wallet = ArcWallet::new();
+        let relay = ScriptedTransport::new();
+        let client = client_for(wallet.clone())
+            .with_expected_relay_key(RELAY_KEY)
+            .with_transport(relay.clone());
+        client.init_once.set(()).expect("skip the advertisement");
+        let sender = wallet.identity_hex().await;
+        let request = IncomingPaymentRequest {
+            message_id: "request-message".to_string(),
+            sender: sender.clone(),
+            request_id: "request".to_string(),
+            amount: 5000,
+            description: "lunch".to_string(),
+            expires_at: u64::MAX,
+        };
+        let other = "https://other.example";
+
+        let answers = [
+            client
+                .fulfill_payment_request(&request, None, Some(other))
+                .await,
+            client
+                .decline_payment_request(&request, None, Some(other))
+                .await,
+            client
+                .request_payment_to_host(&sender, 5000, "lunch", u64::MAX, other)
+                .await
+                .map(|_| ()),
+            client
+                .cancel_payment_request(&sender, "request", "proof", Some(other))
+                .await,
+        ];
+        for answer in answers {
+            assert!(
+                matches!(answer, Err(MessageBoxError::RelayHostRefused { .. })),
+                "{answer:?}"
+            );
+        }
+        assert_eq!(wallet.actions(), 0, "paid through another host");
+        assert!(relay.sent().is_empty(), "sent through another host");
     }
 
     #[tokio::test]

@@ -90,6 +90,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         expires_at: u64,
         host_override: Option<&str>,
     ) -> Result<PaymentRequestResult, MessageBoxError> {
+        // A pinned client refuses another host before anything else.
+        self.relay_host(host_override)?;
         if amount == 0 {
             return Err(MessageBoxError::Validation(
                 "Payment request amount must be greater than 0".to_string(),
@@ -183,6 +185,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         request_proof: &str,
         host_override: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client refuses another host before anything else.
+        self.relay_host(host_override)?;
         let sender_identity_key = self.get_identity_key().await?;
 
         let message = PaymentRequestMessage {
@@ -434,6 +438,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         note: Option<&str>,
         host_override: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client refuses another host before it pays: refused only
+        // at the response, the caller would see an error after paying, and a
+        // retry would pay again.
+        self.relay_host(host_override)?;
+
         // Step 1: Send payment
         self.send_payment(&request.sender, request.amount).await?;
 
@@ -476,6 +485,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         note: Option<&str>,
         host_override: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client refuses another host before anything else.
+        self.relay_host(host_override)?;
         let mut response = PaymentRequestResponse {
             request_id: request.request_id.clone(),
             status: "declined".to_string(),

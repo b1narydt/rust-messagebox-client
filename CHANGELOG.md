@@ -58,8 +58,8 @@ behaviour" section describes the result.
   client talks only to its own host: it skips overlay host lookup and the
   multi-host list and ack fan-out, and refuses any other named host, including
   `init`'s `target_host`, with the new
-  `MessageBoxError::RelayHostRefused { pinned, requested }` before any request
-  or advertisement. Its HTTP and WebSocket channels sign a request only for a server
+  `MessageBoxError::RelayHostRefused { pinned, requested }` before any request,
+  payment or advertisement. Its HTTP and WebSocket channels sign a request only for a server
   that proved the pinned key, so a request is never sent to one that proved
   another; they prove certificates only to the pinned key, never pay a `402`,
   and reveal no key linkage.

@@ -269,8 +269,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///   acknowledges on its own host alone. A call that names another host
     ///   (an `override_host`, a `_from_host` / `_to_host` method, or
     ///   [`init`](Self::init)'s `target_host`) returns
-    ///   [`MessageBoxError::RelayHostRefused`] before any request or
-    ///   advertisement; hosts are
+    ///   [`MessageBoxError::RelayHostRefused`] before any request, payment
+    ///   or advertisement; hosts are
     ///   compared by scheme, host, port and path, ignoring case, a default
     ///   port and a trailing slash;
     /// - the HTTP and WebSocket auth channels run on a wallet that signs a

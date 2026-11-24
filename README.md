@@ -204,17 +204,19 @@ closes that socket and fails the sends still waiting on it at once, and each
 falls back to HTTP. The relay
 is not exactly-once: it keeps one row per id only until the recipient
 acknowledges it, and a resend after that is a new row. A live listener
-delivers each id once (it remembers the last 10,000 per subscription). A copy
-of an id this client already acknowledged is acknowledged again on the
-listener's host, once, and not delivered, so it does not sit on the relay. An
-id counts as acknowledged once its `acknowledge_message` call has answered,
-so a copy listed while that call is in flight is only dropped. Callers of
-`list_messages` dedup by message id themselves.
+delivers each id once (it remembers the last 10,000 per subscription). While
+an `acknowledge_message` call for an id is running, the listener drops any
+copy of it. After the call answers, fails or is cancelled, each copy the
+listener sees is acknowledged on its host, one request per copy, and not
+delivered, so it does not sit on the relay. Callers of `list_messages` dedup
+by message id themselves.
 
 **Acknowledgements.** The relay pushes a live message before it stores it. An
 ack that arrives first is answered `ERR_INVALID_ACKNOWLEDGMENT`; the client
-retries that answer, and only that one, for up to 5 s. A re-ack of a repeat
-is not retried: the poll lists a row that is stored later, and acks it then.
+retries that answer, and only that one, for up to 5 s, unless every id in the
+call was acknowledged before: then the row is most likely gone, and the call
+makes one attempt. The listener's re-ack of a copy is not retried either: the
+poll lists a row that is stored later, and acks it then.
 
 **Poll backstop.** `listen_for_live_messages` also lists the box over HTTP,
 which spends the rate budget: once on each WebSocket connect and reconnect,

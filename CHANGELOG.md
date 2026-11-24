@@ -16,9 +16,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before the ack request went out. A copy of the row listed while that request
   was in flight was then re-acked by the listener, which could delete the row
   first; the caller's own ack got `ERR_INVALID_ACKNOWLEDGMENT` and retried it
-  for 5 s (about 20 requests). Ids are now recorded once the ack answers,
-  success or failure. A re-ack of a repeat is one request; not found means
-  the row is gone or not stored yet, and the poll lists a stored row again.
+  for 5 s (about 20 requests).
+  - While an `acknowledge_message` call runs, its ids are in flight: the
+    listener drops a copy, and neither delivers nor re-acks it.
+  - The ids are recorded as acknowledged when the call ends, whether it
+    answered, failed or was cancelled.
+  - An ack of ids that were all acknowledged before makes one attempt: the
+    listener may have deleted the row since, so not found is not retried.
+  - The listener's re-ack of a copy is one request. Not found means the row
+    is gone or not stored yet, and the poll lists a stored row again.
 
 ---
 

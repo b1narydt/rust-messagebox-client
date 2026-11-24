@@ -245,8 +245,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// server there that proves this key:
     /// - it does not look up a recipient's relay on the overlay, and lists and
     ///   acknowledges on its own host alone. A call that names another host
-    ///   (an `override_host`, or a `_from_host` / `_to_host` method) returns
-    ///   [`MessageBoxError::RelayHostRefused`] before any request; hosts are
+    ///   (an `override_host`, a `_from_host` / `_to_host` method, or
+    ///   [`init`](Self::init)'s `target_host`) returns
+    ///   [`MessageBoxError::RelayHostRefused`] before any request or
+    ///   advertisement; hosts are
     ///   compared by scheme, host, port and path, ignoring case, a default
     ///   port and a trailing slash;
     /// - the HTTP and WebSocket auth channels run on a wallet that signs a
@@ -468,10 +470,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// the init path runs exactly once due to `init_once` OnceCell semantics.
     ///
     /// `target_host`: when Some, uses that host for the anoint_host call instead of
-    /// `self.host()`. Matches the TS `init(targetHost?)` signature.
+    /// `self.host()`. Matches the TS `init(targetHost?)` signature. A client
+    /// pinned with [`with_expected_relay_key`](Self::with_expected_relay_key)
+    /// advertises only its own host: any other `target_host` returns
+    /// [`MessageBoxError::RelayHostRefused`] before anything is advertised.
     pub async fn init(&self, target_host: Option<&str>) -> Result<(), MessageBoxError> {
         match target_host {
             Some(host) => {
+                let host = self.relay_host(Some(host))?;
                 // TS parity: if targetHost provided, anoint THAT host directly
                 // instead of going through assert_initialized's self.host logic.
                 self.init_once
@@ -2214,5 +2220,39 @@ mod tests {
         }
         // 100 distinct ids, each delivered exactly once despite 8 racing tasks.
         assert_eq!(count.load(Ordering::SeqCst), 100);
+    }
+
+    /// A pinned client advertises only its own host: `init` naming another
+    /// host is refused before the advertisement is built or signed. Its own
+    /// host spelled another way is its own host.
+    #[tokio::test]
+    async fn a_pinned_client_advertises_no_other_host() {
+        use crate::transport::scripted::RELAY_KEY;
+        let wallet = ArcWallet::new();
+        let pinned = MessageBoxClient::new(
+            "https://relay.example".to_string(),
+            wallet.clone(),
+            None,
+            Network::Mainnet,
+        )
+        .with_expected_relay_key(RELAY_KEY);
+
+        let err = pinned
+            .init(Some("https://other.example"))
+            .await
+            .expect_err("another host");
+        assert!(
+            matches!(&err, MessageBoxError::RelayHostRefused { requested, .. } if requested == "https://other.example"),
+            "{err:?}"
+        );
+        assert_eq!(wallet.signatures(), 0, "no advertisement was signed");
+        assert!(pinned.init_once.get().is_none());
+
+        // ProtoWallet cannot create the action, which init reports and skips.
+        pinned
+            .init(Some("HTTPS://Relay.Example:443"))
+            .await
+            .expect("the pinned host");
+        assert!(wallet.signatures() > 0, "the advertisement was signed");
     }
 }

@@ -59,7 +59,8 @@ behaviour" section describes the result.
   `MessageBoxWebSocket::connect_with_certificate_provider`, and the
   `websocket::CertificateProvider` re-export: answer the relay's certificate
   request on the WebSocket. HTTP has no provider hook in bsv-sdk 0.8.0.
-- `MessageBoxClient::with_rate_limit_wait` and `with_poll_interval`.
+- `MessageBoxClient::with_rate_limit_wait` and `with_poll_interval` (at
+  least 1 s; a shorter interval is raised to 1 s).
 - Pinned-host payment APIs: `list_incoming_payments_from_host`,
   `accept_payment_from_host` and `request_payment_to_host`, which use only the
   named host.

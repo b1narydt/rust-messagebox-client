@@ -255,7 +255,7 @@ host: no overlay lookup and no multi-host fan-out.
 | `expected_relay_key()` | The pin, if set (lowercase hex) |
 | `with_certificate_provider(provider)` | Answer the relay's certificate request on WebSocket connects |
 | `with_rate_limit_wait(duration)` | Longest a send or list waits on the rate limit (default 60 s) |
-| `with_poll_interval(duration)` | Poll backstop interval while the WebSocket is connected (default 15 s) |
+| `with_poll_interval(duration)` | Poll backstop interval while the WebSocket is connected (default 15 s, at least 1 s) |
 
 #### Core Messaging
 

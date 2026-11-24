@@ -331,9 +331,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
     /// Set the longest the poll backstop of
     /// [`listen_for_live_messages`](Self::listen_for_live_messages) waits
-    /// between lists while the WebSocket is connected (default 15 s).
+    /// between lists while the WebSocket is connected (default 15 s, at least
+    /// 1 s: a shorter interval is raised to 1 s, as every list spends the
+    /// relay rate budget).
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
-        self.poll_interval = interval;
+        self.poll_interval = interval.max(POLL_INTERVAL_MIN);
         self
     }
 
@@ -1295,6 +1297,8 @@ fn exactly_once(
 const POLL_TICK: Duration = Duration::from_secs(1);
 /// Default for [`MessageBoxClient::with_poll_interval`].
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// The shortest interval [`MessageBoxClient::with_poll_interval`] takes.
+const POLL_INTERVAL_MIN: Duration = Duration::from_secs(1);
 /// Without a connected WebSocket the poll lists after `POLL_OFFLINE_MIN`,
 /// doubling up to `POLL_OFFLINE_MAX`.
 const POLL_OFFLINE_MIN: Duration = Duration::from_secs(1);
@@ -2086,7 +2090,8 @@ mod tests {
     }
 
     /// While the socket is connected the poll lists first thing, then once
-    /// per reconnect, and otherwise only every `live_interval`.
+    /// per reconnect, and otherwise only every `live_interval`, which is
+    /// never under 1 s.
     #[test]
     fn a_connected_poll_lists_on_each_connect_then_every_interval() {
         let s = std::time::Duration::from_secs;
@@ -2101,6 +2106,19 @@ mod tests {
         assert!(cadence.due(t0 + s(16), Some(2)), "a reconnect catches up");
         cadence.listed(t0 + s(16), true, None);
         assert!(!cadence.due(t0 + s(17), Some(2)), "once per reconnect");
+
+        // An interval set to zero lists at most once a second.
+        let client = MessageBoxClient::new(
+            "https://example.com".to_string(),
+            ArcWallet::new(),
+            None,
+            Network::Local,
+        )
+        .with_poll_interval(std::time::Duration::ZERO);
+        let mut cadence = super::PollCadence::new(client.poll_interval, 1);
+        cadence.listed(t0, true, None);
+        assert!(!cadence.due(t0 + std::time::Duration::from_millis(999), Some(1)));
+        assert!(cadence.due(t0 + s(1), Some(1)));
     }
 
     /// Without a socket the poll backs off 1 s doubling to 8 s; it waits out

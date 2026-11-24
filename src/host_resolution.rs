@@ -272,7 +272,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// Returns the txid of the broadcast transaction, matching TS `anointHost`
     /// which returns `{ txid }`.
+    ///
+    /// A pinned client advertises only its own host: another host returns
+    /// [`MessageBoxError::RelayHostRefused`] before anything is built or
+    /// signed.
     pub async fn anoint_host(&self, host: &str) -> Result<String, MessageBoxError> {
+        let host = self.relay_host(Some(host))?;
         let identity_key = self.get_identity_key().await?;
 
         // fields[0] = raw identity key bytes (hex-decoded per Pitfall 3)

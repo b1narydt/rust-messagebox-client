@@ -221,8 +221,9 @@ while live delivery continues.
 own host and to the relay there that proves `key`:
 - It talks only to its own host. It looks up no host on the overlay, and lists
   and acknowledges on its own host alone. A call that names another host (an
-  `override_host`, a `_from_host` / `_to_host` method, or `init`'s
-  `target_host`) returns `RelayHostRefused` before any request, payment or
+  `override_host`, a `_from_host` / `_to_host` method, `init`'s
+  `target_host`, or `anoint_host`) returns `RelayHostRefused` before any
+  request, payment or
   advertisement. Hosts compare by scheme, host, port
   and path, ignoring case, a default port and a trailing slash.
 - Over HTTP and the WebSocket, the wallet signs a message only for a server

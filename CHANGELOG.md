@@ -57,7 +57,7 @@ behaviour" section describes the result.
   relay's identity key on every HTTP answer and WebSocket connect. A pinned
   client talks only to its own host: it skips overlay host lookup and the
   multi-host list and ack fan-out, and refuses any other named host, including
-  `init`'s `target_host`, with the new
+  `init`'s `target_host` and `anoint_host`'s, with the new
   `MessageBoxError::RelayHostRefused { pinned, requested }` before any request,
   payment or advertisement. Its HTTP and WebSocket channels sign a request only for a server
   that proved the pinned key, so a request is never sent to one that proved

@@ -267,8 +267,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// server there that proves this key:
     /// - it does not look up a recipient's relay on the overlay, and lists and
     ///   acknowledges on its own host alone. A call that names another host
-    ///   (an `override_host`, a `_from_host` / `_to_host` method, or
-    ///   [`init`](Self::init)'s `target_host`) returns
+    ///   (an `override_host`, a `_from_host` / `_to_host` method,
+    ///   [`init`](Self::init)'s `target_host`, or `anoint_host`) returns
     ///   [`MessageBoxError::RelayHostRefused`] before any request, payment
     ///   or advertisement; hosts are
     ///   compared by scheme, host, port and path, ignoring case, a default
@@ -2242,8 +2242,9 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 100);
     }
 
-    /// A pinned client advertises only its own host: `init` naming another
-    /// host is refused before the advertisement is built or signed. Its own
+    /// A pinned client advertises only its own host: `init` or `anoint_host`
+    /// naming another host is refused before the advertisement is built or
+    /// signed. Its own
     /// host spelled another way is its own host.
     #[tokio::test]
     async fn a_pinned_client_advertises_no_other_host() {
@@ -2267,6 +2268,16 @@ mod tests {
         );
         assert_eq!(wallet.signatures(), 0, "no advertisement was signed");
         assert!(pinned.init_once.get().is_none());
+
+        let err = pinned
+            .anoint_host("https://other.example")
+            .await
+            .expect_err("another host");
+        assert!(
+            matches!(&err, MessageBoxError::RelayHostRefused { .. }),
+            "{err:?}"
+        );
+        assert_eq!(wallet.signatures(), 0, "no advertisement was signed");
 
         // ProtoWallet cannot create the action, which init reports and skips.
         pinned

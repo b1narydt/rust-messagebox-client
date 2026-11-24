@@ -320,6 +320,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// resends a refused send or list, same bytes and id, once it passes.
     /// When the wait would run past this limit the call returns
     /// [`MessageBoxError::RateLimited`] instead. `Duration::ZERO` never waits.
+    ///
+    /// A live send ([`send_live_message`](Self::send_live_message)) counts as
+    /// one call: its wait before the emit and its HTTP fallback share the
+    /// limit. Its 10 s ack wait and network time are on top.
     pub fn with_rate_limit_wait(mut self, wait: Duration) -> Self {
         self.http = self.http.with_rate_limit_wait(wait);
         self
@@ -555,16 +559,24 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         self.http.fetch_ok(url, "POST", Some(body_bytes)).await
     }
 
+    /// When a send or list starting now stops waiting on the rate limit.
+    pub(crate) fn rate_limit_deadline(&self) -> tokio::time::Instant {
+        self.http.rate_limit_deadline()
+    }
+
     /// POST a send or list to `url` on `host`, waiting out the relay's rate
-    /// limit and resending the same bytes after a refusal, within the
-    /// rate-limit wait ([`RelayHttp::fetch_budgeted`]).
+    /// limit and resending the same bytes after a refusal, until `deadline`
+    /// ([`RelayHttp::fetch_budgeted`]).
     pub(crate) async fn post_budgeted(
         &self,
         host: &str,
         url: &str,
         body_bytes: Vec<u8>,
+        deadline: tokio::time::Instant,
     ) -> Result<RelayResponse, MessageBoxError> {
-        self.http.fetch_budgeted(host, url, body_bytes).await
+        self.http
+            .fetch_budgeted(host, url, body_bytes, deadline)
+            .await
     }
 
     /// POST JSON bytes to `url`, returning the response **regardless of HTTP
@@ -902,9 +914,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// the send (`messageFailed`), or no ack names this message within 10 s.
     /// A pinned client whose socket meets a relay that proves another key
     /// returns [`MessageBoxError::RelayIdentityMismatch`] and sends nothing
-    /// over HTTP. Before the emit it waits out a rate-limit hold on the relay, and returns
-    /// [`MessageBoxError::RateLimited`] if that wait would pass
-    /// [`with_rate_limit_wait`](Self::with_rate_limit_wait).
+    /// over HTTP.
+    ///
+    /// Rate limit: the call sets one deadline when it starts,
+    /// [`with_rate_limit_wait`](Self::with_rate_limit_wait) from then. The
+    /// wait for a rate-limit hold before the emit and the waits in the HTTP
+    /// fallback all end by it; a hold that would outlast it returns
+    /// [`MessageBoxError::RateLimited`]. The 10 s ack wait and network time
+    /// are on top, so the call can run that much longer than the wait.
     ///
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
     /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
@@ -927,6 +944,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<DeliveryMode, MessageBoxError> {
+        // Every rate-limit wait in this send, on the socket or over HTTP,
+        // ends by this one deadline.
+        let rate_deadline = self.http.rate_limit_deadline();
         // If no host override, resolve the recipient's host via overlay.
         // If the recipient is on a DIFFERENT host than ours, we must use HTTP
         // (send_message with overlay resolution) since our WebSocket is only
@@ -940,14 +960,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 // Recipient is on a different MessageBox server — use HTTP with overlay.
                 // This is a persisted delivery (no live WS ack possible cross-host).
                 let msg_id = self
-                    .send_message(
+                    .send_persisted(
+                        None,
                         recipient,
                         message_box,
                         body,
                         skip_encryption,
                         check_permissions,
                         message_id,
-                        None,
+                        rate_deadline,
                     )
                     .await?;
                 return Ok(DeliveryMode::Persisted { message_id: msg_id });
@@ -992,6 +1013,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     skip_encryption,
                     check_permissions,
                     message_id,
+                    rate_deadline,
                 )
                 .await?;
             return Ok(DeliveryMode::Persisted { message_id: msg_id });
@@ -1018,6 +1040,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     skip_encryption,
                     check_permissions,
                     message_id,
+                    rate_deadline,
                 )
                 .await?;
             return Ok(DeliveryMode::Persisted { message_id: msg_id });
@@ -1058,10 +1081,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // A live send spends the same relay budget as HTTP, and a refusal on
         // the socket fails every pending live send, so wait out a known hold.
         self.http
-            .wait_for_rate_limit(
-                override_host.unwrap_or_else(|| self.host()),
-                self.http.rate_limit_deadline(),
-            )
+            .wait_for_rate_limit(override_host.unwrap_or_else(|| self.host()), rate_deadline)
             .await?;
 
         // Emit — hold the lock only for the emit, not while awaiting the answer.
@@ -1085,6 +1105,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             skip_encryption,
             check_permissions,
             message_id,
+            rate_deadline,
         )
         .await
     }
@@ -1098,6 +1119,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// fresh id would arrive as a second logical message. The relay is not
     /// exactly-once: it collapses a resend only while the first row still
     /// exists (INSERT IGNORE), and an ack deletes that row.
+    ///
+    /// The HTTP send waits on the rate limit only until `rate_deadline`, the
+    /// live send's own deadline.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn finish_live_send(
         &self,
@@ -1109,6 +1133,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         skip_encryption: bool,
         check_permissions: bool,
         message_id: String,
+        rate_deadline: tokio::time::Instant,
     ) -> Result<DeliveryMode, MessageBoxError> {
         if let Err(reason) = outcome {
             tracing::debug!(%reason, %message_id, "live send not accepted; sending over HTTP");
@@ -1125,6 +1150,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     skip_encryption,
                     check_permissions,
                     Some(&message_id),
+                    rate_deadline,
                 )
                 .await?;
             return Ok(DeliveryMode::Persisted {
@@ -1135,7 +1161,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     }
 
     /// The HTTP send behind every live-send fallback: to `override_host` when
-    /// given, else to the recipient's overlay-resolved host.
+    /// given, else to the recipient's overlay-resolved host (as
+    /// [`send_message`](Self::send_message) does). Its rate-limit waits end by
+    /// `rate_deadline`.
     #[allow(clippy::too_many_arguments)]
     async fn send_persisted(
         &self,
@@ -1146,34 +1174,27 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         skip_encryption: bool,
         check_permissions: bool,
         message_id: Option<&str>,
+        rate_deadline: tokio::time::Instant,
     ) -> Result<String, MessageBoxError> {
-        match override_host {
-            Some(host) => {
-                self.send_message_to_host(
-                    host,
-                    recipient,
-                    message_box,
-                    body,
-                    skip_encryption,
-                    check_permissions,
-                    message_id,
-                    None,
-                )
-                .await
-            }
+        let host = match override_host {
+            Some(host) => host.to_string(),
             None => {
-                self.send_message(
-                    recipient,
-                    message_box,
-                    body,
-                    skip_encryption,
-                    check_permissions,
-                    message_id,
-                    None,
-                )
-                .await
+                self.assert_initialized().await?;
+                self.resolve_host_for_recipient(recipient).await?
             }
-        }
+        };
+        self.send_message_to_host_until(
+            &host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+            None,
+            rate_deadline,
+        )
+        .await
     }
 
     /// Leave a Socket.IO room and remove its subscription.
@@ -1457,7 +1478,9 @@ where
     };
     let body_bytes = serde_json::to_vec(&params)?;
     let url = format!("{host}/listMessages");
-    let response = http.fetch_budgeted(host, &url, body_bytes).await?;
+    let response = http
+        .fetch_budgeted(host, &url, body_bytes, http.rate_limit_deadline())
+        .await?;
 
     // Apply the same pre-deserialization page cap and single-pass success parser
     // as the public full/lite list paths.

@@ -354,8 +354,8 @@ impl RelayHttp {
     ///
     /// Waits out any rate-limit hold on `host` first. On a refusal, holds
     /// `host` for the relay's `retry_after`, waits, and sends the same bytes
-    /// again, so a resent message keeps its id. When the wait would end past
-    /// the rate-limit wait, returns [`MessageBoxError::RateLimited`] instead.
+    /// again, so a resent message keeps its id. When a wait would end past
+    /// `deadline`, returns [`MessageBoxError::RateLimited`] instead.
     /// The relay checks the budget before any side effect, so a refused
     /// request changed nothing.
     pub(crate) async fn fetch_budgeted(
@@ -363,8 +363,8 @@ impl RelayHttp {
         host: &str,
         url: &str,
         body: Vec<u8>,
+        deadline: tokio::time::Instant,
     ) -> Result<RelayResponse, MessageBoxError> {
-        let deadline = self.rate_limit_deadline();
         loop {
             self.wait_for_rate_limit(host, deadline).await?;
             match self.fetch_ok(url, "POST", Some(body.clone())).await {

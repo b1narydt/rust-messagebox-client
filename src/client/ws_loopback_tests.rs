@@ -2,7 +2,7 @@
 //! server (socketioxide behind axum) on a loopback port, as authsocket's
 //! end-to-end tests boot it. The server stands in for the relay: it runs the
 //! BRC-103 handshake and the joinRoom rule, records each `sendMessage` and
-//! acks it the way the relay does.
+//! acks it, or refuses it for the rate limit, the way the relay does.
 //!
 //! The pinned HTTP handshake runs against a stand-in for the relay's
 //! `/.well-known/auth` door: an SDK `Peer` behind axum.
@@ -85,9 +85,12 @@ fn client(url: &str) -> MessageBoxClient<ArcWallet> {
 }
 
 /// Records every `sendMessage` and acks it with `sendMessageAck-{roomId}`,
-/// as the relay does for an accepted live send.
+/// as the relay does for an accepted live send. With `refusal`, answers it
+/// with that `messageFailed` body instead, as the relay does over its rate
+/// limit.
 struct AckSends {
     sends: mpsc::UnboundedSender<Value>,
+    refusal: Option<Value>,
 }
 
 #[async_trait::async_trait]
@@ -108,7 +111,11 @@ impl AppDispatcher<ProtoWallet> for AckSends {
             .to_string();
         let ack = json!({ "status": "success", "messageId": event.data["message"]["messageId"] });
         let _ = self.sends.send(event.data);
-        emit_signed_to_socket(socket, server, &format!("sendMessageAck-{room}"), &ack).await;
+        let (event, answer) = match &self.refusal {
+            Some(refusal) => ("messageFailed".to_string(), refusal),
+            None => (format!("sendMessageAck-{room}"), &ack),
+        };
+        emit_signed_to_socket(socket, server, &event, answer).await;
     }
 }
 
@@ -121,6 +128,12 @@ struct Relay {
 impl Relay {
     /// Serve `core` on an ephemeral loopback port, proving `SERVER_KEY`.
     async fn boot(core: AuthSocketServer<ProtoWallet>) -> Self {
+        Self::boot_answering(core, None).await
+    }
+
+    /// [`boot`](Self::boot), answering every send with the `messageFailed`
+    /// body `refusal` when given.
+    async fn boot_answering(core: AuthSocketServer<ProtoWallet>, refusal: Option<Value>) -> Self {
         let core = Arc::new(core);
         let (layer, io) = SocketIo::new_layer();
         let (sends_tx, sends) = mpsc::unbounded_channel();
@@ -132,7 +145,10 @@ impl Relay {
                     PrivateKey::from_hex(SERVER_KEY).expect("server key"),
                 ))
             },
-            Arc::new(AckSends { sends: sends_tx }),
+            Arc::new(AckSends {
+                sends: sends_tx,
+                refusal,
+            }),
         );
         let app = axum::Router::new().layer(layer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -335,6 +351,49 @@ async fn ws_send_emits_nothing_while_the_relay_is_held() {
         relay.settled_send().await.is_none(),
         "a held send reached the relay"
     );
+    sender.disconnect_web_socket().await.expect("disconnect");
+}
+
+/// One live send waits on the rate limit until one deadline. The send first
+/// waits out a 1 s hold; the relay then refuses it for 1 s more, which ends
+/// past the send's 1.5 s deadline, so the HTTP fallback is not sent and the
+/// send is `RateLimited`. A fallback with a fresh deadline would wait and send.
+#[tokio::test]
+async fn a_live_send_and_its_fallback_share_one_rate_deadline() {
+    let mut relay = Relay::boot_answering(
+        AuthSocketServer::new(),
+        Some(json!({ "reason": "rate_limited", "retry_after": 1 })),
+    )
+    .await;
+    let http = ScriptedTransport::new();
+    let sender = client(&relay.url)
+        .with_rate_limit_wait(Duration::from_millis(1500))
+        .with_transport(http.clone());
+    let held = MessageBoxError::RateLimited {
+        retry_after: Duration::from_secs(1),
+        tier: None,
+    };
+    sender.http.hold_for_rate_limit(&relay.url, &held);
+
+    let result = within(sender.send_live_message(
+        &identity_of(OTHER_KEY).await,
+        "inbox",
+        "hello",
+        true,
+        false,
+        Some("id-deadline"),
+        Some(&relay.url),
+    ))
+    .await;
+    assert!(
+        matches!(result, Err(MessageBoxError::RateLimited { .. })),
+        "{result:?}"
+    );
+    assert!(
+        relay.settled_send().await.is_some(),
+        "the live send was emitted"
+    );
+    assert!(http.sent().is_empty(), "sent over HTTP: {:?}", http.sent());
     sender.disconnect_web_socket().await.expect("disconnect");
 }
 

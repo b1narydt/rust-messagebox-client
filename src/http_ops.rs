@@ -504,6 +504,36 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         payment: Option<MessagePayment>,
     ) -> Result<String, MessageBoxError> {
+        self.send_message_to_host_until(
+            host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+            payment,
+            self.rate_limit_deadline(),
+        )
+        .await
+    }
+
+    /// [`send_message_to_host`](Self::send_message_to_host), waiting on the
+    /// relay's rate limit only until `deadline`, so a live send's HTTP
+    /// fallback shares the live send's deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_message_to_host_until(
+        &self,
+        host: &str,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
+        payment: Option<MessagePayment>,
+        rate_deadline: tokio::time::Instant,
+    ) -> Result<String, MessageBoxError> {
         // Encrypt body (or use as-is when skipEncryption is true).
         let wire_body = if skip_encryption {
             body.to_string()
@@ -554,7 +584,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // a resend of an id whose row still exists is answered 200, and a
         // resend after the row was acked and deleted is stored again. A
         // rate-limited send is resent with these same bytes, so the same id.
-        let response = self.post_budgeted(host, &url, body_bytes).await?;
+        let response = self
+            .post_budgeted(host, &url, body_bytes, rate_deadline)
+            .await?;
 
         // 2xx but possibly a logical `{"status":"error",...}` payload.
         check_status_error(&response.body)?;
@@ -1165,7 +1197,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
-        let response = self.post_budgeted(host, &url, body_bytes).await?;
+        let response = self
+            .post_budgeted(host, &url, body_bytes, self.rate_limit_deadline())
+            .await?;
         // Strongest boundary available with AuthFetch: it has already buffered
         // `body: Vec<u8>`, but no JSON inspection or second body copy has occurred here.
         let list_response = parse_bounded_list_response(&response.body)?;
@@ -1300,7 +1334,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
-        let response = self.post_budgeted(host, &url, body_bytes).await?;
+        let response = self
+            .post_budgeted(host, &url, body_bytes, self.rate_limit_deadline())
+            .await?;
         // Keep the full and lite host paths on the same pre-deserialization bound.
         let list_response = parse_bounded_list_response(&response.body)?;
 
@@ -2627,6 +2663,7 @@ mod tests {
                     true,
                     false,
                     id.to_string(),
+                    client.rate_limit_deadline(),
                 )
                 .await
                 .expect("HTTP fallback");
@@ -2894,6 +2931,7 @@ mod tests {
                 true,
                 false,
                 "id-a".to_string(),
+                client.rate_limit_deadline(),
             )
             .await
             .expect("HTTP fallback");

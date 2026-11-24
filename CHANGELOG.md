@@ -35,7 +35,9 @@ behaviour" section describes the result.
   `src/http_ops.rs`). After a refusal the client holds every send and list to
   that relay for `retry_after` (at least 1 s) and resends the same bytes, so
   the same id, within `with_rate_limit_wait` (default 60 s); past it the call
-  returns `RateLimited`. A call can now take up to that long.
+  returns `RateLimited`. A call can now wait up to that long. A live send's
+  wait before its emit and its HTTP fallback share that one wait; its 10 s
+  ack wait and network time are on top.
 - **The poll backstop lists sparingly** (`src/client.rs`). It replaces the 2 s
   poll that stood down on WebSocket activity: one list on each WebSocket
   connect and reconnect, then every 15 s while connected

@@ -372,10 +372,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         self
     }
 
-    /// How this client dials its WebSocket at `override_host` or its own host.
+    /// How this client dials its WebSocket at `override_host` or its own host:
+    /// the host [`relay_host`](Self::relay_host) returns, so a pinned client
+    /// dials its own host as configured.
     async fn ws_dial(&self, override_host: Option<&str>) -> Result<WsDial<W>, MessageBoxError> {
         Ok(WsDial {
-            url: override_host.unwrap_or_else(|| self.host()).to_string(),
+            url: self.relay_host(override_host)?.to_string(),
             identity_key: self.get_identity_key().await?,
             expected_relay_key: self.expected_relay_key.clone(),
             certificate_provider: self.certificate_provider.clone(),

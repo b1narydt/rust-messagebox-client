@@ -287,7 +287,8 @@ async fn a_pinned_live_send_stops_at_a_relay_that_proves_another_key() {
 
 /// A pinned client with its socket open at its own relay connects to and
 /// sends to no other host: a call that names one is refused, and nothing
-/// goes out on the open socket or over HTTP.
+/// goes out on the open socket or over HTTP. Its own host spelled another
+/// way is its own host, dialed as configured.
 #[tokio::test]
 async fn a_pinned_client_uses_no_socket_for_another_host() {
     let mut relay = Relay::boot(AuthSocketServer::new()).await;
@@ -295,9 +296,17 @@ async fn a_pinned_client_uses_no_socket_for_another_host() {
     let sender = client(&relay.url)
         .with_expected_relay_key(identity_of(SERVER_KEY).await)
         .with_transport(http.clone());
-    within(sender.initialize_connection(None))
+    let spelled = format!("{}/", relay.url.to_ascii_uppercase());
+    within(sender.initialize_connection(Some(&spelled)))
         .await
         .expect("the pinned relay");
+    let dialed = sender
+        .ws_state
+        .lock()
+        .await
+        .as_ref()
+        .map(|ws| ws.url().to_string());
+    assert_eq!(dialed.as_deref(), Some(relay.url.as_str()));
 
     let other = "http://127.0.0.1:9";
     let connected = within(sender.initialize_connection(Some(other))).await;

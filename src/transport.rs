@@ -230,8 +230,9 @@ impl RateGate {
         self.holds.lock().unwrap_or_else(|p| p.into_inner())
     }
 
+    /// One key for every spelling of a host, as [`same_host`] compares them.
     fn key(host: &str) -> String {
-        host.trim().trim_end_matches('/').to_ascii_lowercase()
+        normalize_host(host)
     }
 
     /// Hold `host` for `retry_after` from now. A hold that ends later stays.
@@ -505,6 +506,27 @@ mod tests {
             .await
             .expect("within the deadline");
         assert!(started.elapsed() >= Duration::from_secs(30));
+    }
+
+    /// A hold on a host holds it under every spelling, and holds no other
+    /// port.
+    #[tokio::test(start_paused = true)]
+    async fn a_hold_covers_every_spelling_of_its_host() {
+        let gate = RateGate::default();
+        gate.hold("https://relay.example:443", Duration::from_secs(30), None);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        for spelling in ["https://Relay.Example/", "HTTPS://relay.example"] {
+            assert!(
+                matches!(
+                    gate.wait(spelling, deadline).await,
+                    Err(MessageBoxError::RateLimited { .. })
+                ),
+                "{spelling}"
+            );
+        }
+        gate.wait("https://relay.example:8443", deadline)
+            .await
+            .expect("another port is another relay");
     }
 
     /// A pinned check fails closed when the server proved no key at all.

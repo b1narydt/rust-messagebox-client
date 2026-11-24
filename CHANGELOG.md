@@ -7,6 +7,21 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.6.1] — 2026-11-23
+
+### Fixed
+
+- **A repeat of an acknowledged message is acknowledged, not left on the
+  relay** (`src/client.rs`, `src/http_ops.rs`). The relay deletes a row on
+  ack, so a resend of that id is a new row. The live listener's dedup dropped
+  it and never acked it, so it stayed in the mailbox. The client now records
+  the last 10,000 ids passed to `acknowledge_message`; a later copy of one is
+  acknowledged on the listener's host and not delivered. An id that was
+  delivered but not yet acknowledged is still dropped, so its row stays for
+  the consumer's own retry.
+
+---
+
 ## [0.6.0] — 2026-11-23
 
 Parity with what the Atlas relay does (rust-mpc#462). The README's "Relay

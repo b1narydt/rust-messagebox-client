@@ -1,6 +1,6 @@
 [package]
 name = "bsv-messagebox-client"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.87"
 description = "BSV MessageBox client — peer-to-peer messaging and payments with BRC-78 encryption, WebSocket live delivery, and overlay host resolution. Full parity with @bsv/message-box-client."
@@ -32,7 +32,15 @@ futures-util = "0.3"
 hex = "0.4"
 rand = "0.8"
 tracing = "0.1"
+# Compares relay host URLs for the relay pin (already in the graph via reqwest).
+url = "2.5"
 
 [dev-dependencies]
 wiremock = "0.6"
 tokio-test = "0.4"
+tokio = { version = "1", features = ["test-util", "net"] }
+# Loopback relay for the WebSocket tests: authsocket's own server (socketioxide
+# behind axum), at the versions authsocket's own tests use.
+authsocket = { version = "0.5.0", features = ["client", "server"] }
+axum = "0.8"
+socketioxide = "0.15"

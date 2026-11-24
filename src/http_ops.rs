@@ -10,8 +10,8 @@ use bsv::wallet::types::BooleanDefaultTrue;
 use futures_util::future::join_all;
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 
+use crate::client::check_status_error;
 use crate::client::MessageBoxClient;
-use crate::client::{check_status_error, is_duplicate_message_rejection};
 use crate::encryption;
 use crate::error::MessageBoxError;
 use crate::types::{
@@ -38,6 +38,28 @@ pub(crate) fn dedup_messages(results: Vec<Vec<PeerMessage>>) -> Vec<PeerMessage>
         }
     }
     out
+}
+
+/// The answers of one call made to several hosts, in host order. When every
+/// host failed, the first host's error instead, so the caller sees the relay's
+/// own refusal (`RateLimited`, `Relay { code, .. }`) rather than a summary.
+fn answers_or_first_error<T>(
+    outcomes: Vec<Result<T, MessageBoxError>>,
+) -> Result<Vec<T>, MessageBoxError> {
+    let mut answers = Vec::new();
+    let mut first_error = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(answer) => answers.push(answer),
+            Err(e) => {
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error {
+        Some(e) if answers.is_empty() => Err(e),
+        _ => Ok(answers),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -462,7 +484,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<String, MessageBoxError> {
-        self.assert_initialized().await?;
+        self.assert_initialized(override_host).await?;
         let host = match override_host {
             Some(h) => h.to_string(),
             None => self.resolve_host_for_recipient(recipient).await?,
@@ -504,6 +526,39 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         payment: Option<MessagePayment>,
     ) -> Result<String, MessageBoxError> {
+        self.send_message_to_host_until(
+            host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+            payment,
+            self.rate_limit_deadline(),
+        )
+        .await
+    }
+
+    /// [`send_message_to_host`](Self::send_message_to_host), waiting on the
+    /// relay's rate limit only until `deadline`, so a live send's HTTP
+    /// fallback shares the live send's deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn send_message_to_host_until(
+        &self,
+        host: &str,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
+        payment: Option<MessagePayment>,
+        rate_deadline: tokio::time::Instant,
+    ) -> Result<String, MessageBoxError> {
+        // A pinned client refuses another host before it encrypts, quotes or
+        // pays anything for it.
+        let host = self.relay_host(Some(host))?;
         // Encrypt body (or use as-is when skipEncryption is true).
         let wire_body = if skip_encryption {
             body.to_string()
@@ -550,33 +605,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let body_bytes = serde_json::to_vec(&request)?;
         let url = format!("{host}/sendMessage");
-        // Use the raw POST so we can inspect the body even on a non-2xx status.
-        // The relay rejects a duplicate `messageId` with HTTP 400 + a structured
-        // body; `post_json` would early-return `Err(Http(400))` and discard that
-        // body, hiding the duplicate signal from us.
-        let response = self.post_json_raw(&url, body_bytes).await?;
-
-        // IDEMPOTENT-DELIVERY SEMANTICS: a duplicate-message rejection means the
-        // relay ALREADY has this exact `messageId` stored — i.e. the message was
-        // already delivered. Because `generate_message_id` is a deterministic
-        // HMAC over (body, recipient, originator), two concurrent sends of the
-        // same logical message collide on the same id: one insert wins, the
-        // other gets `ERR_DUPLICATE_MESSAGE`. The logical send DID succeed, so we
-        // return Ok with the (already-known) message id instead of an error. This
-        // prevents spurious failures + retries under concurrent presign sends.
-        //
-        // We match the relay's PRECISE duplicate signal (`code ==
-        // "ERR_DUPLICATE_MESSAGE"`), never a blanket "swallow all 400s" — genuine
-        // auth / validation rejections continue to surface as errors below.
-        if is_duplicate_message_rejection(&response.body) {
-            return Ok(resolved_message_id);
-        }
-
-        // Non-2xx that ISN'T a duplicate → genuine HTTP failure. Preserve the
-        // status-code error `post_json` would have produced.
-        if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(response.status, url));
-        }
+        // The relay has no duplicate refusal: it stores with INSERT IGNORE, so
+        // a resend of an id whose row still exists is answered 200, and a
+        // resend after the row was acked and deleted is stored again. A
+        // rate-limited send is resent with these same bytes, so the same id.
+        let response = self
+            .post_budgeted(host, &url, body_bytes, rate_deadline)
+            .await?;
 
         // 2xx but possibly a logical `{"status":"error",...}` payload.
         check_status_error(&response.body)?;
@@ -812,7 +847,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         params: &SendListParams,
         override_host: Option<&str>,
     ) -> Result<SendListResult, MessageBoxError> {
-        self.assert_initialized().await?;
+        self.assert_initialized(override_host).await?;
 
         let skip_enc = params.skip_encryption.unwrap_or(false);
 
@@ -1179,15 +1214,15 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_box: &str,
         override_host: Option<&str>,
     ) -> Result<Vec<PaymentAwareServerPeerMessage>, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let host = override_host.unwrap_or_else(|| self.host());
+        let host = self.assert_initialized(override_host).await?;
         let params = ListMessagesParams {
             message_box: message_box.to_string(),
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
-        let response = self.post_json(&url, body_bytes).await?;
+        let response = self
+            .post_budgeted(host, &url, body_bytes, self.rate_limit_deadline())
+            .await?;
         // Strongest boundary available with AuthFetch: it has already buffered
         // `body: Vec<u8>`, but no JSON inspection or second body copy has occurred here.
         let list_response = parse_bounded_list_response(&response.body)?;
@@ -1217,7 +1252,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// Multi-host: queries all hosts advertised by this identity concurrently and
     /// deduplicates results by `message_id`. Matches TS `Promise.allSettled` semantics:
-    /// if at least one host succeeds, partial results are returned.
+    /// if at least one host succeeds, partial results are returned. If every host
+    /// fails, returns this client's own host's error.
     ///
     /// NOTE: This handles the server delivery-fee payment wrapper, NOT PeerPay
     /// PaymentTokens (peer-to-peer). PeerPay tokens are handled by `list_incoming_payments`.
@@ -1244,50 +1280,67 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         accept_payments: bool,
         override_host: Option<&str>,
     ) -> Result<Vec<PaymentAwarePeerMessage>, MessageBoxError> {
-        self.assert_initialized().await?;
+        let host = self.assert_initialized(override_host).await?;
 
-        if let Some(host) = override_host {
+        if override_host.is_some() {
             return self
                 .list_messages_detailed_from_host(host, message_box, accept_payments)
                 .await;
         }
 
+        let hosts = self.fan_out_hosts().await?;
+        if hosts.len() == 1 {
+            return self
+                .list_messages_detailed_from_host(self.host(), message_box, accept_payments)
+                .await;
+        }
+        self.list_messages_detailed_on_hosts(&hosts, message_box, accept_payments)
+            .await
+    }
+
+    /// Lists `message_box` on every host in `hosts` at once and keeps the
+    /// first copy of each message id. Fails only when every host fails, with
+    /// the first host's error.
+    async fn list_messages_detailed_on_hosts(
+        &self,
+        hosts: &[String],
+        message_box: &str,
+        accept_payments: bool,
+    ) -> Result<Vec<PaymentAwarePeerMessage>, MessageBoxError> {
+        let futures: Vec<_> = hosts
+            .iter()
+            .map(|host| self.list_messages_detailed_from_host(host, message_box, accept_payments))
+            .collect();
+        let listed = answers_or_first_error(join_all(futures).await)?;
+        let mut seen = HashSet::new();
+        Ok(listed
+            .into_iter()
+            .flatten()
+            .filter(|receipt| seen.insert(receipt.message.message_id.clone()))
+            .collect())
+    }
+
+    /// The hosts a list or acknowledgement without an `override_host` goes
+    /// to: this client's own host first, then each other host the overlay
+    /// advertises for this identity. A client pinned with
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key) uses its own
+    /// host alone and does not ask the overlay.
+    async fn fan_out_hosts(&self) -> Result<Vec<String>, MessageBoxError> {
+        let mut hosts = vec![self.host().to_string()];
+        if self.expected_relay_key().is_some() {
+            return Ok(hosts);
+        }
         let identity_key = self.get_identity_key().await?;
         let ads = self
             .query_advertisements(Some(&identity_key), None)
             .await
             .unwrap_or_default();
-        let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
-        host_set.insert(self.host().to_string());
-
-        if host_set.len() == 1 {
-            return self
-                .list_messages_detailed_from_host(self.host(), message_box, accept_payments)
-                .await;
+        for ad in ads {
+            if !hosts.contains(&ad.host) {
+                hosts.push(ad.host);
+            }
         }
-
-        let futures: Vec<_> = host_set
-            .iter()
-            .map(|host| self.list_messages_detailed_from_host(host, message_box, accept_payments))
-            .collect();
-        let successful: Vec<Vec<PaymentAwarePeerMessage>> = join_all(futures)
-            .await
-            .into_iter()
-            .filter_map(Result::ok)
-            .collect();
-        if successful.is_empty() {
-            return Err(MessageBoxError::Http(
-                0,
-                format!("list_messages: all {} hosts failed", host_set.len()),
-            ));
-        }
-
-        let mut seen = HashSet::new();
-        Ok(successful
-            .into_iter()
-            .flatten()
-            .filter(|receipt| seen.insert(receipt.message.message_id.clone()))
-            .collect())
+        Ok(hosts)
     }
 
     /// Retrieve detailed messages from a single explicit host.
@@ -1306,7 +1359,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/listMessages");
-        let response = self.post_json(&url, body_bytes).await?;
+        let response = self
+            .post_budgeted(host, &url, body_bytes, self.rate_limit_deadline())
+            .await?;
         // Keep the full and lite host paths on the same pre-deserialization bound.
         let list_response = parse_bounded_list_response(&response.body)?;
 
@@ -1379,52 +1434,43 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Mark messages as acknowledged (read) by their IDs.
     ///
     /// TS PARITY: When `override_host` is None, fans out to ALL advertised hosts in parallel
-    /// (same `join_all` pattern as `list_messages`). Returns Ok if ANY host succeeds.
+    /// (same `join_all` pattern as `list_messages`). Returns Ok if ANY host succeeds;
+    /// if every host fails, returns this client's own host's error.
     /// When `override_host` is Some, acks on that single host only.
     pub async fn acknowledge_message(
         &self,
         message_ids: Vec<String>,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        self.assert_initialized().await?;
+        let host = self.assert_initialized(override_host).await?;
 
-        if let Some(host) = override_host {
+        if override_host.is_some() {
             return self.acknowledge_message_on_host(host, &message_ids).await;
         }
 
         // Multi-host fan-out: ack on all known hosts concurrently.
-        let identity_key = self.get_identity_key().await?;
-        let ads = self
-            .query_advertisements(Some(&identity_key), None)
-            .await
-            .unwrap_or_default();
-
-        let mut host_set: HashSet<String> = ads.into_iter().map(|ad| ad.host).collect();
-        host_set.insert(self.host().to_string());
-
-        if host_set.len() == 1 {
+        let hosts = self.fan_out_hosts().await?;
+        if hosts.len() == 1 {
             return self
                 .acknowledge_message_on_host(self.host(), &message_ids)
                 .await;
         }
+        self.acknowledge_message_on_hosts(&hosts, &message_ids)
+            .await
+    }
 
-        // Fan out in parallel — return Ok if at least one succeeds.
-        let futures: Vec<_> = host_set
+    /// Acknowledges `message_ids` on every host in `hosts` at once. Fails
+    /// only when every host fails, with the first host's error.
+    async fn acknowledge_message_on_hosts(
+        &self,
+        hosts: &[String],
+        message_ids: &[String],
+    ) -> Result<(), MessageBoxError> {
+        let futures: Vec<_> = hosts
             .iter()
-            .map(|h| self.acknowledge_message_on_host(h, &message_ids))
+            .map(|host| self.acknowledge_message_on_host(host, message_ids))
             .collect();
-
-        let outcomes = join_all(futures).await;
-        let any_ok = outcomes.iter().any(|r| r.is_ok());
-
-        if any_ok {
-            Ok(())
-        } else {
-            Err(MessageBoxError::Http(
-                0,
-                format!("acknowledge_message: all {} hosts failed", host_set.len()),
-            ))
-        }
+        answers_or_first_error(join_all(futures).await).map(|_| ())
     }
 
     /// Acknowledge messages on a single explicit host.
@@ -1433,14 +1479,42 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         host: &str,
         message_ids: &[String],
     ) -> Result<(), MessageBoxError> {
+        const PERSISTENCE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+        const INITIAL_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+        const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
         let params = AcknowledgeMessageParams {
             message_ids: message_ids.to_vec(),
         };
         let body_bytes = serde_json::to_vec(&params)?;
         let url = format!("{host}/acknowledgeMessage");
-        let response = self.post_json(&url, body_bytes).await?;
-        check_status_error(&response.body)?;
-        Ok(())
+        let deadline = tokio::time::Instant::now() + PERSISTENCE_GRACE;
+        let mut delay = INITIAL_RETRY_DELAY;
+
+        loop {
+            // Atlas uses push-live-first + persist-async. Inspect the structured
+            // 400 response so only the exact "row is not visible yet" outcome is
+            // retried. Other validation, auth, and server failures remain fatal.
+            let response = self.post_json_raw(&url, body_bytes.clone()).await?;
+            if response.is_success() {
+                check_status_error(&response.body)?;
+                return Ok(());
+            }
+            let error = response.error(&url);
+            if !matches!(
+                &error,
+                MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"
+            ) {
+                return Err(error);
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(error);
+            }
+            tokio::time::sleep(delay.min(deadline.saturating_duration_since(now))).await;
+            delay = (delay * 2).min(MAX_RETRY_DELAY);
+        }
     }
 }
 
@@ -1931,7 +2005,7 @@ mod tests {
         originator: Option<&str>,
     ) -> crate::MessageBoxClient<ArcWallet> {
         crate::MessageBoxClient::new(
-            "https://unused.example".to_string(),
+            HOST.to_string(),
             wallet,
             originator.map(str::to_owned),
             bsv::services::overlay_tools::Network::Mainnet,
@@ -2508,5 +2582,623 @@ mod tests {
             .expect("second call");
 
         assert_eq!(id1, id2, "same inputs must produce the same HMAC");
+    }
+
+    // -----------------------------------------------------------------------
+    // Relay answers, driven through a scripted transport
+    // -----------------------------------------------------------------------
+
+    use crate::transport::scripted::ScriptedTransport;
+    use serde_json::json;
+
+    const HOST: &str = "https://relay.example";
+
+    fn scripted_client(relay: &Arc<ScriptedTransport>) -> crate::MessageBoxClient<ArcWallet> {
+        payment_client(ArcWallet::new(), None).with_transport(relay.clone())
+    }
+
+    fn ack_not_found() -> serde_json::Value {
+        json!({"status":"error","code":"ERR_INVALID_ACKNOWLEDGMENT","description":"Message not found!"})
+    }
+
+    /// The relay persists after it pushes, so an ack can beat the row. The
+    /// client retries that one answer and succeeds once the row is visible.
+    #[tokio::test]
+    async fn ack_is_retried_while_the_row_is_not_yet_visible() {
+        let relay = ScriptedTransport::new();
+        relay.push(400, &[], ack_not_found());
+        relay.push(200, &[], json!({"status":"success"}));
+        let client = scripted_client(&relay);
+
+        client
+            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .await
+            .expect("the second ack lands");
+        let sent = relay.sent();
+        assert_eq!(sent.len(), 2);
+        for request in sent {
+            assert_eq!(request.url, format!("{HOST}/acknowledgeMessage"));
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.body, Some(json!({"messageIds": ["m1"]})));
+        }
+    }
+
+    /// Past the grace the relay's own refusal reaches the caller, code intact.
+    #[tokio::test(start_paused = true)]
+    async fn ack_grace_ends_with_the_relay_code() {
+        let relay = ScriptedTransport::new();
+        for _ in 0..100 {
+            relay.push(400, &[], ack_not_found());
+        }
+        let client = scripted_client(&relay);
+        let started = tokio::time::Instant::now();
+
+        let err = client
+            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .await
+            .expect_err("the row never appears");
+        assert!(
+            matches!(&err, MessageBoxError::Relay { status: 400, code, .. } if code == "ERR_INVALID_ACKNOWLEDGMENT"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("ERR_INVALID_ACKNOWLEDGMENT"));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+        assert!(relay.sent().len() < 100, "the grace is bounded");
+    }
+
+    const RECIPIENT: &str = "02abababababababababababababababababababababababababababababababab";
+
+    /// A refusal on the socket fails every pending live send; each then goes
+    /// over HTTP with the id it already emitted, so a receiver that got the
+    /// live push dedups the second copy.
+    #[tokio::test]
+    async fn refused_live_sends_fall_back_with_their_own_ids() {
+        use crate::websocket::{lock_waiters, LiveSendAck, PendingAcks};
+
+        let waiters = PendingAcks::default();
+        let pending = [
+            ("id-a", LiveSendAck::register(&waiters, "id-a")),
+            ("id-b", LiveSendAck::register(&waiters, "id-b")),
+        ];
+        lock_waiters(&waiters).route(
+            "messageFailed",
+            &json!({"reason": "Could not verify delivery permission"}),
+        );
+
+        let relay = ScriptedTransport::new();
+        for id in ["id-a", "id-b"] {
+            relay.push(
+                200,
+                &[],
+                json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":id}]}),
+            );
+        }
+        let client = scripted_client(&relay);
+        for (id, ack) in pending {
+            let outcome = ack.wait(std::time::Duration::from_secs(1)).await;
+            assert!(outcome.is_err(), "the refusal reached {id}");
+            let mode = client
+                .finish_live_send(
+                    outcome,
+                    HOST,
+                    Some(HOST),
+                    RECIPIENT,
+                    "inbox",
+                    "hello",
+                    true,
+                    false,
+                    id.to_string(),
+                    client.rate_limit_deadline(),
+                )
+                .await
+                .expect("HTTP fallback");
+            assert!(!mode.is_live());
+            assert_eq!(mode.message_id(), id);
+        }
+        let ids: Vec<_> = relay
+            .sent()
+            .into_iter()
+            .map(|r| r.body.unwrap()["message"]["messageId"].clone())
+            .collect();
+        assert_eq!(ids, [json!("id-a"), json!("id-b")]);
+    }
+
+    /// A pinned client refuses an answer proven by any other key before it
+    /// reads the body; the pin ignores case and whitespace. Unpinned, the
+    /// client takes whoever answers.
+    #[tokio::test]
+    async fn a_pinned_client_refuses_other_relays() {
+        use crate::transport::scripted::RELAY_KEY;
+        const IMPOSTOR: &str = "02eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let accepted = |id: &str| json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":id}]});
+
+        let relay = ScriptedTransport::new();
+        relay.push_from(IMPOSTOR, 200, &[], accepted("forged"));
+        relay.push(200, &[], accepted("id-1"));
+        let pinned = payment_client(ArcWallet::new(), None)
+            .with_expected_relay_key(format!(" {} ", RELAY_KEY.to_ascii_uppercase()))
+            .with_transport(relay.clone());
+        let err = pinned
+            .send_message_to_host(
+                HOST,
+                RECIPIENT,
+                "inbox",
+                "hi",
+                true,
+                false,
+                Some("id-1"),
+                None,
+            )
+            .await
+            .expect_err("an impostor's answer is refused");
+        assert!(
+            matches!(&err, MessageBoxError::RelayIdentityMismatch { observed: Some(k), .. } if k == IMPOSTOR),
+            "{err:?}"
+        );
+        let id = pinned
+            .send_message_to_host(
+                HOST,
+                RECIPIENT,
+                "inbox",
+                "hi",
+                true,
+                false,
+                Some("id-1"),
+                None,
+            )
+            .await
+            .expect("the pinned relay's answer is used");
+        assert_eq!(id, "id-1");
+
+        let relay = ScriptedTransport::new();
+        relay.push_from(IMPOSTOR, 200, &[], accepted("id-2"));
+        let unpinned = scripted_client(&relay);
+        let id = unpinned
+            .send_message_to_host(
+                HOST,
+                RECIPIENT,
+                "inbox",
+                "hi",
+                true,
+                false,
+                Some("id-2"),
+                None,
+            )
+            .await
+            .expect("an unpinned client trusts whoever answers");
+        assert_eq!(id, "id-2");
+    }
+
+    /// A pinned client sends nothing to another host: a call that names one,
+    /// even a host that only begins with the pinned one, is refused before
+    /// any request. Its own host spelled another way is its own host.
+    #[tokio::test]
+    async fn a_pinned_client_sends_nothing_to_another_host() {
+        use crate::transport::scripted::RELAY_KEY;
+        let relay = ScriptedTransport::new();
+        relay.push(200, &[], json!({"status":"success","messages":[]}));
+        let pinned = payment_client(ArcWallet::new(), None)
+            .with_expected_relay_key(RELAY_KEY)
+            .with_transport(relay.clone());
+        pinned.init_once.set(()).expect("skip the advertisement");
+
+        for other in [
+            "https://other.example",
+            "https://relay.example.evil",
+            "http://relay.example",
+            "https://relay.example:8443",
+        ] {
+            let err = pinned
+                .list_messages("inbox", false, Some(other))
+                .await
+                .expect_err("another host");
+            assert!(
+                matches!(&err, MessageBoxError::RelayHostRefused { requested, .. } if requested.starts_with(other)),
+                "{other}: {err:?}"
+            );
+        }
+        assert!(relay.sent().is_empty(), "{:?}", relay.sent());
+
+        pinned
+            .list_messages("inbox", false, Some("HTTPS://Relay.Example:443"))
+            .await
+            .expect("the pinned host");
+        assert_eq!(relay.sent().len(), 1);
+    }
+
+    /// An overlay tracker on a loopback port that counts the connections it
+    /// is sent and answers none. The URL is `https` because the resolver
+    /// refuses plain HTTP; the connection is counted before any TLS.
+    async fn counting_tracker() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("https://{}", listener.local_addr().expect("addr"));
+        let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = lookups.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+        (url, lookups)
+    }
+
+    /// A pinned client never asks the overlay for a host: its send, list and
+    /// ack go to its own host alone. An unpinned client on the same tracker
+    /// does ask it.
+    #[tokio::test]
+    async fn a_pinned_client_never_asks_the_overlay_for_a_host() {
+        use crate::transport::scripted::RELAY_KEY;
+        use std::sync::atomic::Ordering::SeqCst;
+        let (tracker, lookups) = counting_tracker().await;
+        let network = bsv::services::overlay_tools::Network::Custom(vec![tracker]);
+        let relay = ScriptedTransport::new();
+        relay.push(
+            200,
+            &[],
+            json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":"id-1"}]}),
+        );
+        relay.push(200, &[], json!({"status":"success","messages":[]}));
+        relay.push(200, &[], json!({"status":"success"}));
+        let pinned =
+            crate::MessageBoxClient::new(HOST.to_string(), ArcWallet::new(), None, network.clone())
+                .with_expected_relay_key(RELAY_KEY)
+                .with_transport(relay.clone());
+        pinned.init_once.set(()).expect("skip the advertisement");
+
+        pinned
+            .send_message(RECIPIENT, "inbox", "hi", true, false, Some("id-1"), None)
+            .await
+            .expect("send");
+        pinned
+            .list_messages("inbox", false, None)
+            .await
+            .expect("list");
+        pinned
+            .acknowledge_message(vec!["id-1".to_string()], None)
+            .await
+            .expect("ack");
+        assert_eq!(
+            lookups.load(SeqCst),
+            0,
+            "the pinned client asked the overlay"
+        );
+        let urls: Vec<String> = relay.sent().into_iter().map(|r| r.url).collect();
+        assert_eq!(
+            urls,
+            [
+                format!("{HOST}/sendMessage"),
+                format!("{HOST}/listMessages"),
+                format!("{HOST}/acknowledgeMessage"),
+            ]
+        );
+
+        let unpinned =
+            crate::MessageBoxClient::new(HOST.to_string(), ArcWallet::new(), None, network);
+        unpinned
+            .resolve_host_for_recipient(RECIPIENT)
+            .await
+            .expect("its own host when the overlay has none");
+        assert!(lookups.load(SeqCst) > 0, "the tracker saw no lookup");
+    }
+
+    /// A pinned client refuses a call naming another host before any work
+    /// for it: no overlay lookup, no advertisement, no request, and the
+    /// one-time init still unrun.
+    #[tokio::test]
+    async fn a_pinned_client_refuses_another_host_before_it_initializes() {
+        use crate::transport::scripted::RELAY_KEY;
+        use crate::types::{SendListParams, SetPermissionParams};
+        use std::sync::atomic::Ordering::SeqCst;
+        const OTHER: Option<&str> = Some("https://other.example");
+        let (tracker, lookups) = counting_tracker().await;
+        let network = bsv::services::overlay_tools::Network::Custom(vec![tracker]);
+        let relay = ScriptedTransport::new();
+        let pinned =
+            crate::MessageBoxClient::new(HOST.to_string(), ArcWallet::new(), None, network)
+                .with_expected_relay_key(RELAY_KEY)
+                .with_transport(relay.clone());
+        let list = SendListParams {
+            recipients: vec![RECIPIENT.to_string()],
+            message_box: "inbox".to_string(),
+            body: "hi".to_string(),
+            skip_encryption: None,
+        };
+        let permission = SetPermissionParams {
+            message_box: "inbox".to_string(),
+            sender: None,
+            recipient_fee: 0,
+        };
+
+        let calls: Vec<(&str, Result<(), MessageBoxError>)> = vec![
+            (
+                "send_message",
+                pinned
+                    .send_message(RECIPIENT, "inbox", "hi", false, true, None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "send_notification",
+                pinned
+                    .send_notification(RECIPIENT, "hi", OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "send_message_to_recipients",
+                pinned
+                    .send_message_to_recipients(&list, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "get_message_box_quote_multi",
+                pinned
+                    .get_message_box_quote_multi(&[RECIPIENT], "inbox", OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "get_message_box_quote",
+                pinned
+                    .get_message_box_quote(RECIPIENT, "inbox", OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "list_messages_lite",
+                pinned.list_messages_lite("inbox", OTHER).await.map(drop),
+            ),
+            (
+                "list_messages",
+                pinned.list_messages("inbox", false, OTHER).await.map(drop),
+            ),
+            (
+                "acknowledge_message",
+                pinned
+                    .acknowledge_message(vec!["id-1".to_string()], OTHER)
+                    .await,
+            ),
+            (
+                "register_device",
+                pinned
+                    .register_device("token", None, None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "list_registered_devices",
+                pinned.list_registered_devices(OTHER).await.map(drop),
+            ),
+            (
+                "set_message_box_permission",
+                pinned.set_message_box_permission(permission, OTHER).await,
+            ),
+            (
+                "get_message_box_permission",
+                pinned
+                    .get_message_box_permission(RECIPIENT, "inbox", None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            (
+                "list_message_box_permissions",
+                pinned
+                    .list_message_box_permissions(None, None, None, OTHER)
+                    .await
+                    .map(drop),
+            ),
+            ("leave_room", pinned.leave_room("inbox", OTHER).await),
+        ];
+        for (call, result) in calls {
+            assert!(
+                matches!(result, Err(MessageBoxError::RelayHostRefused { .. })),
+                "{call}: {result:?}"
+            );
+        }
+        assert_eq!(lookups.load(SeqCst), 0, "a refused call asked the overlay");
+        assert!(relay.sent().is_empty(), "{:?}", relay.sent());
+        assert!(
+            pinned.init_once.get().is_none(),
+            "a refused call ran the init"
+        );
+    }
+
+    fn rate_limited(retry_after: u64) -> serde_json::Value {
+        json!({"status":"error","reason":"rate_limited","description":"verified identity rate limit exceeded","tier":"uncertified","retry_after":retry_after})
+    }
+
+    fn accepted(id: &str) -> serde_json::Value {
+        json!({"status":"success","message":"sent","results":[{"recipient":RECIPIENT,"messageId":id}]})
+    }
+
+    fn sent_ids(relay: &ScriptedTransport) -> Vec<serde_json::Value> {
+        relay
+            .sent()
+            .into_iter()
+            .map(|r| r.body.unwrap()["message"]["messageId"].clone())
+            .collect()
+    }
+
+    /// A rate-limited send waits the relay's `retry_after` and is resent with
+    /// the same id. A wait longer than the client's limit is `RateLimited`,
+    /// and the relay stays held: the next send waits without a request.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_send_waits_and_keeps_its_id() {
+        let s = std::time::Duration::from_secs;
+        let relay = ScriptedTransport::new();
+        relay.push(429, &[("x-bsv-retry-after", "3")], rate_limited(3));
+        relay.push(200, &[], accepted("id-1"));
+        let client = scripted_client(&relay).with_rate_limit_wait(s(10));
+        let send = |id: &'static str| {
+            client.send_message_to_host(HOST, RECIPIENT, "inbox", "hi", true, false, Some(id), None)
+        };
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(send("id-1").await.expect("resent"), "id-1");
+        assert!(started.elapsed() >= s(3));
+        assert_eq!(sent_ids(&relay), [json!("id-1"), json!("id-1")]);
+
+        relay.push(429, &[], rate_limited(30));
+        let err = send("id-2").await.expect_err("past the wait");
+        assert!(
+            matches!(err, MessageBoxError::RateLimited { retry_after, .. } if retry_after == s(30)),
+            "{err:?}"
+        );
+        let err = send("id-3").await.expect_err("still held");
+        assert!(
+            matches!(err, MessageBoxError::RateLimited { .. }),
+            "{err:?}"
+        );
+        assert_eq!(relay.sent().len(), 3, "a held relay gets no request");
+    }
+
+    /// A live send the relay refused for its rate limit holds the relay, so
+    /// its HTTP fallback waits out `retry_after` instead of being refused too.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_live_send_waits_before_its_http_fallback() {
+        let relay = ScriptedTransport::new();
+        relay.push(200, &[], accepted("id-a"));
+        let client = scripted_client(&relay);
+        let refused = MessageBoxError::RateLimited {
+            retry_after: std::time::Duration::from_secs(4),
+            tier: None,
+        };
+
+        let started = tokio::time::Instant::now();
+        let mode = client
+            .finish_live_send(
+                Err(refused),
+                HOST,
+                Some(HOST),
+                RECIPIENT,
+                "inbox",
+                "hello",
+                true,
+                false,
+                "id-a".to_string(),
+                client.rate_limit_deadline(),
+            )
+            .await
+            .expect("HTTP fallback");
+        assert_eq!(mode.message_id(), "id-a");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+        assert_eq!(sent_ids(&relay), [json!("id-a")]);
+    }
+
+    /// Only the not-yet-visible answer is retried; any other refusal is final.
+    #[tokio::test(start_paused = true)]
+    async fn ack_does_not_retry_other_refusals() {
+        let relay = ScriptedTransport::new();
+        relay.push(
+            400,
+            &[],
+            json!({"status":"error","code":"ERR_INVALID_MESSAGE_ID","description":"bad id"}),
+        );
+        let client = scripted_client(&relay);
+
+        let err = client
+            .acknowledge_message_on_host(HOST, &["m1".to_string()])
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&err, MessageBoxError::Relay { code, .. } if code == "ERR_INVALID_MESSAGE_ID"),
+            "{err:?}"
+        );
+        assert_eq!(relay.sent().len(), 1);
+    }
+
+    /// When every host fails a fanned-out list or ack, the call returns the
+    /// first host's own refusal, not a summary of the failures.
+    #[tokio::test]
+    async fn a_call_every_host_refuses_returns_the_first_hosts_refusal() {
+        let hosts = [HOST.to_string(), "https://other.example".to_string()];
+        let codes = ["ERR_ONE", "ERR_TWO"];
+        let relay = ScriptedTransport::new();
+        let client = scripted_client(&relay);
+        let refuse_both = || {
+            for code in codes {
+                relay.push(
+                    400,
+                    &[],
+                    json!({"status":"error","code":code,"description":"refused"}),
+                );
+            }
+        };
+        // Answers go out in request order: HOST's is the one its request took.
+        let hosts_code = |from: usize| {
+            let at = relay.sent()[from..]
+                .iter()
+                .position(|r| r.url.starts_with(HOST))
+                .expect("HOST was asked");
+            codes[at]
+        };
+        let code_of = |err: MessageBoxError| match err {
+            MessageBoxError::Relay { code, .. } => code,
+            other => panic!("{other:?}"),
+        };
+
+        refuse_both();
+        let err = client
+            .list_messages_detailed_on_hosts(&hosts, "inbox", false)
+            .await
+            .expect_err("every host refused the list");
+        assert_eq!(code_of(err), hosts_code(0));
+
+        refuse_both();
+        let err = client
+            .acknowledge_message_on_hosts(&hosts, &["m1".to_string()])
+            .await
+            .expect_err("every host refused the ack");
+        assert_eq!(code_of(err), hosts_code(2));
+    }
+
+    /// The relay refuses a sender the recipient has not whitelisted with
+    /// `ERR_DELIVERY_BLOCKED`; a payment request says why instead. Any other
+    /// refusal keeps the relay's own code.
+    #[tokio::test]
+    async fn a_blocked_payment_request_names_the_whitelist() {
+        let recipient = ArcWallet::new()
+            .get_public_key(
+                GetPublicKeyArgs {
+                    identity_key: true,
+                    protocol_id: None,
+                    key_id: None,
+                    counterparty: None,
+                    privileged: false,
+                    privileged_reason: None,
+                    for_self: None,
+                    seek_permission: None,
+                },
+                None,
+            )
+            .await
+            .expect("get_public_key")
+            .public_key
+            .to_der_hex();
+        let relay = ScriptedTransport::new();
+        relay.push(
+            403,
+            &[],
+            json!({"status":"error","code":"ERR_DELIVERY_BLOCKED","description":"Blocked recipients: x"}),
+        );
+
+        relay.push(403, &[], json!({"error":"not_certified"}));
+        let client = scripted_client(&relay);
+        let request = || client.request_payment_to_host(&recipient, 1000, "rent", u64::MAX, HOST);
+
+        let err = request().await.expect_err("blocked");
+        assert!(
+            matches!(&err, MessageBoxError::Validation(why) if why.contains("whitelist")),
+            "{err:?}"
+        );
+        let err = request().await.expect_err("not certified");
+        assert!(
+            matches!(&err, MessageBoxError::Relay { code, .. } if code == "not_certified"),
+            "{err:?}"
+        );
     }
 }

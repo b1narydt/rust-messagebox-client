@@ -9,42 +9,181 @@
 //! - `sendMessage-{roomId}` room deliveries: decode [`ServerPeerMessage`],
 //!   decrypt (BRC-78) with authenticated-decrypt provenance, and dispatch to
 //!   the room subscription callback.
-//! - `sendMessageAck-{roomId}` FIFO ack correlation: the server's ack is
-//!   *room*-scoped (no messageId), so N concurrent sends to one room resolve
-//!   oldest-first against a per-key `VecDeque` of waiters.
-//! - the public [`MessageBoxWebSocket`] API surface, unchanged for `client.rs`
-//!   and `delivery.rs`.
+//! - live-send answers: the relay acks an accepted send with
+//!   `sendMessageAck-{roomId}` `{status, messageId}` and refuses one with
+//!   `messageFailed {reason}`, which names no message. Waiters are keyed by
+//!   message id; a refusal fails every waiter on the socket (see
+//!   `AckWaiters`).
+//! - the public [`MessageBoxWebSocket`] API surface.
 //!
 //! Inbound routing preserves the old dispatcher's strict FIFO semantics: the
 //! authsocket fallback handler forwards `(event_name, data)` onto an internal
 //! channel consumed by one dispatcher task, so per-room message/ack ordering
 //! is exactly as the server emitted it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use authsocket::client::AuthSocketClient;
+/// Answers a relay's certificate request during the WebSocket handshake:
+/// given the relay's identity key and the requested set, return the
+/// certificates to show. An error or an empty batch fails the connection
+/// (authsocket refuses both).
+pub use authsocket::client::CertificateProvider;
 use bsv::wallet::interfaces::WalletInterface;
 
 use crate::encryption;
 use crate::error::MessageBoxError;
-use crate::types::{AuthenticatedPeerMessage, ServerPeerMessage};
+use crate::types::{AuthenticatedPeerMessage, ServerPeerMessage, WsSendMessageData};
 
 /// Subscriber callback: event key → message handler.
 type SubscriptionMap =
     Arc<Mutex<HashMap<String, Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>>>>;
 
-/// Pending ack queue keyed by `sendMessageAck-{roomId}`.
+/// The relay's answer to one live send: accepted, or refused and why.
+type AckOutcome = Result<(), MessageBoxError>;
+
+/// Live sends on one socket that the relay has not answered yet, oldest first.
 ///
-/// The server's `sendMessageAck-{roomId}` carries only a `status` — it is
-/// *room*-scoped, not *message*-scoped (no `messageId` to correlate on). So when
-/// N concurrent sends target the same room, they must be matched to acks in FIFO
-/// order: the server processes a room's sends serially and acks each in turn, so
-/// the i-th ack belongs to the i-th still-pending send. A `VecDeque` per key
-/// preserves that ordering.
-type PendingAcks = Arc<Mutex<HashMap<String, VecDeque<oneshot::Sender<bool>>>>>;
+/// - `sendMessageAck-{roomId}` `{status: "success", messageId}` resolves the
+///   waiter for that message id only. An ack naming no waiting id is logged
+///   and ignored.
+/// - `messageFailed {reason}` carries no message id and no room, so the
+///   refusal cannot be pinned on one send: it fails every waiter. A
+///   `reason: "rate_limited"` refusal becomes [`MessageBoxError::RateLimited`].
+///   Each failed send then takes the HTTP fallback with its own id, which
+///   gets a per-request answer.
+/// - A waiter leaves only by its own token (answered, or its
+///   [`LiveSendAck`] dropped), so a send that gives up never removes another.
+#[derive(Default)]
+pub(crate) struct AckWaiters {
+    next_token: u64,
+    waiting: BTreeMap<u64, (String, oneshot::Sender<AckOutcome>)>,
+}
+
+pub(crate) type PendingAcks = Arc<std::sync::Mutex<AckWaiters>>;
+
+impl AckWaiters {
+    fn register(&mut self, message_id: &str) -> (u64, oneshot::Receiver<AckOutcome>) {
+        let token = self.next_token;
+        self.next_token += 1;
+        let (tx, rx) = oneshot::channel();
+        // The relay trims the id before it acks.
+        self.waiting
+            .insert(token, (message_id.trim().to_string(), tx));
+        (token, rx)
+    }
+
+    fn remove(&mut self, token: u64) {
+        self.waiting.remove(&token);
+    }
+
+    fn fail_all(&mut self, error: impl Fn() -> MessageBoxError) {
+        for (_, (_, tx)) in std::mem::take(&mut self.waiting) {
+            let _ = tx.send(Err(error()));
+        }
+    }
+
+    /// Apply one verified relay event. Events other than acks and refusals
+    /// are left alone.
+    pub(crate) fn route(&mut self, event_name: &str, data: &serde_json::Value) {
+        if event_name == "messageFailed" {
+            let body = data.as_object();
+            let reason = body
+                .and_then(|b| b.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unspecified")
+                .to_string();
+            tracing::warn!(
+                %reason,
+                pending = self.waiting.len(),
+                "relay refused a live send; failing every pending send on this socket"
+            );
+            if reason == "rate_limited" {
+                self.fail_all(|| crate::transport::rate_limited(body, None));
+            } else {
+                self.fail_all(|| {
+                    MessageBoxError::WebSocket(format!("relay refused the live send: {reason}"))
+                });
+            }
+        } else if event_name.starts_with("sendMessageAck-") {
+            let Some(message_id) = data.get("messageId").and_then(|v| v.as_str()) else {
+                tracing::warn!(event = %event_name, "relay ack names no message id; ignored");
+                return;
+            };
+            let message_id = message_id.trim();
+            let Some(token) = self
+                .waiting
+                .iter()
+                .find(|(_, (id, _))| id == message_id)
+                .map(|(token, _)| *token)
+            else {
+                tracing::warn!(%message_id, "relay ack for no pending send; ignored");
+                return;
+            };
+            let (_, tx) = self.waiting.remove(&token).expect("token was just found");
+            let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let _ = tx.send(if status == "success" {
+                Ok(())
+            } else {
+                Err(MessageBoxError::WebSocket(format!(
+                    "relay acked {message_id} with status {status:?}"
+                )))
+            });
+        }
+    }
+}
+
+pub(crate) fn lock_waiters(waiters: &PendingAcks) -> std::sync::MutexGuard<'_, AckWaiters> {
+    waiters
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The relay's answer to one live send, still to come.
+///
+/// Dropping it withdraws this send's waiter and no other, so a send that
+/// times out or is cancelled never leaves an entry behind and never takes
+/// another send's answer.
+pub struct LiveSendAck {
+    token: u64,
+    rx: oneshot::Receiver<AckOutcome>,
+    waiters: PendingAcks,
+}
+
+impl LiveSendAck {
+    pub(crate) fn register(waiters: &PendingAcks, message_id: &str) -> Self {
+        let (token, rx) = lock_waiters(waiters).register(message_id);
+        Self {
+            token,
+            rx,
+            waiters: waiters.clone(),
+        }
+    }
+
+    /// Wait up to `timeout` for the relay to accept (`Ok`) or refuse (`Err`)
+    /// this send. No answer in time is an error too.
+    pub async fn wait(mut self, timeout: Duration) -> Result<(), MessageBoxError> {
+        match tokio::time::timeout(timeout, &mut self.rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(MessageBoxError::WebSocket(
+                "the socket closed before the relay answered".to_string(),
+            )),
+            Err(_) => Err(MessageBoxError::WebSocket(format!(
+                "no answer from the relay within {timeout:?}"
+            ))),
+        }
+    }
+}
+
+impl Drop for LiveSendAck {
+    fn drop(&mut self) {
+        lock_waiters(&self.waiters).remove(self.token);
+    }
+}
 
 /// WebSocket connection to the MessageBox server: the shared authsocket
 /// BRC-103 client plus the MessageBox application routing.
@@ -53,10 +192,12 @@ pub struct MessageBoxWebSocket {
     ws: AuthSocketClient,
     /// Map of event key (e.g. "sendMessage-{roomId}") to subscriber callback.
     subscriptions: SubscriptionMap,
-    /// Pending ack waiters keyed by "sendMessageAck-{roomId}", FIFO per key.
+    /// Live sends waiting for the relay's answer.
     pending_acks: PendingAcks,
     /// Rooms tracked locally so `leave_room` can clear subscriptions.
     joined_rooms: Arc<Mutex<HashSet<String>>>,
+    /// The URL this socket was opened to.
+    url: String,
 }
 
 impl MessageBoxWebSocket {
@@ -74,12 +215,52 @@ impl MessageBoxWebSocket {
     where
         W: WalletInterface + Clone + Send + Sync + 'static,
     {
-        let ws = AuthSocketClient::connect(url, identity_key, wallet.clone())
-            .await
-            .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
+        Self::open(url, identity_key, wallet, originator, None).await
+    }
+
+    /// [`connect`](Self::connect), answering the relay's certificate request
+    /// with `provider`. A relay whose identity gate is armed asks for a
+    /// certificate during the handshake; the provider's batch is sent before
+    /// the client's first signed `authenticated` event.
+    pub async fn connect_with_certificate_provider<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        originator: Option<String>,
+        provider: CertificateProvider,
+    ) -> Result<Self, MessageBoxError>
+    where
+        W: WalletInterface + Clone + Send + Sync + 'static,
+    {
+        Self::open(url, identity_key, wallet, originator, Some(provider)).await
+    }
+
+    async fn open<W>(
+        url: &str,
+        identity_key: &str,
+        wallet: W,
+        originator: Option<String>,
+        provider: Option<CertificateProvider>,
+    ) -> Result<Self, MessageBoxError>
+    where
+        W: WalletInterface + Clone + Send + Sync + 'static,
+    {
+        let ws = match provider {
+            Some(provider) => {
+                AuthSocketClient::connect_with_certificate_provider(
+                    url,
+                    identity_key,
+                    wallet.clone(),
+                    provider,
+                )
+                .await
+            }
+            None => AuthSocketClient::connect(url, identity_key, wallet.clone()).await,
+        }
+        .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
 
         let subscriptions: SubscriptionMap = Arc::new(Mutex::new(HashMap::new()));
-        let pending_acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
+        let pending_acks: PendingAcks = Arc::default();
         let joined_rooms: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
         // Internal FIFO: the authsocket fallback (sync) forwards every verified
@@ -134,20 +315,8 @@ impl MessageBoxWebSocket {
                                 authenticated_decrypt,
                             });
                         }
-                    } else if event_name.starts_with("sendMessageAck-") {
-                        // Room-scoped ack: resolve the OLDEST still-pending
-                        // send for this room (FIFO).
-                        let success =
-                            data.get("status").and_then(|s| s.as_str()) == Some("success");
-                        let mut guard = pending_acks.lock().await;
-                        if let Some(queue) = guard.get_mut(&event_name) {
-                            if let Some(tx) = queue.pop_front() {
-                                let _ = tx.send(success);
-                            }
-                            if queue.is_empty() {
-                                guard.remove(&event_name);
-                            }
-                        }
+                    } else {
+                        lock_waiters(&pending_acks).route(&event_name, &data);
                     }
                     // authenticationSuccess and other transport-level events are
                     // handled inside the authsocket client.
@@ -160,7 +329,14 @@ impl MessageBoxWebSocket {
             subscriptions,
             pending_acks,
             joined_rooms,
+            url: url.to_string(),
         })
+    }
+
+    /// The URL this socket was opened to: the relay whose rate budget its
+    /// live sends spend.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
     }
 
     /// Return true if the connection is currently authenticated.
@@ -222,68 +398,36 @@ impl MessageBoxWebSocket {
         self.subscriptions.lock().await.insert(event_key, callback);
     }
 
-    /// Emit a sendMessage event and register an ack waiter.
+    /// Emit a sendMessage event and return the waiter for the relay's answer.
     ///
-    /// The sendMessage event is signed as a BRC-103 general message and emitted
-    /// directly on the socket — concurrent calls sign + emit + await their acks
-    /// in parallel. The ack waiter is enqueued under `sendMessageAck-{ack_key}`
-    /// and resolved FIFO when the server emits that room-scoped ack.
+    /// The event is signed as a BRC-103 general message and emitted directly
+    /// on the socket, so concurrent sends emit and wait in parallel. The
+    /// waiter is registered under `data.message.message_id` before the emit,
+    /// so an ack that beats the return is not lost.
     pub async fn emit_send_message(
         &self,
-        payload: serde_json::Value,
-        ack_key: String,
-        ack_tx: oneshot::Sender<bool>,
-    ) -> Result<(), MessageBoxError> {
-        // Register the ack waiter BEFORE sending — avoids the race where the
-        // server acks before we enqueue.
-        self.pending_acks
-            .lock()
+        data: &WsSendMessageData,
+    ) -> Result<LiveSendAck, MessageBoxError> {
+        let payload = serde_json::to_value(data)?;
+        let ack = LiveSendAck::register(&self.pending_acks, &data.message.message_id);
+        // On error `ack` drops here and withdraws its own waiter.
+        self.ws
+            .emit("sendMessage", &payload)
             .await
-            .entry(ack_key.clone())
-            .or_default()
-            .push_back(ack_tx);
-
-        if let Err(e) = self.ws.emit("sendMessage", &payload).await {
-            // Send failed — pull our just-enqueued waiter back off the tail so
-            // it doesn't leak (and isn't mismatched to a later ack).
-            let mut guard = self.pending_acks.lock().await;
-            if let Some(queue) = guard.get_mut(&ack_key) {
-                queue.pop_back();
-                if queue.is_empty() {
-                    guard.remove(&ack_key);
-                }
-            }
-            return Err(MessageBoxError::WebSocket(e.to_string()));
-        }
-        Ok(())
+            .map_err(|e| MessageBoxError::WebSocket(e.to_string()))?;
+        Ok(ack)
     }
 
-    /// Remove a pending ack entry (called on timeout to prevent leaking channels).
-    ///
-    /// Pops the OLDEST waiter for the key — under FIFO ack matching, a timeout
-    /// on the oldest in-flight send is the one most likely to have been abandoned.
-    pub async fn remove_pending_ack(&self, key: &str) {
-        let mut guard = self.pending_acks.lock().await;
-        if let Some(queue) = guard.get_mut(key) {
-            queue.pop_front();
-            if queue.is_empty() {
-                guard.remove(key);
-            }
-        }
-    }
-
-    /// Disconnect from the server and clear all state.
-    ///
-    /// Sends `false` to all remaining pending ack waiters before dropping them.
+    /// Disconnect from the server and clear all state. Every send still
+    /// waiting for the relay's answer fails.
     pub async fn disconnect(&self) -> Result<(), MessageBoxError> {
-        {
-            let mut guard = self.pending_acks.lock().await;
-            for (_, queue) in guard.drain() {
-                for tx in queue {
-                    let _ = tx.send(false);
-                }
-            }
-        }
+        self.close("disconnected").await
+    }
+
+    /// [`disconnect`](Self::disconnect), failing the sends still waiting for
+    /// the relay's answer with `why`.
+    pub(crate) async fn close(&self, why: &str) -> Result<(), MessageBoxError> {
+        lock_waiters(&self.pending_acks).fail_all(|| MessageBoxError::WebSocket(why.to_string()));
         self.subscriptions.lock().await.clear();
         self.joined_rooms.lock().await.clear();
         self.ws
@@ -416,96 +560,78 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FIFO ack router — concurrent same-room send correlation
+    // Live-send answers
     // -----------------------------------------------------------------------
 
-    /// Two concurrent sends to the SAME room each enqueue a waiter; two acks
-    /// resolve them oldest-first.
-    #[tokio::test]
-    async fn fifo_acks_resolve_concurrent_same_room_sends_in_order() {
-        let acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-        let key = "sendMessageAck-03abc-inbox".to_string();
-
-        let (tx1, rx1) = oneshot::channel::<bool>();
-        let (tx2, rx2) = oneshot::channel::<bool>();
-        {
-            let mut g = acks.lock().await;
-            g.entry(key.clone()).or_default().push_back(tx1);
-            g.entry(key.clone()).or_default().push_back(tx2);
-            assert_eq!(g.get(&key).unwrap().len(), 2, "both waiters queued");
-        }
-
-        {
-            let mut g = acks.lock().await;
-            let q = g.get_mut(&key).unwrap();
-            let _ = q.pop_front().unwrap().send(true);
-            assert!(!q.is_empty(), "second waiter still queued");
-        }
-        assert!(rx1.await.unwrap(), "first send resolved by first ack");
-
-        {
-            let mut g = acks.lock().await;
-            let q = g.get_mut(&key).unwrap();
-            let _ = q.pop_front().unwrap().send(false);
-            if q.is_empty() {
-                g.remove(&key);
-            }
-            assert!(!g.contains_key(&key), "key removed once queue drains");
-        }
-        assert!(!rx2.await.unwrap(), "second send resolved by second ack");
+    fn waiters() -> PendingAcks {
+        Arc::default()
     }
 
-    /// `remove_pending_ack` semantics: popping the oldest waiter on timeout and
-    /// removing the key once the queue drains — no leaked entries.
-    #[tokio::test]
-    async fn remove_pending_ack_pops_oldest_and_clears_empty_key() {
-        let acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-        let key = "sendMessageAck-03abc-inbox".to_string();
-        let (tx, _rx) = oneshot::channel::<bool>();
-        acks.lock()
-            .await
-            .entry(key.clone())
-            .or_default()
-            .push_back(tx);
-
-        {
-            let mut g = acks.lock().await;
-            if let Some(q) = g.get_mut(&key) {
-                q.pop_front();
-                if q.is_empty() {
-                    g.remove(&key);
-                }
-            }
-        }
-        assert!(acks.lock().await.is_empty(), "no leaked ack entries");
+    fn ack(message_id: &str) -> serde_json::Value {
+        json!({"status": "success", "messageId": message_id})
     }
 
-    /// Acks for DIFFERENT rooms are independent.
+    /// An ack resolves the send it names and no other, whatever the order.
     #[tokio::test]
-    async fn acks_are_per_room_independent() {
-        let acks: PendingAcks = Arc::new(Mutex::new(HashMap::new()));
-        let key_a = "sendMessageAck-03aaa-inbox".to_string();
-        let key_b = "sendMessageAck-03bbb-inbox".to_string();
-        let (tx_a, rx_a) = oneshot::channel::<bool>();
-        let (tx_b, rx_b) = oneshot::channel::<bool>();
-        {
-            let mut g = acks.lock().await;
-            g.entry(key_a.clone()).or_default().push_back(tx_a);
-            g.entry(key_b.clone()).or_default().push_back(tx_b);
-        }
-        {
-            let mut g = acks.lock().await;
-            let q = g.get_mut(&key_a).unwrap();
-            let _ = q.pop_front().unwrap().send(true);
-            if q.is_empty() {
-                g.remove(&key_a);
-            }
-        }
-        assert!(rx_a.await.unwrap(), "room A resolved");
-        assert!(
-            acks.lock().await.contains_key(&key_b),
-            "room B still pending"
+    async fn an_ack_resolves_only_the_send_it_names() {
+        let waiters = waiters();
+        let a = LiveSendAck::register(&waiters, "id-a");
+        let b = LiveSendAck::register(&waiters, "id-b");
+
+        lock_waiters(&waiters).route("sendMessageAck-03abc-inbox", &ack("id-c"));
+        lock_waiters(&waiters).route("sendMessageAck-03abc-inbox", &ack("id-b"));
+        b.wait(Duration::from_secs(1)).await.expect("b accepted");
+
+        assert_eq!(lock_waiters(&waiters).waiting.len(), 1, "a still waits");
+        lock_waiters(&waiters).route("sendMessageAck-03abc-inbox", &ack(" id-a "));
+        a.wait(Duration::from_secs(1)).await.expect("a accepted");
+    }
+
+    /// A refusal names no send, so every pending send on the socket fails;
+    /// a rate-limit refusal carries the relay's wait.
+    #[tokio::test]
+    async fn a_refusal_fails_every_pending_send() {
+        let waiters = waiters();
+        let a = LiveSendAck::register(&waiters, "id-a");
+        let b = LiveSendAck::register(&waiters, "id-b");
+
+        lock_waiters(&waiters).route(
+            "messageFailed",
+            &json!({"status":"error","reason":"rate_limited","tier":"uncertified","retry_after":4}),
         );
-        drop(rx_b);
+        for pending in [a, b] {
+            match pending.wait(Duration::from_secs(1)).await {
+                Err(MessageBoxError::RateLimited { retry_after, .. }) => {
+                    assert_eq!(retry_after, Duration::from_secs(4))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+
+        let c = LiveSendAck::register(&waiters, "id-c");
+        lock_waiters(&waiters).route(
+            "messageFailed",
+            &json!({"reason": "Delivery blocked by recipient"}),
+        );
+        assert!(matches!(
+            c.wait(Duration::from_secs(1)).await,
+            Err(MessageBoxError::WebSocket(reason)) if reason.contains("Delivery blocked")
+        ));
+    }
+
+    /// A send that times out withdraws its own waiter, not an older one.
+    #[tokio::test(start_paused = true)]
+    async fn a_timeout_withdraws_only_its_own_waiter() {
+        let waiters = waiters();
+        let older = LiveSendAck::register(&waiters, "id-old");
+        let newer = LiveSendAck::register(&waiters, "id-new");
+
+        assert!(newer.wait(Duration::from_secs(10)).await.is_err());
+        lock_waiters(&waiters).route("sendMessageAck-03abc-inbox", &ack("id-old"));
+        older
+            .wait(Duration::from_secs(10))
+            .await
+            .expect("the older send keeps its answer");
+        assert!(lock_waiters(&waiters).waiting.is_empty(), "nothing leaks");
     }
 }

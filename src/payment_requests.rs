@@ -60,6 +60,38 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         description: &str,
         expires_at: u64,
     ) -> Result<PaymentRequestResult, MessageBoxError> {
+        self.request_payment_inner(recipient, amount, description, expires_at, None)
+            .await
+    }
+
+    /// Send a payment request through one explicitly selected MessageBox host.
+    ///
+    /// Unlike [`Self::request_payment`], this does not resolve the recipient's
+    /// advertised host. This is intended for deployments that pin a particular
+    /// relay and must fail closed instead of silently routing through another
+    /// advertised MessageBox host.
+    pub async fn request_payment_to_host(
+        &self,
+        recipient: &str,
+        amount: u64,
+        description: &str,
+        expires_at: u64,
+        host: &str,
+    ) -> Result<PaymentRequestResult, MessageBoxError> {
+        self.request_payment_inner(recipient, amount, description, expires_at, Some(host))
+            .await
+    }
+
+    async fn request_payment_inner(
+        &self,
+        recipient: &str,
+        amount: u64,
+        description: &str,
+        expires_at: u64,
+        host_override: Option<&str>,
+    ) -> Result<PaymentRequestResult, MessageBoxError> {
+        // A pinned client refuses another host before anything else.
+        self.relay_host(host_override)?;
         if amount == 0 {
             return Err(MessageBoxError::Validation(
                 "Payment request amount must be greater than 0".to_string(),
@@ -119,12 +151,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 false,
                 false,
                 None,
-                None,
+                host_override,
             )
             .await
         {
             Ok(_) => {}
-            Err(MessageBoxError::Http(403, _)) => {
+            Err(MessageBoxError::Relay { code, .. }) if code == "ERR_DELIVERY_BLOCKED" => {
                 return Err(MessageBoxError::Validation(
                     "Payment request blocked — you are not on the recipient's whitelist."
                         .to_string(),
@@ -153,6 +185,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         request_proof: &str,
         host_override: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client refuses another host before anything else.
+        self.relay_host(host_override)?;
         let sender_identity_key = self.get_identity_key().await?;
 
         let message = PaymentRequestMessage {
@@ -404,6 +438,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         note: Option<&str>,
         host_override: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client refuses another host before it pays: refused only
+        // at the response, the caller would see an error after paying, and a
+        // retry would pay again.
+        self.relay_host(host_override)?;
+
         // Step 1: Send payment
         self.send_payment(&request.sender, request.amount).await?;
 
@@ -446,6 +485,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         note: Option<&str>,
         host_override: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client refuses another host before anything else.
+        self.relay_host(host_override)?;
         let mut response = PaymentRequestResponse {
             request_id: request.request_id.clone(),
             status: "declined".to_string(),

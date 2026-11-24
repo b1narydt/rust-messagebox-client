@@ -1,18 +1,24 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use bsv::auth::clients::auth_fetch::{AuthFetch, AuthFetchResponse};
+use bsv::auth::clients::auth_fetch::AuthFetch;
 use bsv::remittance::types::PeerMessage;
 use bsv::services::overlay_tools::Network;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use tokio::sync::{Mutex, OnceCell};
-// `Mutex` is still used for WebSocket state, joined rooms, and the subscription
-// registry — see the corresponding fields below. It is NO LONGER used for
-// `auth_fetch`, which is now concurrency-safe (`&self`) and shared bare via `Arc`.
+// `Mutex` guards WebSocket state, joined rooms, and the subscription registry.
+// HTTP needs no lock: the transport is concurrency-safe (`&self`).
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
-use crate::types::{AuthenticatedPeerMessage, ListMessagesParams};
+use crate::pinned_wallet::{PinnedFetch, PinnedWallet};
+use crate::transport::{RelayHttp, RelayResponse};
+use crate::types::{
+    AuthenticatedPeerMessage, ListMessagesParams, WsSendMessageData, WsSendMessagePayload,
+};
+use crate::websocket::CertificateProvider;
 
 /// Internal callback type for live message subscriptions. Carries the
 /// authenticated-decrypt provenance flag end-to-end (WS dispatch, reconnect
@@ -25,28 +31,104 @@ type SubscriptionCallback = Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>;
 const RECONNECT_BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const RECONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Establish a fresh WebSocket connection and swap it into `ws_state`, replaying
-/// joinRoom + re-subscribe for every active subscription.
+/// Everything needed to open the client's WebSocket. The reconnect
+/// supervisor owns one, so it dials exactly as the first connect did.
+struct WsDial<W> {
+    url: String,
+    identity_key: String,
+    expected_relay_key: Option<String>,
+    certificate_provider: Option<CertificateProvider>,
+    wallet: W,
+    originator: Option<String>,
+}
+
+impl<W> WsDial<W>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    /// Connect and authenticate, answering a certificate request with the
+    /// provider when one is configured.
+    ///
+    /// With a relay identity pin the handshake runs on a [`PinnedWallet`] and
+    /// a guarded provider, so nothing is signed for, and no certificate is
+    /// proved to, a server that proved another key. Such a server, or one
+    /// that proves a different key after the handshake, ends the connect with
+    /// [`MessageBoxError::RelayIdentityMismatch`].
+    async fn connect(&self) -> Result<crate::websocket::MessageBoxWebSocket, MessageBoxError> {
+        use crate::websocket::MessageBoxWebSocket;
+        let wallet = PinnedWallet::new(self.wallet.clone(), self.expected_relay_key.clone());
+        let opened = match &self.certificate_provider {
+            Some(provider) => {
+                MessageBoxWebSocket::connect_with_certificate_provider(
+                    &self.url,
+                    &self.identity_key,
+                    wallet.clone(),
+                    self.originator.clone(),
+                    wallet.guard_provider(provider.clone()),
+                )
+                .await
+            }
+            None => {
+                MessageBoxWebSocket::connect(
+                    &self.url,
+                    &self.identity_key,
+                    wallet.clone(),
+                    self.originator.clone(),
+                )
+                .await
+            }
+        };
+        let ws = match opened {
+            Ok(ws) => ws,
+            Err(e) => return Err(wallet.classify(e)),
+        };
+        if let Err(e) = crate::transport::check_relay_identity(
+            self.expected_relay_key.as_deref(),
+            Some(ws.server_identity_key()),
+        ) {
+            if let Err(close) = ws.disconnect().await {
+                tracing::warn!(error = %close, "closing the mismatched relay socket failed");
+            }
+            return Err(e);
+        }
+        Ok(ws)
+    }
+}
+
+/// Unless `ws_state` holds a connected socket, establish a fresh WebSocket
+/// connection and swap it into `ws_state`, replaying joinRoom + re-subscribe
+/// for every active subscription.
 ///
 /// Shared by `ensure_ws_connected` (lazy/on-demand connect) and the reconnect
 /// supervisor (proactive heal). Lives as a free function — taking `Arc` handles
 /// rather than `&self` — so the `'static` supervisor task can call it without a
-/// self-reference. On success the new socket replaces whatever was in
-/// `ws_state`; the old (dead) socket is dropped, tearing down its tasks.
+/// self-reference. `dial_lock` is held from the check to the swap, so
+/// concurrent callers dial once: a caller that finds a connected socket once
+/// it holds the lock uses that socket. The socket a dial replaces is one that
+/// was found dead (or none); it is closed, failing the sends still waiting on
+/// it. A failed dial (including a relay identity mismatch) leaves `ws_state`
+/// as it was and joins no room. A successful one bumps `connections`, which
+/// tells each poll backstop to catch up once.
 async fn reconnect_ws<W>(
     ws_state: &Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
     subscriptions: &Arc<Mutex<HashMap<String, SubscriptionCallback>>>,
-    ws_url: &str,
-    identity_key: &str,
-    wallet: W,
-    originator: Option<String>,
+    connections: &AtomicU64,
+    dial_lock: &Mutex<()>,
+    dial: &WsDial<W>,
 ) -> Result<(), MessageBoxError>
 where
     W: WalletInterface + Clone + Send + Sync + 'static,
 {
-    let ws =
-        crate::websocket::MessageBoxWebSocket::connect(ws_url, identity_key, wallet, originator)
-            .await?;
+    let _dialing = dial_lock.lock().await;
+    let connected = ws_state
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|ws| ws.is_connected());
+    if connected {
+        return Ok(());
+    }
+    let ws = dial.connect().await?;
 
     // Replay subscriptions on the fresh socket so the general_msg_dispatcher
     // has callbacks registered for every active room. Without this, events
@@ -65,7 +147,19 @@ where
         }
     }
 
-    *ws_state.lock().await = Some(ws);
+    // No answer reaches a send still waiting on the replaced socket, so it
+    // fails now and takes its HTTP fallback instead of waiting out its ack
+    // timeout.
+    let replaced = ws_state.lock().await.replace(ws);
+    if let Some(old) = replaced {
+        if let Err(e) = old
+            .close("the socket was replaced before the relay answered")
+            .await
+        {
+            tracing::warn!(error = %e, "closing the replaced socket failed");
+        }
+    }
+    connections.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }
 
@@ -83,17 +177,23 @@ where
 pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// Base URL of the MessageBox server (trailing whitespace trimmed on construction).
     host: String,
-    /// BRC-31 authenticated HTTP client. `&self`-concurrency-safe, so it is shared
-    /// via a bare `Arc` — N requests can be in flight on one session at once.
-    /// The `Arc` lets background polling tasks share the same wallet auth state
-    /// without a lock or duplicating it.
-    auth_fetch: Arc<AuthFetch<W>>,
+    /// BRC-31 authenticated HTTP, behind the client's one HTTP door. Cheap to
+    /// clone, so background polling tasks share the same session without a
+    /// lock; N requests can be in flight at once.
+    http: RelayHttp,
     /// Wallet retained for direct encrypt / decrypt calls in `http_ops`.
     wallet: W,
     /// Optional originator string forwarded to wallet operations.
     originator: Option<String>,
     /// Cached identity public key (hex) — populated on first call.
     identity_key: OnceCell<String>,
+    /// The relay identity pin (normalised hex), set by
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key). `None`
+    /// trusts whichever relay answers the host.
+    expected_relay_key: Option<String>,
+    /// Answers the relay's certificate request on the WebSocket handshake,
+    /// set by [`with_certificate_provider`](Self::with_certificate_provider).
+    certificate_provider: Option<CertificateProvider>,
     /// Ensures assert_initialized runs the full init path at most once.
     pub(crate) init_once: OnceCell<()>,
     /// Network preset for overlay tools (LookupResolver, TopicBroadcaster).
@@ -104,8 +204,17 @@ pub struct MessageBoxClient<W: WalletInterface + Clone + 'static> {
     /// `Arc` so the background reconnect supervisor task can share it and swap a
     /// freshly reconnected socket in without a self-reference.
     ws_state: Arc<Mutex<Option<crate::websocket::MessageBoxWebSocket>>>,
+    /// Held by [`reconnect_ws`] from its connected check to its swap, so one
+    /// WebSocket dial runs at a time.
+    ws_dial_lock: Arc<Mutex<()>>,
     /// Ensures the reconnect supervisor task is spawned at most once per client.
     reconnect_supervisor: OnceCell<()>,
+    /// Counts successful WebSocket connects and reconnects (rooms rejoined).
+    /// Each poll backstop lists once when it changes.
+    ws_connections: Arc<AtomicU64>,
+    /// The longest the poll backstop waits between lists while the WebSocket
+    /// is connected.
+    poll_interval: Duration,
     /// Tracks which message box rooms have been joined via join_room.
     /// Updated on join_room (insert) and leave_room (remove).
     /// Arc allows sharing with background polling tasks.
@@ -128,14 +237,19 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     pub fn new(host: String, wallet: W, originator: Option<String>, network: Network) -> Self {
         MessageBoxClient {
             host: host.trim().to_string(),
-            auth_fetch: Arc::new(AuthFetch::new(wallet.clone())),
+            http: RelayHttp::new(Arc::new(AuthFetch::new(wallet.clone())), None),
             wallet,
             originator,
             identity_key: OnceCell::new(),
+            expected_relay_key: None,
+            certificate_provider: None,
             init_once: OnceCell::new(),
             network,
             ws_state: Arc::new(Mutex::new(None)),
+            ws_dial_lock: Arc::default(),
             reconnect_supervisor: OnceCell::new(),
+            ws_connections: Arc::new(AtomicU64::new(0)),
+            poll_interval: DEFAULT_POLL_INTERVAL,
             joined_rooms: Arc::new(Mutex::new(std::collections::HashSet::new())),
             subscriptions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -144,6 +258,132 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Convenience constructor defaulting to `Network::Mainnet`.
     pub fn new_mainnet(host: String, wallet: W, originator: Option<String>) -> Self {
         Self::new(host, wallet, originator, Network::Mainnet)
+    }
+
+    /// Pin the relay's identity key (hex; case and surrounding whitespace are
+    /// ignored).
+    ///
+    /// Once pinned, the client talks only to its own host and trusts only a
+    /// server there that proves this key:
+    /// - it does not look up a recipient's relay on the overlay, and lists and
+    ///   acknowledges on its own host alone. A call that names another host
+    ///   (an `override_host`, a `_from_host` / `_to_host` method,
+    ///   [`init`](Self::init)'s `target_host`, or `anoint_host`) returns
+    ///   [`MessageBoxError::RelayHostRefused`] before any request, payment
+    ///   or advertisement, the overlay lookup of the first call's init
+    ///   included; hosts are compared by scheme, host, port and path,
+    ///   ignoring case, a default port and a trailing slash;
+    /// - the HTTP and WebSocket auth channels run on a wallet that signs a
+    ///   message only for a server that proved this key in the BRC-103
+    ///   handshake. A request to a server that proved another key is never
+    ///   signed, so never sent, and fails with
+    ///   [`MessageBoxError::RelayIdentityMismatch`];
+    /// - every HTTP response must also come from a server that proved this
+    ///   key, or it is refused with that error before its body is used;
+    /// - every WebSocket connect and reconnect checks the key the server
+    ///   proved, and on a mismatch disconnects and returns that error. A live
+    ///   send then fails with it rather than falling back to HTTP;
+    /// - during either handshake the client proves certificates (from the
+    ///   wallet or the [certificate provider](Self::with_certificate_provider))
+    ///   only to a server that proved this key, and never pays a `402`
+    ///   answer: that wallet refuses `create_action`, and both key-linkage
+    ///   reveals.
+    ///
+    /// Without a pin the client trusts whichever relay answers each host.
+    pub fn with_expected_relay_key(mut self, identity_key: impl AsRef<str>) -> Self {
+        let key = crate::transport::normalize_identity_key(identity_key.as_ref());
+        let auth_wallet = PinnedWallet::new(self.wallet.clone(), Some(key.clone()));
+        self.http = self
+            .http
+            .with_transport(Arc::new(PinnedFetch::new(auth_wallet)))
+            .with_pin(key.clone(), self.host.clone());
+        self.expected_relay_key = Some(key);
+        self
+    }
+
+    /// The host a call goes to: `explicit`, else this client's own host.
+    ///
+    /// A pinned client uses its own host, and refuses an explicit host that
+    /// is not that host with [`MessageBoxError::RelayHostRefused`] (see
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key)).
+    pub(crate) fn relay_host<'a>(
+        &'a self,
+        explicit: Option<&'a str>,
+    ) -> Result<&'a str, MessageBoxError> {
+        match explicit {
+            Some(host) if self.expected_relay_key.is_some() => {
+                if crate::transport::same_host(host, &self.host) {
+                    Ok(self.host())
+                } else {
+                    Err(MessageBoxError::RelayHostRefused {
+                        pinned: self.host.clone(),
+                        requested: host.to_string(),
+                    })
+                }
+            }
+            Some(host) => Ok(host),
+            None => Ok(self.host()),
+        }
+    }
+
+    /// The relay identity pin, if one is set (normalised lowercase hex).
+    pub fn expected_relay_key(&self) -> Option<&str> {
+        self.expected_relay_key.as_deref()
+    }
+
+    /// Answer the relay's certificate request on every WebSocket connect and
+    /// reconnect with `provider` (see [`CertificateProvider`]).
+    ///
+    /// A relay with its identity gate armed asks for one Account Details
+    /// certificate during the handshake. Without a provider the WebSocket
+    /// handshake fails on such a relay. HTTP requests have no provider hook:
+    /// `AuthFetch` answers the same request from the wallet's
+    /// `list_certificates`, so the wallet must implement it (see the README).
+    pub fn with_certificate_provider(mut self, provider: CertificateProvider) -> Self {
+        self.certificate_provider = Some(provider);
+        self
+    }
+
+    /// Set the longest one send or list waits, in all, on the relay's rate
+    /// limit (default 60 s).
+    ///
+    /// The relay charges HTTP sends, WebSocket sends and lists to one budget
+    /// per identity and refuses past it with a wait (`retry_after`). The
+    /// client then holds every send and list to that relay for the wait, and
+    /// resends a refused send or list, same bytes and id, once it passes.
+    /// When the wait would run past this limit the call returns
+    /// [`MessageBoxError::RateLimited`] instead. `Duration::ZERO` never waits.
+    ///
+    /// A live send ([`send_live_message`](Self::send_live_message)) counts as
+    /// one call: its wait before the emit and its HTTP fallback share the
+    /// limit. Its 10 s ack wait and network time are on top.
+    pub fn with_rate_limit_wait(mut self, wait: Duration) -> Self {
+        self.http = self.http.with_rate_limit_wait(wait);
+        self
+    }
+
+    /// Set the longest the poll backstop of
+    /// [`listen_for_live_messages`](Self::listen_for_live_messages) waits
+    /// between lists while the WebSocket is connected (default 15 s, at least
+    /// 1 s: a shorter interval is raised to 1 s, as every list spends the
+    /// relay rate budget).
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval.max(POLL_INTERVAL_MIN);
+        self
+    }
+
+    /// How this client dials its WebSocket at `override_host` or its own host:
+    /// the host [`relay_host`](Self::relay_host) returns, so a pinned client
+    /// dials its own host as configured.
+    async fn ws_dial(&self, override_host: Option<&str>) -> Result<WsDial<W>, MessageBoxError> {
+        Ok(WsDial {
+            url: self.relay_host(override_host)?.to_string(),
+            identity_key: self.get_identity_key().await?,
+            expected_relay_key: self.expected_relay_key.clone(),
+            certificate_provider: self.certificate_provider.clone(),
+            wallet: self.wallet.clone(),
+            originator: self.originator.clone(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -212,7 +452,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     // Initialization guard
     // -----------------------------------------------------------------------
 
-    /// Ensure the client is initialized before performing any HTTP operation.
+    /// Ensure the client is initialized before performing any HTTP operation
+    /// against `override_host` (or the client's own host), and return the
+    /// host that operation goes to.
+    ///
+    /// A pinned client refuses another host here, through
+    /// [`relay_host`](Self::relay_host), before the init: so a refused call
+    /// asks no overlay and advertises nothing.
     ///
     /// Uses `init_once.get_or_try_init` so the full init path runs at most once
     /// even under concurrent callers — matching the TS `initializeConnection`
@@ -224,7 +470,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// 3. If no matching ad exists, call `anoint_host`.
     /// 4. CRITICAL TS PARITY: catch anoint errors and continue — TS logs
     ///    "Failed to anoint host, continuing with default functionality".
-    pub(crate) async fn assert_initialized(&self) -> Result<(), MessageBoxError> {
+    pub(crate) async fn assert_initialized<'a>(
+        &'a self,
+        override_host: Option<&'a str>,
+    ) -> Result<&'a str, MessageBoxError> {
+        let host = self.relay_host(override_host)?;
         self.init_once
             .get_or_try_init(|| async {
                 let identity_key = self.get_identity_key().await?;
@@ -245,7 +495,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 Ok::<(), MessageBoxError>(())
             })
             .await?;
-        Ok(())
+        Ok(host)
     }
 
     /// Initialize the client — ensures overlay advertisement exists.
@@ -254,10 +504,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// the init path runs exactly once due to `init_once` OnceCell semantics.
     ///
     /// `target_host`: when Some, uses that host for the anoint_host call instead of
-    /// `self.host()`. Matches the TS `init(targetHost?)` signature.
+    /// `self.host()`. Matches the TS `init(targetHost?)` signature. A client
+    /// pinned with [`with_expected_relay_key`](Self::with_expected_relay_key)
+    /// advertises only its own host: any other `target_host` returns
+    /// [`MessageBoxError::RelayHostRefused`] before anything is advertised.
     pub async fn init(&self, target_host: Option<&str>) -> Result<(), MessageBoxError> {
         match target_host {
             Some(host) => {
+                let host = self.relay_host(Some(host))?;
                 // TS parity: if targetHost provided, anoint THAT host directly
                 // instead of going through assert_initialized's self.host logic.
                 self.init_once
@@ -272,7 +526,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     .await?;
                 Ok(())
             }
-            None => self.assert_initialized().await,
+            None => {
+                self.assert_initialized(None).await?;
+                Ok(())
+            }
         }
     }
 
@@ -342,52 +599,60 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         Ok(())
     }
 
-    /// POST JSON bytes to `url` using BRC-31 authenticated transport.
+    /// POST JSON bytes to `url` using BRC-31 authenticated transport. A
+    /// non-2xx status is an error.
     ///
-    /// `fetch()` takes `&self` and is concurrency-safe, so this call holds no
-    /// client-side lock — multiple `post_json` calls on the same client run in
-    /// parallel.
+    /// The transport takes `&self` and is concurrency-safe, so this call holds
+    /// no client-side lock — multiple `post_json` calls on the same client run
+    /// in parallel.
     pub(crate) async fn post_json(
         &self,
         url: &str,
         body_bytes: Vec<u8>,
-    ) -> Result<AuthFetchResponse, MessageBoxError> {
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/json".to_string());
+    ) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_ok(url, "POST", Some(body_bytes)).await
+    }
 
-        let response = self
-            .auth_fetch
-            .fetch(url, "POST", Some(body_bytes), Some(headers))
+    /// When a send or list starting now stops waiting on the rate limit.
+    pub(crate) fn rate_limit_deadline(&self) -> tokio::time::Instant {
+        self.http.rate_limit_deadline()
+    }
+
+    /// POST a send or list to `url` on `host`, waiting out the relay's rate
+    /// limit and resending the same bytes after a refusal, until `deadline`
+    /// ([`RelayHttp::fetch_budgeted`]).
+    pub(crate) async fn post_budgeted(
+        &self,
+        host: &str,
+        url: &str,
+        body_bytes: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<RelayResponse, MessageBoxError> {
+        self.http
+            .fetch_budgeted(host, url, body_bytes, deadline)
             .await
-            .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
-
-        if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(response.status, url.to_string()));
-        }
-
-        Ok(response)
     }
 
     /// POST JSON bytes to `url`, returning the response **regardless of HTTP
     /// status** so the caller can inspect the body on a non-2xx reply.
-    ///
-    /// `post_json` early-returns `Err(Http(status))` on any non-2xx response and
-    /// discards the body — which is correct for most endpoints, but loses the
-    /// relay's structured error payload. `sendMessage` needs that payload to
-    /// distinguish the idempotent `ERR_DUPLICATE_MESSAGE` rejection (delivered
-    /// HTTP 400) from genuine failures, so it uses this raw variant instead.
     pub(crate) async fn post_json_raw(
         &self,
         url: &str,
         body_bytes: Vec<u8>,
-    ) -> Result<AuthFetchResponse, MessageBoxError> {
-        let mut headers = HashMap::new();
-        headers.insert("content-type".to_string(), "application/json".to_string());
+    ) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_raw(url, "POST", Some(body_bytes)).await
+    }
 
-        self.auth_fetch
-            .fetch(url, "POST", Some(body_bytes), Some(headers))
-            .await
-            .map_err(|e| MessageBoxError::Auth(e.to_string()))
+    /// Replace the HTTP transport (unit tests drive a scripted relay). Call it
+    /// last: [`with_expected_relay_key`](Self::with_expected_relay_key)
+    /// installs its own transport.
+    #[cfg(test)]
+    pub(crate) fn with_transport(
+        mut self,
+        transport: Arc<dyn crate::transport::HttpTransport>,
+    ) -> Self {
+        self.http = self.http.with_transport(transport);
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -404,6 +669,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
+        // A pinned client opens and uses a socket only at its own host.
+        self.relay_host(override_host)?;
         // Fast path: already connected.
         if self
             .ws_state
@@ -418,15 +685,13 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             return Ok(());
         }
 
-        let identity_key = self.get_identity_key().await?;
-        let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
+        let dial = self.ws_dial(override_host).await?;
         reconnect_ws(
             &self.ws_state,
             &self.subscriptions,
-            &ws_url,
-            &identity_key,
-            self.wallet.clone(),
-            self.originator.clone(),
+            &self.ws_connections,
+            &self.ws_dial_lock,
+            &dial,
         )
         .await?;
 
@@ -452,8 +717,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         if self.reconnect_supervisor.get().is_some() {
             return Ok(());
         }
-        let identity_key = self.get_identity_key().await?;
-        let ws_url = override_host.unwrap_or_else(|| self.host()).to_string();
+        let dial = self.ws_dial(override_host).await?;
 
         // OnceCell::set races are benign — only one initializer wins; the loser
         // simply skips spawning a duplicate.
@@ -463,8 +727,8 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         let ws_state = self.ws_state.clone();
         let subscriptions = self.subscriptions.clone();
-        let wallet = self.wallet.clone();
-        let originator = self.originator.clone();
+        let ws_connections = self.ws_connections.clone();
+        let ws_dial_lock = self.ws_dial_lock.clone();
 
         tokio::spawn(async move {
             loop {
@@ -498,10 +762,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                     match reconnect_ws(
                         &ws_state,
                         &subscriptions,
-                        &ws_url,
-                        &identity_key,
-                        wallet.clone(),
-                        originator.clone(),
+                        &ws_connections,
+                        &ws_dial_lock,
+                        &dial,
                     )
                     .await
                     {
@@ -539,12 +802,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///    the callback when the server broadcasts a signed `sendMessage-{roomId}`.
     /// 2. **WebSocket `on_any` (fallback):** the same callback, for servers that
     ///    emit raw (unsigned) room events.
-    /// 3. **HTTP poll (backstop):** a background task that *stands down* for any
-    ///    interval in which WS push already delivered (so it does not poll every
-    ///    2 s when live push is healthy), and otherwise polls `/listMessages` to
-    ///    catch anything the WS paths missed — forcing a catch-up at least every
-    ///    `MAX_POLL_SKIPS` intervals. Stops when `leave_room` removes the room
-    ///    from `joined_rooms`.
+    /// 3. **HTTP poll (backstop):** a background task that lists the box over
+    ///    `/listMessages`. Lists cost the same relay rate budget as sends, so it
+    ///    lists sparingly: while the WebSocket is connected, once on each
+    ///    connect and reconnect (to catch up on what arrived while it was
+    ///    down), then at most every 15 s
+    ///    ([`with_poll_interval`](Self::with_poll_interval)); with no
+    ///    connected WebSocket, after 1 s, doubling to 8 s. It waits out a
+    ///    rate-limit refusal, and backs off after a failed list (up to 60 s),
+    ///    including a list too large to accept, which it logs as an error;
+    ///    live delivery carries on meanwhile. Stops when `leave_room` removes
+    ///    the room from `joined_rooms`.
     ///
     /// All paths deliver `PeerMessage` with decrypted body to the same callback.
     ///
@@ -599,11 +867,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         // wins the race.
         let deduped = exactly_once(on_message);
 
-        // WS-only delivery counter. Bumped on every WebSocket delivery so the
-        // HTTP poll backstop below can detect healthy live-push and stand down,
-        // instead of hitting /listMessages every 2s for every active mailbox.
-        let ws_activity = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let ws_callback = record_ws_activity(deduped.clone(), ws_activity.clone());
+        let ws_callback = deduped.clone();
 
         {
             let guard = self.ws_state.lock().await;
@@ -622,15 +886,11 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 
         self.joined_rooms.lock().await.insert(room_id.clone());
 
-        // Spawn the HTTP poll BACKSTOP. With the server signing room broadcasts
-        // onto the client's authenticated primary path, live WS push is the fast
-        // path. The poll now exists only to (a) support servers that don't push
-        // and (b) recover if the WS connection silently stalls — so it stands
-        // down for any interval in which a WS delivery already occurred. This
-        // keeps redundant /listMessages load off the server under high-frequency,
-        // many-connection traffic while preserving a correctness backstop.
-        let poll_auth_fetch = self.auth_fetch.clone();
+        // Spawn the HTTP poll backstop (see the cadence on `PollCadence`).
+        let poll_http = self.http.clone();
         let poll_joined_rooms = self.joined_rooms.clone();
+        let poll_ws_state = self.ws_state.clone();
+        let poll_connections = self.ws_connections.clone();
         let poll_host = self.host.clone();
         let poll_message_box = message_box.to_string();
         let poll_identity_key = identity_key.clone();
@@ -638,61 +898,72 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let poll_originator = self.originator.clone();
         let poll_room_id = room_id.clone();
         let poll_callback = deduped;
-        let poll_ws_activity = ws_activity;
+        let mut cadence = PollCadence::new(
+            self.poll_interval,
+            self.ws_connections.load(Ordering::Acquire),
+        );
 
         tokio::spawn(async move {
-            use std::sync::atomic::Ordering;
-            let mut last_activity = poll_ws_activity.load(Ordering::Relaxed);
-            let mut skipped: u32 = 0;
-
             loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
                 // Stop when the room is no longer active (leave_room was called)
                 if !poll_joined_rooms.lock().await.contains(&poll_room_id) {
                     break;
                 }
 
-                // Stand down while WS push is healthy, but force a catch-up at
-                // least every MAX_POLL_SKIPS intervals so partial push loss on an
-                // otherwise-active connection can't permanently suppress the poll.
-                let activity = poll_ws_activity.load(Ordering::Relaxed);
-                if !poll_should_run(activity, &mut last_activity, &mut skipped) {
+                let connected = poll_ws_state
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|ws| ws.is_connected());
+                let live = connected.then(|| poll_connections.load(Ordering::Acquire));
+                if !cadence.due(tokio::time::Instant::now(), live) {
+                    tokio::time::sleep(POLL_TICK).await;
                     continue;
                 }
 
-                // Backstop poll. Cheap no-op when the mailbox is simply idle; a
-                // genuine catch-up when live push stalled. The shared `deduped`
-                // callback suppresses anything WS already delivered.
-                match poll_list_messages(
-                    &poll_auth_fetch,
+                // The shared `deduped` callback suppresses anything WS already
+                // delivered.
+                let listed = poll_list_messages(
+                    &poll_http,
                     &poll_host,
                     &poll_message_box,
                     &poll_identity_key,
                     &poll_wallet,
                     poll_originator.as_deref(),
                 )
-                .await
-                {
+                .await;
+                let failure = match listed {
                     Ok(messages) => {
                         for msg in messages {
                             poll_callback(msg);
                         }
+                        None
                     }
-                    // The poll IS the correctness backstop — never swallow its
-                    // error silently. A persistent failure here means both live
-                    // push (already stalled) and the backstop are down.
                     Err(e) => {
-                        tracing::warn!(
-                            room_id = %poll_room_id,
-                            error = %e,
-                            "poll backstop failed — message catch-up unavailable this interval"
-                        );
+                        // Only the list-size bound fails as Validation: the
+                        // box holds more than one list may carry, and the
+                        // relay does not paginate.
+                        if matches!(e, MessageBoxError::Validation(_)) {
+                            tracing::error!(
+                                room_id = %poll_room_id,
+                                error = %e,
+                                "poll backstop cannot list this box; live delivery continues"
+                            );
+                        } else {
+                            tracing::warn!(
+                                room_id = %poll_room_id,
+                                error = %e,
+                                "poll backstop failed; message catch-up delayed"
+                            );
+                        }
+                        Some(e)
                     }
-                }
-
-                // Refresh in case a WS delivery landed while we were polling.
-                last_activity = poll_ws_activity.load(Ordering::Relaxed);
+                };
+                cadence.listed(
+                    tokio::time::Instant::now(),
+                    live.is_some(),
+                    failure.as_ref(),
+                );
             }
         });
 
@@ -702,13 +973,25 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
     ///
     /// Mirrors TS `sendLiveMessage`: auto-connects if needed, joins the sender's
-    /// own room (required for ack routing), then emits. Falls back to HTTP if the
-    /// connection cannot be established or the ack times out / fails.
+    /// own room, then emits. Falls back to HTTP, with the same message id, if
+    /// the connection cannot be established, the emit fails, the relay refuses
+    /// the send (`messageFailed`), or no ack names this message within 10 s.
+    /// A pinned client whose socket meets a relay that proves another key
+    /// returns [`MessageBoxError::RelayIdentityMismatch`] and sends nothing
+    /// over HTTP.
+    ///
+    /// Rate limit: the call sets one deadline when it starts,
+    /// [`with_rate_limit_wait`](Self::with_rate_limit_wait) from then. The
+    /// wait for a rate-limit hold before the emit and the waits in the HTTP
+    /// fallback all end by it; a hold that would outlast it returns
+    /// [`MessageBoxError::RateLimited`]. The 10 s ack wait and network time
+    /// are on top, so the call can run that much longer than the wait. The
+    /// wait before the emit, and the hold a refusal on the socket sets, are on
+    /// the relay the socket is open to.
     ///
     /// TS parity: HTTP fallback resolves recipient's host via overlay before sending.
-    /// The WS path connects to `self.host()` — overlay resolution affects the fallback path.
-    /// `override_host`: when Some, the HTTP fallback path sends to that host directly.
-    /// Send a message via WebSocket with 10-second ack timeout and HTTP fallback.
+    /// The WS path uses the open socket, or opens one to `override_host` (else
+    /// `self.host()`); overlay resolution affects the fallback path.
     ///
     /// Mirrors TS `sendLiveMessage(params, overrideHost?)` which accepts the full
     /// `SendMessageParams` including `skipEncryption`, `checkPermissions`, and `messageId`.
@@ -728,6 +1011,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         message_id: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<DeliveryMode, MessageBoxError> {
+        // Every rate-limit wait in this send, on the socket or over HTTP,
+        // ends by this one deadline.
+        let rate_deadline = self.http.rate_limit_deadline();
         // If no host override, resolve the recipient's host via overlay.
         // If the recipient is on a DIFFERENT host than ours, we must use HTTP
         // (send_message with overlay resolution) since our WebSocket is only
@@ -741,141 +1027,85 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
                 // Recipient is on a different MessageBox server — use HTTP with overlay.
                 // This is a persisted delivery (no live WS ack possible cross-host).
                 let msg_id = self
-                    .send_message(
+                    .send_persisted(
+                        None,
                         recipient,
                         message_box,
                         body,
                         skip_encryption,
                         check_permissions,
                         message_id,
-                        None,
+                        rate_deadline,
                     )
                     .await?;
                 return Ok(DeliveryMode::Persisted { message_id: msg_id });
             }
         }
 
-        // Auto-connect or reconnect — if the WebSocket is disconnected, drop the
-        // stale connection and establish a fresh one with a new BRC-103 handshake.
-        // This handles proxy timeouts and server restarts without falling through
-        // to the slower HTTP fallback path.
-        {
-            let guard = self.ws_state.lock().await;
-            if guard.as_ref().map(|ws| !ws.is_connected()).unwrap_or(false) {
-                drop(guard);
-                // Stale connection — tear down and reconnect
-                if let Err(e) = self.disconnect_web_socket().await {
-                    eprintln!(
-                        "Warning: stale WebSocket disconnect failed (proceeding to reconnect): {e}"
-                    );
-                }
-            }
-        }
+        // Auto-connect or reconnect — a disconnected socket is replaced with a
+        // fresh one and a new BRC-103 handshake. This handles proxy timeouts
+        // and server restarts without falling through to the slower HTTP
+        // fallback path.
         if let Err(e) = self.ensure_ws_connected(override_host).await {
+            // A pinned client named another host, or the server at this host
+            // is not the pinned relay: the send ends here, with nothing sent
+            // over HTTP.
+            if matches!(
+                e,
+                MessageBoxError::RelayIdentityMismatch { .. }
+                    | MessageBoxError::RelayHostRefused { .. }
+            ) {
+                return Err(e);
+            }
             eprintln!("Warning: WebSocket connection failed, falling back to HTTP: {e}");
-            // HTTP fallback: use override_host if provided, otherwise overlay resolution.
             // Returns Persisted because no WS ack was received.
-            let msg_id = match override_host {
-                Some(host) => {
-                    self.send_message_to_host(
-                        host,
-                        recipient,
-                        message_box,
-                        body,
-                        skip_encryption,
-                        check_permissions,
-                        message_id,
-                        None,
-                    )
-                    .await?
-                }
-                None => {
-                    self.send_message(
-                        recipient,
-                        message_box,
-                        body,
-                        skip_encryption,
-                        check_permissions,
-                        message_id,
-                        None,
-                    )
-                    .await?
-                }
-            };
+            let msg_id = self
+                .send_persisted(
+                    override_host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    message_id,
+                    rate_deadline,
+                )
+                .await?;
             return Ok(DeliveryMode::Persisted { message_id: msg_id });
         }
 
         // Join sender's own room before send — TS calls joinRoom(messageBox) which
-        // joins `${myIdentityKey}-${messageBox}`. Required so the server can route
-        // the sendMessageAck back to this socket.
+        // joins `${myIdentityKey}-${messageBox}`.
         let identity_key = self.get_identity_key().await?;
         let my_room = format!("{identity_key}-{message_box}");
-        {
+        // The socket may be open to another host than this call names (an
+        // earlier call opened it); its live sends spend that relay's budget.
+        let socket_host = {
             let guard = self.ws_state.lock().await;
-            if let Some(ref ws) = *guard {
-                if ws.join_room(&my_room).await.is_err() {
-                    drop(guard);
-                    let msg_id = match override_host {
-                        Some(host) => {
-                            self.send_message_to_host(
-                                host,
-                                recipient,
-                                message_box,
-                                body,
-                                skip_encryption,
-                                check_permissions,
-                                message_id,
-                                None,
-                            )
-                            .await?
-                        }
-                        None => {
-                            self.send_message(
-                                recipient,
-                                message_box,
-                                body,
-                                skip_encryption,
-                                check_permissions,
-                                message_id,
-                                None,
-                            )
-                            .await?
-                        }
-                    };
-                    return Ok(DeliveryMode::Persisted { message_id: msg_id });
-                }
-            } else {
-                drop(guard);
-                let msg_id = match override_host {
-                    Some(host) => {
-                        self.send_message_to_host(
-                            host,
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            message_id,
-                            None,
-                        )
-                        .await?
-                    }
-                    None => {
-                        self.send_message(
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            message_id,
-                            None,
-                        )
-                        .await?
-                    }
-                };
-                return Ok(DeliveryMode::Persisted { message_id: msg_id });
+            match guard.as_ref() {
+                Some(ws) => ws
+                    .join_room(&my_room)
+                    .await
+                    .ok()
+                    .map(|()| ws.url().to_string()),
+                None => None,
             }
-        }
+        };
+        let Some(socket_host) = socket_host else {
+            let msg_id = self
+                .send_persisted(
+                    override_host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    message_id,
+                    rate_deadline,
+                )
+                .await?;
+            return Ok(DeliveryMode::Persisted { message_id: msg_id });
+        };
 
         // Encrypt (unless skip_encryption) and resolve message ID for the WebSocket path
         let encrypted = if skip_encryption {
@@ -896,79 +1126,139 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
             .await?
         };
 
-        let room_id = format!("{recipient}-{message_box}");
-        let ack_key = format!("sendMessageAck-{room_id}");
+        // The relay lowercases the HTTP recipient but compares the WS room key
+        // with the recipient exactly, and rooms are joined lowercase. Send both
+        // lowercase so a mixed-case key reaches the recipient's room.
+        let recipient_key = recipient.trim().to_ascii_lowercase();
+        let data = WsSendMessageData {
+            room_id: format!("{recipient_key}-{message_box}"),
+            message: WsSendMessagePayload {
+                message_id: message_id.clone(),
+                recipient: recipient_key,
+                body: encrypted,
+            },
+        };
 
-        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<bool>();
+        // A live send spends the same relay budget as HTTP, and a refusal on
+        // the socket fails every pending live send, so wait out a known hold
+        // on the socket's relay.
+        self.http
+            .wait_for_rate_limit(&socket_host, rate_deadline)
+            .await?;
 
-        let payload = serde_json::json!({
-            "roomId": room_id,
-            "message": {
-                "messageId": message_id,
-                "recipient": recipient,
-                "body": encrypted
-            }
-        });
-
-        // Emit — acquire lock briefly then release before awaiting ack
-        {
+        // Emit — hold the lock only for the emit, not while awaiting the answer.
+        let emitted = {
             let guard = self.ws_state.lock().await;
-            if let Some(ref ws) = *guard {
-                ws.emit_send_message(payload, ack_key.clone(), ack_tx)
-                    .await?;
+            match *guard {
+                Some(ref ws) => ws.emit_send_message(&data).await,
+                None => Err(MessageBoxError::WebSocket("not connected".to_string())),
             }
-        }
+        };
+        let outcome = match emitted {
+            Ok(ack) => ack.wait(LIVE_ACK_TIMEOUT).await,
+            Err(e) => Err(e),
+        };
+        self.finish_live_send(
+            outcome,
+            &socket_host,
+            override_host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+            rate_deadline,
+        )
+        .await
+    }
 
-        // Await ack with 10-second timeout.
-        // Live: server acked via WS within the window → DeliveryMode::Live.
-        // Anything else (timeout, channel error, ack=false): fall back to HTTP
-        // and return DeliveryMode::Persisted.
-        match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
-            Ok(Ok(true)) => Ok(DeliveryMode::Live { message_id }),
-            _ => {
-                // Clean up the pending ack to prevent channel leaks (Pitfall 7)
-                let guard = self.ws_state.lock().await;
-                if let Some(ref ws) = *guard {
-                    ws.remove_pending_ack(&ack_key).await;
-                }
-                drop(guard);
-                tracing::debug!(
-                    "send_live_message: WS ack timed out or failed; falling back to HTTP"
-                );
-                // Fall back to HTTP — pass through all feature params.
-                // The HTTP path generates a fresh message ID; use that for the Persisted ID.
-                let http_id = match override_host {
-                    Some(host) => {
-                        self.send_message_to_host(
-                            host,
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            None,
-                            None,
-                        )
-                        .await?
-                    }
-                    None => {
-                        self.send_message(
-                            recipient,
-                            message_box,
-                            body,
-                            skip_encryption,
-                            check_permissions,
-                            None,
-                            None,
-                        )
-                        .await?
-                    }
-                };
-                Ok(DeliveryMode::Persisted {
-                    message_id: http_id,
-                })
-            }
+    /// Turn the relay's answer to a live send into the delivery result.
+    ///
+    /// Accepted: [`DeliveryMode::Live`]. Anything else (refused, no answer in
+    /// time, emit failed): send over HTTP with the SAME id already emitted
+    /// over the WebSocket. The live push may have reached the receiver even
+    /// though its answer was lost, and receivers dedup by message id, so a
+    /// fresh id would arrive as a second logical message. The relay is not
+    /// exactly-once: it collapses a resend only while the first row still
+    /// exists (INSERT IGNORE), and an ack deletes that row.
+    ///
+    /// A rate-limit refusal holds `socket_host`, the relay the socket is open
+    /// to. The HTTP send waits on the rate limit only until `rate_deadline`,
+    /// the live send's own deadline.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn finish_live_send(
+        &self,
+        outcome: Result<(), MessageBoxError>,
+        socket_host: &str,
+        override_host: Option<&str>,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: String,
+        rate_deadline: tokio::time::Instant,
+    ) -> Result<DeliveryMode, MessageBoxError> {
+        if let Err(reason) = outcome {
+            tracing::debug!(%reason, %message_id, "live send not accepted; sending over HTTP");
+            // A rate-limit refusal holds the socket's relay, so an HTTP send
+            // below to that relay waits it out instead of being refused too.
+            self.http.hold_for_rate_limit(socket_host, &reason);
+            let http_id = self
+                .send_persisted(
+                    override_host,
+                    recipient,
+                    message_box,
+                    body,
+                    skip_encryption,
+                    check_permissions,
+                    Some(&message_id),
+                    rate_deadline,
+                )
+                .await?;
+            return Ok(DeliveryMode::Persisted {
+                message_id: http_id,
+            });
         }
+        Ok(DeliveryMode::Live { message_id })
+    }
+
+    /// The HTTP send behind every live-send fallback: to `override_host` when
+    /// given, else to the recipient's overlay-resolved host (as
+    /// [`send_message`](Self::send_message) does). Its rate-limit waits end by
+    /// `rate_deadline`.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_persisted(
+        &self,
+        override_host: Option<&str>,
+        recipient: &str,
+        message_box: &str,
+        body: &str,
+        skip_encryption: bool,
+        check_permissions: bool,
+        message_id: Option<&str>,
+        rate_deadline: tokio::time::Instant,
+    ) -> Result<String, MessageBoxError> {
+        let host = match override_host {
+            Some(host) => host.to_string(),
+            None => {
+                self.assert_initialized(None).await?;
+                self.resolve_host_for_recipient(recipient).await?
+            }
+        };
+        self.send_message_to_host_until(
+            &host,
+            recipient,
+            message_box,
+            body,
+            skip_encryption,
+            check_permissions,
+            message_id,
+            None,
+            rate_deadline,
+        )
+        .await
     }
 
     /// Leave a Socket.IO room and remove its subscription.
@@ -976,13 +1266,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// Mirrors TS `leaveRoom(messageBox)`. Constructs the room ID as
     /// `{identityKey}-{messageBox}` and emits `leaveRoom` to the server.
     /// No-op if the WebSocket is not connected.
-    /// `override_host` is reserved for future multi-host WS routing.
+    /// `override_host` is reserved for future multi-host WS routing; a pinned
+    /// client refuses another host, as everywhere else.
     pub async fn leave_room(
         &self,
         message_box: &str,
         override_host: Option<&str>,
     ) -> Result<(), MessageBoxError> {
-        let _ = override_host;
+        self.relay_host(override_host)?;
         let identity_key = self.get_identity_key().await?;
         let room_id = format!("{identity_key}-{message_box}");
         // Tear down LOCAL subscription state FIRST and UNCONDITIONALLY, before the
@@ -1022,22 +1313,10 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     // Internal HTTP helpers
     // -----------------------------------------------------------------------
 
-    /// GET `url` using BRC-31 authenticated transport.
-    ///
-    /// Mirrors `post_json` but sends no body and no content-type header.
-    /// The caller is responsible for building the full URL including query string.
-    pub(crate) async fn get_json(&self, url: &str) -> Result<AuthFetchResponse, MessageBoxError> {
-        let response = self
-            .auth_fetch
-            .fetch(url, "GET", None, None)
-            .await
-            .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
-
-        if response.status < 200 || response.status >= 300 {
-            return Err(MessageBoxError::Http(response.status, url.to_string()));
-        }
-
-        Ok(response)
+    /// GET `url` using BRC-31 authenticated transport. A non-2xx status is an
+    /// error. The caller builds the full URL including query string.
+    pub(crate) async fn get_json(&self, url: &str) -> Result<RelayResponse, MessageBoxError> {
+        self.http.fetch_ok(url, "GET", None).await
     }
 }
 
@@ -1045,11 +1324,9 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
 // Delivery callback wrappers
 // ---------------------------------------------------------------------------
 
-/// Maximum consecutive poll-backstop skips before a poll is forced regardless of
-/// WS activity. At the 2 s interval this caps the catch-up window at ~16 s, so a
-/// chatty room that keeps WS *activity* alive can never permanently suppress the
-/// backstop even if *individual* pushes are being lost.
-const MAX_POLL_SKIPS: u32 = 7;
+/// How long a live send waits for the relay to accept or refuse it before
+/// it falls back to HTTP.
+const LIVE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wrap a subscriber callback so each `message_id` is delivered **at most once**,
 /// no matter which path produced it: the WS primary dispatcher, the WS `on_any`
@@ -1079,36 +1356,112 @@ fn exactly_once(
     })
 }
 
-/// Wrap a callback so every invocation first bumps `activity`. Installed only on
-/// the WebSocket delivery path, so the HTTP poll backstop can tell when live
-/// push is healthy and stand down (see the poll loop in
-/// [`MessageBoxClient::listen_for_live_messages`]).
-fn record_ws_activity(
-    inner: Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync>,
-    activity: Arc<std::sync::atomic::AtomicU64>,
-) -> Arc<dyn Fn(AuthenticatedPeerMessage) + Send + Sync> {
-    Arc::new(move |msg: AuthenticatedPeerMessage| {
-        activity.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        inner(msg);
-    })
+/// How often the poll backstop wakes to decide whether to list.
+const POLL_TICK: Duration = Duration::from_secs(1);
+/// Default for [`MessageBoxClient::with_poll_interval`].
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// The shortest interval [`MessageBoxClient::with_poll_interval`] takes.
+const POLL_INTERVAL_MIN: Duration = Duration::from_secs(1);
+/// Without a connected WebSocket the poll lists after `POLL_OFFLINE_MIN`,
+/// doubling up to `POLL_OFFLINE_MAX`.
+const POLL_OFFLINE_MIN: Duration = Duration::from_secs(1);
+const POLL_OFFLINE_MAX: Duration = Duration::from_secs(8);
+/// After a failed list the poll waits `POLL_ERROR_MIN`, doubling up to
+/// `POLL_ERROR_MAX`, on top of its usual cadence; after an oversize list,
+/// `POLL_ERROR_MAX` at once.
+const POLL_ERROR_MIN: Duration = Duration::from_secs(2);
+const POLL_ERROR_MAX: Duration = Duration::from_secs(60);
+
+/// When the poll backstop lists next.
+///
+/// Every list costs the relay rate budget that sends also spend (10 a
+/// minute for an uncertified key), so the poll lists only:
+/// - first thing, and once after every WebSocket connect or reconnect, to
+///   catch up on what arrived while the socket was down;
+/// - while the socket is connected, `live_interval` after the last list;
+/// - with no connected socket, `POLL_OFFLINE_MIN` after the last list,
+///   doubling to `POLL_OFFLINE_MAX`;
+/// - never before a rate-limit refusal's `retry_after` has passed, before a
+///   growing back-off after a failed list, or within 60 s of an oversize
+///   list, connected or not.
+struct PollCadence {
+    live_interval: Duration,
+    /// The connection count at the last catch-up.
+    connections: u64,
+    last_list: Option<tokio::time::Instant>,
+    /// Lists in a row made with no connected socket.
+    offline_streak: u32,
+    error_wait: Option<Duration>,
+    not_before: Option<tokio::time::Instant>,
 }
 
-/// Decide whether the poll backstop should run this interval, given the current
-/// WS-activity counter vs the value at the last check.
-///
-/// Skips (returns `false`) while WS push is delivering — *unless* `MAX_POLL_SKIPS`
-/// consecutive skips have accrued, in which case it forces a poll so partial push
-/// loss on an otherwise-active connection can't permanently suppress catch-up.
-/// Updates `last_activity` and `skipped` in place.
-fn poll_should_run(current_activity: u64, last_activity: &mut u64, skipped: &mut u32) -> bool {
-    if current_activity != *last_activity && *skipped < MAX_POLL_SKIPS {
-        *last_activity = current_activity;
-        *skipped += 1;
-        return false; // WS push is healthy this interval — stand down
+impl PollCadence {
+    fn new(live_interval: Duration, connections: u64) -> Self {
+        Self {
+            live_interval,
+            connections,
+            last_list: None,
+            offline_streak: 0,
+            error_wait: None,
+            not_before: None,
+        }
     }
-    *last_activity = current_activity;
-    *skipped = 0;
-    true
+
+    /// Whether to list now. `live` is the connection count while the
+    /// WebSocket is connected, `None` while it is not.
+    fn due(&mut self, now: tokio::time::Instant, live: Option<u64>) -> bool {
+        if self.not_before.is_some_and(|t| now < t) {
+            return false;
+        }
+        let Some(last) = self.last_list else {
+            return true;
+        };
+        match live {
+            Some(connections) if connections != self.connections => {
+                self.connections = connections;
+                true
+            }
+            Some(_) => now >= last + self.live_interval,
+            None => now >= last + self.offline_wait(),
+        }
+    }
+
+    /// The wait before the next list with no connected socket: 1 s after a
+    /// connected list (or the first), then doubling up to `POLL_OFFLINE_MAX`.
+    fn offline_wait(&self) -> Duration {
+        let doublings = self.offline_streak.saturating_sub(1).min(31);
+        POLL_OFFLINE_MIN
+            .saturating_mul(1 << doublings)
+            .min(POLL_OFFLINE_MAX)
+    }
+
+    /// Record a list made at `now` while the socket was `live`, and how it
+    /// failed, if it did.
+    fn listed(&mut self, now: tokio::time::Instant, live: bool, failure: Option<&MessageBoxError>) {
+        self.last_list = Some(now);
+        self.offline_streak = if live {
+            0
+        } else {
+            self.offline_streak.saturating_add(1)
+        };
+        self.not_before = match failure {
+            None => {
+                self.error_wait = None;
+                None
+            }
+            Some(MessageBoxError::RateLimited { retry_after, .. }) => Some(now + *retry_after),
+            // The box is over the list bound and stays so until messages are
+            // acknowledged; a reconnect does not shorten the wait.
+            Some(MessageBoxError::Validation(_)) => Some(now + POLL_ERROR_MAX),
+            Some(_) => {
+                let wait = self
+                    .error_wait
+                    .map_or(POLL_ERROR_MIN, |w| (w * 2).min(POLL_ERROR_MAX));
+                self.error_wait = Some(wait);
+                Some(now + wait)
+            }
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,7 +1535,7 @@ impl BoundedIdSet {
 /// authenticated-decrypt provenance), or an empty vec on error.
 /// `accept_payments` is always false — the polling path does not handle delivery fees.
 async fn poll_list_messages<W>(
-    auth_fetch: &Arc<AuthFetch<W>>,
+    http: &RelayHttp,
     host: &str,
     message_box: &str,
     identity_key: &str,
@@ -1197,17 +1550,9 @@ where
     };
     let body_bytes = serde_json::to_vec(&params)?;
     let url = format!("{host}/listMessages");
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "application/json".to_string());
-
-    let response = auth_fetch
-        .fetch(&url, "POST", Some(body_bytes), Some(headers))
-        .await
-        .map_err(|e| MessageBoxError::Auth(e.to_string()))?;
-
-    if response.status < 200 || response.status >= 300 {
-        return Err(MessageBoxError::Http(response.status, url));
-    }
+    let response = http
+        .fetch_budgeted(host, &url, body_bytes, http.rate_limit_deadline())
+        .await?;
 
     // Apply the same pre-deserialization page cap and single-pass success parser
     // as the public full/lite list paths.
@@ -1256,40 +1601,6 @@ fn extract_plain_body(body: &str) -> String {
     body.to_string()
 }
 
-/// Detect the relay's *duplicate-message* rejection in a response body.
-///
-/// The MessageBox relay rejects a re-send of an already-stored `messageId` with
-/// HTTP 400 and body `{"status":"error","code":"ERR_DUPLICATE_MESSAGE",
-/// "description":"Duplicate message."}` (see
-/// `rust-messagebox-server/src/handlers/send_message.rs` — `error_response(
-/// BAD_REQUEST, "ERR_DUPLICATE_MESSAGE", "Duplicate message.")`).
-///
-/// Because `generate_message_id` is a deterministic HMAC over
-/// `(body, recipient, originator)`, two concurrent sends of the *same logical
-/// message* derive the *same* `messageId`: one wins the insert, the other gets
-/// this rejection. A duplicate rejection therefore means the message was
-/// **already delivered** — it is idempotent-delivery success, NOT a failure.
-///
-/// We match on the precise `code == "ERR_DUPLICATE_MESSAGE"` signal (not a
-/// blanket "ignore all 400s"), so genuine auth / validation rejections
-/// (`ERR_INVALID_RECIPIENT_KEY`, `ERR_MESSAGE_REQUIRED`, BRC-31 auth failures,
-/// …) still surface as errors.
-///
-/// Note: NOT a TS-parity behaviour. `@bsv/message-box-client` (v2.0.6) treats
-/// any non-`success` send response as a thrown error and has no idempotent
-/// duplicate handling; this is a deliberate Rust-side correctness improvement
-/// for concurrent presign sends that collide on the deterministic messageId.
-pub(crate) fn is_duplicate_message_rejection(body: &[u8]) -> bool {
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-        if v.get("status").and_then(|s| s.as_str()) == Some("error")
-            && v.get("code").and_then(|c| c.as_str()) == Some("ERR_DUPLICATE_MESSAGE")
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// Check if a successful (2xx) HTTP response body contains a server-level
 /// error indicator (`{"status": "error", "description": "..."}`).
 ///
@@ -1316,6 +1627,9 @@ pub(crate) fn check_status_error(body: &[u8]) -> Result<(), MessageBoxError> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod ws_loopback_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bsv::primitives::private_key::PrivateKey;
@@ -1331,12 +1645,49 @@ mod tests {
     /// KeyDeriver.  Wrapping in Arc satisfies the Clone bound while sharing
     /// the same underlying wallet across the clone and the AuthFetch instance.
     #[derive(Clone)]
-    struct ArcWallet(Arc<ProtoWallet>);
+    pub(super) struct ArcWallet(
+        Arc<ProtoWallet>,
+        Option<Arc<CertificateProbe>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
+
+    /// One certificate the wallet lists, and a count of the proofs asked of
+    /// it. A proof is counted, then refused.
+    pub(super) struct CertificateProbe {
+        certificate: Certificate,
+        pub(super) proofs: std::sync::atomic::AtomicUsize,
+    }
 
     impl ArcWallet {
         fn new() -> Self {
             let key = PrivateKey::from_random().expect("random key");
-            ArcWallet(Arc::new(ProtoWallet::new(key)))
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None, Arc::default())
+        }
+
+        /// A wallet for a fixed private key (64 hex characters).
+        pub(super) fn from_key_hex(key_hex: &str) -> Self {
+            let key = PrivateKey::from_hex(key_hex).expect("private key hex");
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None, Arc::default())
+        }
+
+        /// How many signatures this wallet (or a clone) has made.
+        pub(super) fn signatures(&self) -> usize {
+            self.2.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// A wallet for a fixed key that holds `certificate` and counts the
+        /// proofs asked of it.
+        pub(super) fn holding(
+            key_hex: &str,
+            certificate: Certificate,
+        ) -> (Self, Arc<CertificateProbe>) {
+            let probe = Arc::new(CertificateProbe {
+                certificate,
+                proofs: Default::default(),
+            });
+            let mut wallet = Self::from_key_hex(key_hex);
+            wallet.1 = Some(probe.clone());
+            (wallet, probe)
         }
     }
 
@@ -1446,6 +1797,7 @@ mod tests {
             args: CreateSignatureArgs,
             orig: Option<&str>,
         ) -> Result<CreateSignatureResult, WalletError> {
+            self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.0.create_signature(args, orig).await
         }
         async fn verify_signature(
@@ -1467,13 +1819,28 @@ mod tests {
             args: ListCertificatesArgs,
             orig: Option<&str>,
         ) -> Result<ListCertificatesResult, WalletError> {
-            self.0.list_certificates(args, orig).await
+            match &self.1 {
+                Some(probe) => Ok(ListCertificatesResult {
+                    total_certificates: 1,
+                    certificates: vec![CertificateResult {
+                        certificate: probe.certificate.clone(),
+                        keyring: None,
+                        verifier: None,
+                    }],
+                }),
+                None => self.0.list_certificates(args, orig).await,
+            }
         }
         async fn prove_certificate(
             &self,
             args: ProveCertificateArgs,
             orig: Option<&str>,
         ) -> Result<ProveCertificateResult, WalletError> {
+            if let Some(probe) = &self.1 {
+                probe
+                    .proofs
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             self.0.prove_certificate(args, orig).await
         }
         async fn relinquish_certificate(
@@ -1687,51 +2054,6 @@ mod tests {
         assert_eq!(err.to_string(), "auth error: permission denied");
     }
 
-    /// `is_duplicate_message_rejection` matches the relay's precise duplicate signal.
-    #[test]
-    fn is_duplicate_message_rejection_matches_exact_code() {
-        use super::is_duplicate_message_rejection;
-        // The exact body the relay returns (HTTP 400) for a duplicate messageId.
-        let dup = br#"{"status":"error","code":"ERR_DUPLICATE_MESSAGE","description":"Duplicate message."}"#;
-        assert!(
-            is_duplicate_message_rejection(dup),
-            "must match ERR_DUPLICATE_MESSAGE"
-        );
-    }
-
-    /// Genuine validation / auth errors must NOT be treated as duplicates.
-    #[test]
-    fn is_duplicate_message_rejection_rejects_other_errors() {
-        use super::is_duplicate_message_rejection;
-        let invalid =
-            br#"{"status":"error","code":"ERR_INVALID_RECIPIENT_KEY","description":"bad key"}"#;
-        let missing =
-            br#"{"status":"error","code":"ERR_MESSAGE_REQUIRED","description":"no body"}"#;
-        // An error body with no `code` field (e.g. a raw BRC-31 auth failure).
-        let no_code = br#"{"status":"error","description":"permission denied"}"#;
-        let success = br#"{"status":"success","messageId":"abc"}"#;
-        assert!(
-            !is_duplicate_message_rejection(invalid),
-            "ERR_INVALID_RECIPIENT_KEY is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(missing),
-            "ERR_MESSAGE_REQUIRED is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(no_code),
-            "no-code error is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(success),
-            "success is not a duplicate"
-        );
-        assert!(
-            !is_duplicate_message_rejection(b"not json"),
-            "malformed body is not a duplicate"
-        );
-    }
-
     /// `get_identity_key` returns the same value on a second call (OnceCell cache).
     #[tokio::test]
     async fn get_identity_key_caches_result() {
@@ -1840,71 +2162,70 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2, "m1 once + m2 once");
     }
 
+    /// While the socket is connected the poll lists first thing, then once
+    /// per reconnect, and otherwise only every `live_interval`, which is
+    /// never under 1 s.
     #[test]
-    fn record_ws_activity_bumps_counter_and_forwards() {
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-        let activity = Arc::new(AtomicU64::new(0));
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
-            Arc::new(move |_m| {
-                c.fetch_add(1, Ordering::SeqCst);
-            });
-        let wrapped = super::record_ws_activity(inner, activity.clone());
+    fn a_connected_poll_lists_on_each_connect_then_every_interval() {
+        let s = std::time::Duration::from_secs;
+        let t0 = tokio::time::Instant::now();
+        let mut cadence = super::PollCadence::new(s(15), 1);
 
-        wrapped(peer_msg("m1"));
-        wrapped(peer_msg("m2"));
+        assert!(cadence.due(t0, Some(1)), "first thing");
+        cadence.listed(t0, true, None);
+        assert!(!cadence.due(t0 + s(14), Some(1)));
+        assert!(cadence.due(t0 + s(15), Some(1)), "the safety net");
+        cadence.listed(t0 + s(15), true, None);
+        assert!(cadence.due(t0 + s(16), Some(2)), "a reconnect catches up");
+        cadence.listed(t0 + s(16), true, None);
+        assert!(!cadence.due(t0 + s(17), Some(2)), "once per reconnect");
 
-        assert_eq!(
-            activity.load(Ordering::Relaxed),
-            2,
-            "counter bumped per delivery"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            2,
-            "inner callback forwarded each time"
-        );
+        // An interval set to zero lists at most once a second.
+        let client = MessageBoxClient::new(
+            "https://example.com".to_string(),
+            ArcWallet::new(),
+            None,
+            Network::Local,
+        )
+        .with_poll_interval(std::time::Duration::ZERO);
+        let mut cadence = super::PollCadence::new(client.poll_interval, 1);
+        cadence.listed(t0, true, None);
+        assert!(!cadence.due(t0 + std::time::Duration::from_millis(999), Some(1)));
+        assert!(cadence.due(t0 + s(1), Some(1)));
     }
 
+    /// Without a socket the poll backs off 1 s doubling to 8 s; it waits out
+    /// a rate-limit refusal. One oversize list holds it 60 s, through a
+    /// reconnect.
     #[test]
-    fn poll_should_run_runs_when_ws_quiet() {
-        // current == last → WS delivered nothing this interval → poll runs.
-        let mut last = 5u64;
-        let mut skipped = 0u32;
-        assert!(super::poll_should_run(5, &mut last, &mut skipped));
-        assert_eq!(skipped, 0);
-    }
-
-    #[test]
-    fn poll_should_run_stands_down_when_ws_active() {
-        // current != last → WS delivered → stand down (within the skip budget).
-        let mut last = 5u64;
-        let mut skipped = 0u32;
-        assert!(!super::poll_should_run(6, &mut last, &mut skipped));
-        assert_eq!(last, 6, "last_activity advances to current");
-        assert_eq!(skipped, 1);
-    }
-
-    #[test]
-    fn poll_should_run_forces_catch_up_after_max_skips() {
-        // A perpetually-active connection must still be polled at least every
-        // MAX_POLL_SKIPS intervals so partial push loss can't suppress catch-up.
-        let mut last = 0u64;
-        let mut skipped = 0u32;
-        let mut runs = 0u32;
-        for tick in 1..=(super::MAX_POLL_SKIPS as u64 * 3) {
-            // WS "delivers" every interval → counter always changes.
-            if super::poll_should_run(tick, &mut last, &mut skipped) {
-                runs += 1;
-            }
+    fn a_poll_backs_off_offline_after_refusals_and_after_failures() {
+        let s = std::time::Duration::from_secs;
+        let just_before = |t: tokio::time::Instant| t - std::time::Duration::from_millis(1);
+        let mut t = tokio::time::Instant::now();
+        let mut cadence = super::PollCadence::new(s(15), 0);
+        assert!(cadence.due(t, None));
+        cadence.listed(t, false, None);
+        for wait in [1, 2, 4, 8, 8] {
+            assert!(!cadence.due(just_before(t + s(wait)), None), "{wait}s");
+            t += s(wait);
+            assert!(cadence.due(t, None), "{wait}s");
+            cadence.listed(t, false, None);
         }
-        // Over 3*MAX_POLL_SKIPS always-active intervals, the forced poll fires
-        // roughly every (MAX_POLL_SKIPS+1) intervals — at least twice.
-        assert!(
-            runs >= 2,
-            "forced catch-up must fire periodically, got {runs}"
-        );
+
+        let refused = MessageBoxError::RateLimited {
+            retry_after: s(30),
+            tier: None,
+        };
+        cadence.listed(t, false, Some(&refused));
+        assert!(!cadence.due(just_before(t + s(30)), None));
+        t += s(30);
+        assert!(cadence.due(t, None));
+
+        let too_big = MessageBoxError::Validation("listMessages response too large".into());
+        cadence.listed(t, true, Some(&too_big));
+        assert!(!cadence.due(just_before(t + s(60)), Some(0)));
+        assert!(!cadence.due(just_before(t + s(60)), Some(1)), "a reconnect");
+        assert!(cadence.due(t + s(60), Some(1)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1937,36 +2258,48 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 100);
     }
 
-    #[test]
-    fn exactly_once_composes_with_record_ws_activity() {
-        // Mirrors the wiring in listen_for_live_messages: the WS path stamps
-        // activity then delivers through the shared dedup; the poll path shares
-        // the same dedup. A message delivered by WS must not be re-delivered by
-        // a later poll of the same id.
-        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-        let activity = Arc::new(AtomicU64::new(0));
-        let count = Arc::new(AtomicUsize::new(0));
-        let c = count.clone();
-        let inner: Arc<dyn Fn(crate::types::AuthenticatedPeerMessage) + Send + Sync> =
-            Arc::new(move |_m| {
-                c.fetch_add(1, Ordering::SeqCst);
-            });
-        let deduped = super::exactly_once(inner);
-        let ws_path = super::record_ws_activity(deduped.clone(), activity.clone());
-        let poll_path = deduped;
+    /// A pinned client advertises only its own host: `init` or `anoint_host`
+    /// naming another host is refused before the advertisement is built or
+    /// signed. Its own
+    /// host spelled another way is its own host.
+    #[tokio::test]
+    async fn a_pinned_client_advertises_no_other_host() {
+        use crate::transport::scripted::RELAY_KEY;
+        let wallet = ArcWallet::new();
+        let pinned = MessageBoxClient::new(
+            "https://relay.example".to_string(),
+            wallet.clone(),
+            None,
+            Network::Mainnet,
+        )
+        .with_expected_relay_key(RELAY_KEY);
 
-        ws_path(peer_msg("m1")); // delivered via WS, stamps activity
-        poll_path(peer_msg("m1")); // poll re-sees the same id → suppressed
+        let err = pinned
+            .init(Some("https://other.example"))
+            .await
+            .expect_err("another host");
+        assert!(
+            matches!(&err, MessageBoxError::RelayHostRefused { requested, .. } if requested == "https://other.example"),
+            "{err:?}"
+        );
+        assert_eq!(wallet.signatures(), 0, "no advertisement was signed");
+        assert!(pinned.init_once.get().is_none());
 
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "delivered exactly once across paths"
+        let err = pinned
+            .anoint_host("https://other.example")
+            .await
+            .expect_err("another host");
+        assert!(
+            matches!(&err, MessageBoxError::RelayHostRefused { .. }),
+            "{err:?}"
         );
-        assert_eq!(
-            activity.load(Ordering::Relaxed),
-            1,
-            "only the WS path stamps activity"
-        );
+        assert_eq!(wallet.signatures(), 0, "no advertisement was signed");
+
+        // ProtoWallet cannot create the action, which init reports and skips.
+        pinned
+            .init(Some("HTTPS://Relay.Example:443"))
+            .await
+            .expect("the pinned host");
+        assert!(wallet.signatures() > 0, "the advertisement was signed");
     }
 }

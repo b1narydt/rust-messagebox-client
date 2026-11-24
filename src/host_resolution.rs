@@ -245,10 +245,17 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     /// first matching host. Falls back to `self.host` when:
     /// - No advertisements exist for the recipient, or
     /// - The overlay is unreachable (query_advertisements always returns Ok)
+    ///
+    /// A client pinned with
+    /// [`with_expected_relay_key`](Self::with_expected_relay_key) returns its
+    /// own host without asking the overlay.
     pub async fn resolve_host_for_recipient(
         &self,
         recipient: &str,
     ) -> Result<String, MessageBoxError> {
+        if self.expected_relay_key().is_some() {
+            return Ok(self.host().to_string());
+        }
         let ads = self.query_advertisements(Some(recipient), None).await?;
         if let Some(ad) = ads.into_iter().next() {
             Ok(ad.host)
@@ -265,7 +272,12 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///
     /// Returns the txid of the broadcast transaction, matching TS `anointHost`
     /// which returns `{ txid }`.
+    ///
+    /// A pinned client advertises only its own host: another host returns
+    /// [`MessageBoxError::RelayHostRefused`] before anything is built or
+    /// signed.
     pub async fn anoint_host(&self, host: &str) -> Result<String, MessageBoxError> {
+        let host = self.relay_host(Some(host))?;
         let identity_key = self.get_identity_key().await?;
 
         // fields[0] = raw identity key bytes (hex-decoded per Pitfall 3)
@@ -384,9 +396,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         platform: Option<&str>,
         override_host: Option<&str>,
     ) -> Result<RegisterDeviceResponse, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         let request = RegisterDeviceRequest {
             fcm_token: fcm_token.to_string(),
             device_id: device_id.map(String::from),
@@ -416,9 +426,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         &self,
         override_host: Option<&str>,
     ) -> Result<Vec<RegisteredDevice>, MessageBoxError> {
-        self.assert_initialized().await?;
-
-        let base = override_host.unwrap_or_else(|| self.host());
+        let base = self.assert_initialized(override_host).await?;
         let url = format!("{base}/devices");
         let response = self.get_json(&url).await?;
 

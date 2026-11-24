@@ -381,8 +381,10 @@ impl RelayHttp {
     ///
     /// With a pin, a request to a URL off the pinned host is refused with
     /// [`MessageBoxError::RelayHostRefused`] before it is sent, and a response
-    /// from a server that proves another key is an error before its status or
-    /// body is looked at (that request has already reached the server).
+    /// from a server that proves another key, or none, is an error before its
+    /// status or body is looked at. (The pinned transport, `PinnedFetch`,
+    /// already refuses to sign a request for a server that proved another
+    /// key, so such a request is never sent.)
     pub(crate) async fn fetch_raw(
         &self,
         url: &str,

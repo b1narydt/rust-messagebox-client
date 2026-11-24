@@ -222,14 +222,17 @@ own host and to the relay there that proves `key`:
   `override_host`, or a `_from_host` / `_to_host` method) returns
   `RelayHostRefused` before any request. Hosts compare by scheme, host, port
   and path, ignoring case, a default port and a trailing slash.
-- Every HTTP answer must come from a server that proved `key` in the BRC-103
-  handshake, else `RelayIdentityMismatch`; a server that proved no key fails
-  too. The request has already reached that server.
+- Over HTTP and the WebSocket, the wallet signs a message only for a server
+  that proved `key` in the BRC-103 handshake. A server that proved another
+  key gets the handshake and nothing after it: the request is never signed,
+  so never sent, and the call returns `RelayIdentityMismatch`.
+- Every HTTP answer must also come from a server that proved `key`, else
+  `RelayIdentityMismatch`; a server that proved no key fails too.
 - Every WebSocket connect and reconnect is checked the same way and
   disconnects on a mismatch. A live send then returns the error and sends
   nothing over HTTP.
 - In either handshake the client proves certificates only to a server that
-  proved `key`, and never pays a `402` answer.
+  proved `key`, never pays a `402` answer, and reveals no key linkage.
 
 Without a pin the client trusts whichever relay answers the host.
 

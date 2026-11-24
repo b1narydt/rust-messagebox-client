@@ -56,8 +56,10 @@ behaviour" section describes the result.
   client talks only to its own host: it skips overlay host lookup and the
   multi-host list and ack fan-out, and refuses any other named host with the
   new `MessageBoxError::RelayHostRefused { pinned, requested }` before any
-  request. Its handshakes prove certificates only to the pinned key and never
-  pay a `402`.
+  request. Its HTTP and WebSocket channels sign a request only for a server
+  that proved the pinned key, so a request is never sent to one that proved
+  another; they prove certificates only to the pinned key, never pay a `402`,
+  and reveal no key linkage.
 - `MessageBoxClient::with_certificate_provider`,
   `MessageBoxWebSocket::connect_with_certificate_provider`, and the
   `websocket::CertificateProvider` re-export: answer the relay's certificate

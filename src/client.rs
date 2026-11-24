@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, OnceCell};
 
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
-use crate::pinned_wallet::PinnedWallet;
+use crate::pinned_wallet::{PinnedFetch, PinnedWallet};
 use crate::transport::{RelayHttp, RelayResponse};
 use crate::types::{
     AuthenticatedPeerMessage, ListMessagesParams, WsSendMessageData, WsSendMessagePayload,
@@ -50,9 +50,9 @@ where
     /// provider when one is configured.
     ///
     /// With a relay identity pin the handshake runs on a [`PinnedWallet`] and
-    /// a guarded provider, so no certificate is proved to a server that
-    /// proved another key, and such a server, or one that proves a different
-    /// key after the handshake, ends the connect with
+    /// a guarded provider, so nothing is signed for, and no certificate is
+    /// proved to, a server that proved another key. Such a server, or one
+    /// that proves a different key after the handshake, ends the connect with
     /// [`MessageBoxError::RelayIdentityMismatch`].
     async fn connect(&self) -> Result<crate::websocket::MessageBoxWebSocket, MessageBoxError> {
         use crate::websocket::MessageBoxWebSocket;
@@ -249,18 +249,21 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     ///   [`MessageBoxError::RelayHostRefused`] before any request; hosts are
     ///   compared by scheme, host, port and path, ignoring case, a default
     ///   port and a trailing slash;
-    /// - every HTTP response must come from a server that proved this key in
-    ///   the BRC-103 handshake, or it is refused with
-    ///   [`MessageBoxError::RelayIdentityMismatch`] before its body is used.
-    ///   The request has still reached that server;
+    /// - the HTTP and WebSocket auth channels run on a wallet that signs a
+    ///   message only for a server that proved this key in the BRC-103
+    ///   handshake. A request to a server that proved another key is never
+    ///   signed, so never sent, and fails with
+    ///   [`MessageBoxError::RelayIdentityMismatch`];
+    /// - every HTTP response must also come from a server that proved this
+    ///   key, or it is refused with that error before its body is used;
     /// - every WebSocket connect and reconnect checks the key the server
     ///   proved, and on a mismatch disconnects and returns that error. A live
     ///   send then fails with it rather than falling back to HTTP;
     /// - during either handshake the client proves certificates (from the
     ///   wallet or the [certificate provider](Self::with_certificate_provider))
     ///   only to a server that proved this key, and never pays a `402`
-    ///   answer: the HTTP and WebSocket handshakes run on a wallet that
-    ///   refuses `create_action`.
+    ///   answer: that wallet refuses `create_action`, and both key-linkage
+    ///   reveals.
     ///
     /// Without a pin the client trusts whichever relay answers each host.
     pub fn with_expected_relay_key(mut self, identity_key: impl AsRef<str>) -> Self {
@@ -268,7 +271,7 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
         let auth_wallet = PinnedWallet::new(self.wallet.clone(), Some(key.clone()));
         self.http = self
             .http
-            .with_transport(Arc::new(AuthFetch::new(auth_wallet)))
+            .with_transport(Arc::new(PinnedFetch::new(auth_wallet)))
             .with_pin(key.clone(), self.host.clone());
         self.expected_relay_key = Some(key);
         self
@@ -1600,7 +1603,11 @@ mod tests {
     /// KeyDeriver.  Wrapping in Arc satisfies the Clone bound while sharing
     /// the same underlying wallet across the clone and the AuthFetch instance.
     #[derive(Clone)]
-    pub(super) struct ArcWallet(Arc<ProtoWallet>, Option<Arc<CertificateProbe>>);
+    pub(super) struct ArcWallet(
+        Arc<ProtoWallet>,
+        Option<Arc<CertificateProbe>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    );
 
     /// One certificate the wallet lists, and a count of the proofs asked of
     /// it. A proof is counted, then refused.
@@ -1612,13 +1619,18 @@ mod tests {
     impl ArcWallet {
         fn new() -> Self {
             let key = PrivateKey::from_random().expect("random key");
-            ArcWallet(Arc::new(ProtoWallet::new(key)), None)
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None, Arc::default())
         }
 
         /// A wallet for a fixed private key (64 hex characters).
         pub(super) fn from_key_hex(key_hex: &str) -> Self {
             let key = PrivateKey::from_hex(key_hex).expect("private key hex");
-            ArcWallet(Arc::new(ProtoWallet::new(key)), None)
+            ArcWallet(Arc::new(ProtoWallet::new(key)), None, Arc::default())
+        }
+
+        /// How many signatures this wallet (or a clone) has made.
+        pub(super) fn signatures(&self) -> usize {
+            self.2.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// A wallet for a fixed key that holds `certificate` and counts the
@@ -1743,6 +1755,7 @@ mod tests {
             args: CreateSignatureArgs,
             orig: Option<&str>,
         ) -> Result<CreateSignatureResult, WalletError> {
+            self.2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.0.create_signature(args, orig).await
         }
         async fn verify_signature(

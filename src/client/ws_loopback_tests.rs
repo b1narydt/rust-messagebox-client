@@ -662,9 +662,9 @@ impl Transport for Outbox {
 
 /// Serve the relay's HTTP handshake door, `/.well-known/auth`, proving
 /// `SERVER_KEY` and asking for `requested`, on a loopback port. Any other
-/// request gets an unauthenticated answer, so a client request fails once
-/// its handshake is done.
-async fn boot_http_handshake(requested: RequestedCertificateSet) -> String {
+/// request is counted and gets an unauthenticated answer, so a client request
+/// fails once its handshake is done. Returns the URL and that count.
+async fn boot_http_handshake(requested: RequestedCertificateSet) -> (String, Arc<AtomicUsize>) {
     let outbox = Arc::new(Outbox::default());
     let peer = Arc::new(Peer::new(
         ProtoWallet::new(PrivateKey::from_hex(SERVER_KEY).expect("server key")),
@@ -687,9 +687,14 @@ async fn boot_http_handshake(requested: RequestedCertificateSet) -> String {
             serde_json::to_string(&answer).expect("answer json")
         }
     };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
     let app = axum::Router::new()
         .route("/.well-known/auth", axum::routing::post(handshake))
-        .fallback(|| async { "not authenticated" });
+        .fallback(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async { "not authenticated" }
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -697,7 +702,7 @@ async fn boot_http_handshake(requested: RequestedCertificateSet) -> String {
     tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve");
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), requests)
 }
 
 /// The HTTP handshake (`AuthFetch`) of a client pinned to another key never
@@ -706,7 +711,7 @@ async fn boot_http_handshake(requested: RequestedCertificateSet) -> String {
 #[tokio::test]
 async fn a_pinned_http_handshake_proves_nothing_to_another_relay() {
     let server_key = identity_of(SERVER_KEY).await;
-    let url = boot_http_handshake(membership_request(server_key.clone())).await;
+    let (url, _) = boot_http_handshake(membership_request(server_key.clone())).await;
     let certificate = issue_membership(CLIENT_KEY, SERVER_KEY).await.certificate;
     let list = format!("{url}/listMessages");
 
@@ -725,6 +730,73 @@ async fn a_pinned_http_handshake_proves_nothing_to_another_relay() {
             "proofs asked with the pin on {pin}"
         );
     }
+}
+
+/// A client pinned to another key never sends a request to the relay that
+/// proves `SERVER_KEY`: its wallet signs nothing for that relay, so the send
+/// fails as a pin mismatch and the relay's handler never runs. Pinned to
+/// `SERVER_KEY`, the send reaches the handler.
+#[tokio::test]
+async fn a_pinned_send_never_reaches_a_relay_that_proves_another_key() {
+    let server_key = identity_of(SERVER_KEY).await;
+    let recipient = identity_of(OTHER_KEY).await;
+    let (url, requests) = boot_http_handshake(RequestedCertificateSet::default()).await;
+    let send = |pin: String| {
+        let (url, recipient) = (url.clone(), recipient.clone());
+        async move {
+            let pinned = client(&url).with_expected_relay_key(pin);
+            pinned.init_once.set(()).expect("skip the overlay");
+            within(pinned.send_message(&recipient, "inbox", "hi", true, false, Some("id"), None))
+                .await
+        }
+    };
+
+    match send(identity_of(OTHER_KEY).await).await {
+        Err(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
+            assert_eq!(observed.as_deref(), Some(server_key.as_str()));
+        }
+        other => panic!("expected RelayIdentityMismatch, got {other:?}"),
+    }
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        0,
+        "the request reached the relay"
+    );
+
+    let reached = send(server_key).await;
+    assert!(
+        reached.is_err(),
+        "the stand-in answers no request: {reached:?}"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+/// The WebSocket client signs each message for the server that proved its
+/// key, through the same wallet call. Pinned to another key, a client signs
+/// nothing for the relay that proves `SERVER_KEY`, not even the
+/// `authenticated` event that ends the handshake, and the connect fails as a
+/// pin mismatch. Pinned to `SERVER_KEY`, it signs.
+#[tokio::test]
+async fn a_pinned_ws_client_signs_nothing_for_another_relay() {
+    let relay = Relay::boot(AuthSocketServer::new()).await;
+    let server_key = identity_of(SERVER_KEY).await;
+
+    let wallet = ArcWallet::from_key_hex(CLIENT_KEY);
+    let pinned = MessageBoxClient::new(relay.url.clone(), wallet.clone(), None, Network::Local)
+        .with_expected_relay_key(identity_of(OTHER_KEY).await);
+    match within(pinned.join_room("inbox")).await {
+        Err(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
+            assert_eq!(observed.as_deref(), Some(server_key.as_str()));
+        }
+        other => panic!("expected RelayIdentityMismatch, got {other:?}"),
+    }
+    assert_eq!(wallet.signatures(), 0);
+
+    let wallet = ArcWallet::from_key_hex(CLIENT_KEY);
+    let pinned = MessageBoxClient::new(relay.url.clone(), wallet.clone(), None, Network::Local)
+        .with_expected_relay_key(&server_key);
+    within(pinned.join_room("inbox")).await.expect("join");
+    assert!(wallet.signatures() > 0);
 }
 
 /// One `membership` field of certificate type `[7; 32]` from `certifier`.

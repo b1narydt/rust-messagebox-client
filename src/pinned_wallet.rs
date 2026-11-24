@@ -1,26 +1,33 @@
 //! The wallet the relay auth channel signs with.
 //!
-//! `AuthFetch` and the WebSocket handshake act with the wallet before the
-//! client sees the relay's proven identity: they answer a certificate request
-//! by proving certificates to whichever server asked, and `AuthFetch` pays a
-//! `402` answer by creating a transaction. A relay identity pin is checked only
-//! on the answer, which is too late for either.
+//! `AuthFetch` and the WebSocket client act with the wallet before the client
+//! sees an answer: they sign each request for the server that proved its key
+//! in the handshake, answer a certificate request by proving certificates to
+//! that server, and `AuthFetch` pays a `402` answer by creating a transaction.
+//! A relay identity pin checked only on the answer is too late for all three.
 //!
 //! [`PinnedWallet`] is what those channels get instead of the caller's wallet.
-//! With a pin it refuses `create_action`, so the auth channel never pays, and
-//! refuses `prove_certificate` for any verifier but the pinned relay. Every
-//! other call goes to the caller's wallet unchanged. Without a pin it changes
-//! nothing. [`PinnedWallet::guard_provider`] does the same for a configured
-//! [`CertificateProvider`].
+//! With a pin it refuses `create_action`, so the auth channel never pays;
+//! refuses `prove_certificate` for any verifier but the pinned relay; refuses
+//! `create_signature` for any other counterparty key, so a request is never
+//! signed, and so never sent, to a server that proved another key; and
+//! refuses both key-linkage reveals, which the auth channel never needs.
+//! Every other call goes to the caller's wallet unchanged. Without a pin it
+//! changes nothing. [`PinnedWallet::guard_provider`] guards a configured
+//! [`CertificateProvider`] the same way, and [`PinnedFetch`] reports a refusal
+//! on the HTTP channel as the pin mismatch behind it.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use bsv::auth::clients::auth_fetch::AuthFetch;
 use bsv::wallet::error::WalletError;
 use bsv::wallet::interfaces::*;
+use bsv::wallet::types::CounterpartyType;
 
 use crate::error::MessageBoxError;
-use crate::transport::normalize_identity_key;
+use crate::transport::{normalize_identity_key, HttpTransport, RelayResponse};
 use crate::websocket::CertificateProvider;
 
 /// The caller's wallet, as handed to the relay auth channel.
@@ -29,7 +36,8 @@ pub(crate) struct PinnedWallet<W> {
     inner: W,
     /// The relay identity pin, normalised. `None` delegates every call.
     pin: Option<String>,
-    /// The last verifier a certificate proof was refused to.
+    /// The last server a proof or signature was refused for, until
+    /// [`refusal`](Self::refusal) reports it.
     refused: Arc<Mutex<Option<String>>>,
 }
 
@@ -42,31 +50,40 @@ impl<W> PinnedWallet<W> {
         }
     }
 
-    /// Whether the pin allows proving a certificate to `verifier` (hex). A
-    /// refused verifier is recorded for [`refusal`](Self::refusal).
-    fn may_prove_to(&self, verifier: &str) -> bool {
+    /// Whether the pin allows proving a certificate to, or signing for, the
+    /// server `peer` (hex). A refused server is recorded for
+    /// [`refusal`](Self::refusal).
+    fn may_answer(&self, peer: &str) -> bool {
         match &self.pin {
-            Some(pin) if normalize_identity_key(verifier) != *pin => {
-                *self.refused.lock().unwrap_or_else(|p| p.into_inner()) =
-                    Some(verifier.to_string());
+            Some(pin) if normalize_identity_key(peer) != *pin => {
+                *self.refused.lock().unwrap_or_else(|p| p.into_inner()) = Some(peer.to_string());
                 false
             }
             _ => true,
         }
     }
 
-    /// The pin mismatch behind a refused certificate proof, if there was one:
-    /// the server that asked had proved a key other than the pin.
+    /// The pin mismatch behind the last refused proof or signature, if there
+    /// was one: the server had proved a key other than the pin. Each refusal
+    /// is reported once.
     pub(crate) fn refusal(&self) -> Option<MessageBoxError> {
-        let verifier = self
+        let peer = self
             .refused
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()?;
+            .take()?;
         Some(MessageBoxError::RelayIdentityMismatch {
             expected: self.pin.clone().unwrap_or_default(),
-            observed: Some(normalize_identity_key(&verifier)),
+            observed: Some(normalize_identity_key(&peer)),
         })
+    }
+
+    /// The error for a call the pin refuses.
+    fn refused_by_pin(&self, what: &str) -> WalletError {
+        WalletError::Internal(format!(
+            "{what} refused: the client is pinned to relay {}",
+            self.pin.as_deref().unwrap_or_default()
+        ))
     }
 
     /// `provider`, refusing without calling it any verifier but the pinned
@@ -80,7 +97,7 @@ impl<W> PinnedWallet<W> {
         }
         let guard = self.clone();
         Arc::new(move |verifier, requested| {
-            if !guard.may_prove_to(&verifier) {
+            if !guard.may_answer(&verifier) {
                 let message = format!(
                     "certificate request from {verifier} refused: the client is pinned to relay {}",
                     guard.pin.as_deref().unwrap_or_default()
@@ -115,13 +132,48 @@ where
         orig: Option<&str>,
     ) -> Result<ProveCertificateResult, WalletError> {
         let verifier = args.verifier.to_der_hex();
-        if !self.may_prove_to(&verifier) {
-            return Err(WalletError::Internal(format!(
-                "certificate proof for {verifier} refused: the client is pinned to relay {}",
-                self.pin.as_deref().unwrap_or_default()
-            )));
+        if !self.may_answer(&verifier) {
+            return Err(self.refused_by_pin(&format!("certificate proof for {verifier}")));
         }
         self.inner.prove_certificate(args, orig).await
+    }
+    /// The auth channel signs each message for the server that proved its
+    /// key, as `Other(that key)`.
+    async fn create_signature(
+        &self,
+        args: CreateSignatureArgs,
+        orig: Option<&str>,
+    ) -> Result<CreateSignatureResult, WalletError> {
+        if let (CounterpartyType::Other, Some(peer)) = (
+            &args.counterparty.counterparty_type,
+            &args.counterparty.public_key,
+        ) {
+            let peer = peer.to_der_hex();
+            if !self.may_answer(&peer) {
+                return Err(self.refused_by_pin(&format!("signature for {peer}")));
+            }
+        }
+        self.inner.create_signature(args, orig).await
+    }
+    async fn reveal_counterparty_key_linkage(
+        &self,
+        args: RevealCounterpartyKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+        if self.pin.is_some() {
+            return Err(self.refused_by_pin("key linkage"));
+        }
+        self.inner.reveal_counterparty_key_linkage(args, orig).await
+    }
+    async fn reveal_specific_key_linkage(
+        &self,
+        args: RevealSpecificKeyLinkageArgs,
+        orig: Option<&str>,
+    ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+        if self.pin.is_some() {
+            return Err(self.refused_by_pin("key linkage"));
+        }
+        self.inner.reveal_specific_key_linkage(args, orig).await
     }
 
     // Everything below delegates unchanged.
@@ -175,20 +227,6 @@ where
     ) -> Result<GetPublicKeyResult, WalletError> {
         self.inner.get_public_key(args, orig).await
     }
-    async fn reveal_counterparty_key_linkage(
-        &self,
-        args: RevealCounterpartyKeyLinkageArgs,
-        orig: Option<&str>,
-    ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
-        self.inner.reveal_counterparty_key_linkage(args, orig).await
-    }
-    async fn reveal_specific_key_linkage(
-        &self,
-        args: RevealSpecificKeyLinkageArgs,
-        orig: Option<&str>,
-    ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
-        self.inner.reveal_specific_key_linkage(args, orig).await
-    }
     async fn encrypt(
         &self,
         args: EncryptArgs,
@@ -216,13 +254,6 @@ where
         orig: Option<&str>,
     ) -> Result<VerifyHmacResult, WalletError> {
         self.inner.verify_hmac(args, orig).await
-    }
-    async fn create_signature(
-        &self,
-        args: CreateSignatureArgs,
-        orig: Option<&str>,
-    ) -> Result<CreateSignatureResult, WalletError> {
-        self.inner.create_signature(args, orig).await
     }
     async fn verify_signature(
         &self,
@@ -296,13 +327,54 @@ where
     }
 }
 
+/// `AuthFetch` on a [`PinnedWallet`]. A request that fails because the wallet
+/// refused a proof or a signature for a server that proved another key fails
+/// with [`MessageBoxError::RelayIdentityMismatch`].
+pub(crate) struct PinnedFetch<W>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    fetch: AuthFetch<PinnedWallet<W>>,
+    wallet: PinnedWallet<W>,
+}
+
+impl<W> PinnedFetch<W>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    pub(crate) fn new(wallet: PinnedWallet<W>) -> Self {
+        Self {
+            fetch: AuthFetch::new(wallet.clone()),
+            wallet,
+        }
+    }
+}
+
+#[async_trait]
+impl<W> HttpTransport for PinnedFetch<W>
+where
+    W: WalletInterface + Clone + Send + Sync + 'static,
+{
+    async fn fetch(
+        &self,
+        url: &str,
+        method: &str,
+        body: Option<Vec<u8>>,
+        headers: Option<HashMap<String, String>>,
+    ) -> Result<RelayResponse, MessageBoxError> {
+        HttpTransport::fetch(&self.fetch, url, method, body, headers)
+            .await
+            .map_err(|e| self.wallet.refusal().unwrap_or(e))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bsv::primitives::private_key::PrivateKey;
     use bsv::primitives::public_key::PublicKey;
     use bsv::wallet::proto_wallet::ProtoWallet;
-    use bsv::wallet::types::BooleanDefaultFalse;
+    use bsv::wallet::types::{BooleanDefaultFalse, Counterparty, Protocol};
 
     // `ProtoWallet` answers `create_action` and `prove_certificate` with
     // `NotImplemented`, so that error shows a call reached the inner wallet
@@ -337,6 +409,82 @@ mod tests {
             privileged: BooleanDefaultFalse(None),
             privileged_reason: None,
         }
+    }
+
+    /// What the BRC-103 peer signs a message with: the server's key as
+    /// `Other`.
+    fn signature_for(server: &PublicKey) -> CreateSignatureArgs {
+        CreateSignatureArgs {
+            protocol_id: Protocol {
+                security_level: 2,
+                protocol: "auth message signature".to_string(),
+            },
+            key_id: "nonce peer-nonce".to_string(),
+            counterparty: Counterparty {
+                counterparty_type: CounterpartyType::Other,
+                public_key: Some(server.clone()),
+            },
+            data: Some(b"request".to_vec()),
+            hash_to_directly_sign: None,
+            privileged: false,
+            privileged_reason: None,
+            seek_permission: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pinned_wallet_signs_only_for_the_pinned_relay() {
+        let relay = key(2);
+        let other = key(3);
+        let wallet = pinned_to(&relay);
+
+        let refused = wallet.create_signature(signature_for(&other), None).await;
+        assert!(
+            matches!(refused, Err(WalletError::Internal(_))),
+            "{refused:?}"
+        );
+        match wallet.refusal() {
+            Some(MessageBoxError::RelayIdentityMismatch { observed, .. }) => {
+                assert_eq!(observed, Some(other.to_der_hex()));
+            }
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert!(wallet.refusal().is_none(), "a refusal is reported once");
+
+        let signed = wallet.create_signature(signature_for(&relay), None).await;
+        assert!(signed.is_ok(), "{signed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_wallet_reveals_no_key_linkage() {
+        let relay = key(2);
+        let wallet = pinned_to(&relay);
+        let counterparty = wallet
+            .reveal_counterparty_key_linkage(
+                RevealCounterpartyKeyLinkageArgs {
+                    counterparty: relay.clone(),
+                    verifier: relay.clone(),
+                    privileged: None,
+                    privileged_reason: None,
+                },
+                None,
+            )
+            .await;
+        assert!(counterparty.is_err(), "{counterparty:?}");
+        let specific = wallet
+            .reveal_specific_key_linkage(
+                RevealSpecificKeyLinkageArgs {
+                    counterparty: signature_for(&relay).counterparty,
+                    verifier: relay.clone(),
+                    protocol_id: signature_for(&relay).protocol_id,
+                    key_id: "1".to_string(),
+                    privileged: None,
+                    privileged_reason: None,
+                },
+                None,
+            )
+            .await;
+        assert!(specific.is_err(), "{specific:?}");
     }
 
     #[tokio::test]

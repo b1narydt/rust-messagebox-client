@@ -40,7 +40,8 @@ pub enum MessageBoxError {
     },
     /// The client was pinned to one relay identity key
     /// ([`MessageBoxClient::with_expected_relay_key`](crate::MessageBoxClient::with_expected_relay_key))
-    /// and a server proved a different key, or none. The answer was not used.
+    /// and a server proved a different key, or none, in the handshake. No
+    /// request was sent to that server, and no answer from it was used.
     #[error("relay identity mismatch: expected {expected}, server proved {}", observed.as_deref().unwrap_or("no key"))]
     RelayIdentityMismatch {
         expected: String,

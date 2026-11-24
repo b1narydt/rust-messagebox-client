@@ -34,10 +34,11 @@ use socketioxide::SocketIo;
 use tokio::sync::mpsc;
 
 use super::tests::ArcWallet;
-use super::MessageBoxClient;
+use super::{reconnect_ws, MessageBoxClient};
 use crate::delivery::DeliveryMode;
 use crate::error::MessageBoxError;
 use crate::transport::scripted::ScriptedTransport;
+use crate::types::{WsSendMessageData, WsSendMessagePayload};
 use crate::websocket::CertificateProvider;
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000011";
@@ -84,13 +85,20 @@ fn client(url: &str) -> MessageBoxClient<ArcWallet> {
     )
 }
 
-/// Records every `sendMessage` and acks it with `sendMessageAck-{roomId}`,
-/// as the relay does for an accepted live send. With `refusal`, answers it
-/// with that `messageFailed` body instead, as the relay does over its rate
-/// limit.
+/// How the loopback relay answers a live send.
+enum Answer {
+    /// `sendMessageAck-{roomId}`, as the relay does for an accepted send.
+    Ack,
+    /// `messageFailed` with this body, as the relay does over its rate limit.
+    Refuse(Value),
+    /// Nothing.
+    Silent,
+}
+
+/// Records every `sendMessage` and answers it as `answer` says.
 struct AckSends {
     sends: mpsc::UnboundedSender<Value>,
-    refusal: Option<Value>,
+    answer: Answer,
 }
 
 #[async_trait::async_trait]
@@ -111,9 +119,10 @@ impl AppDispatcher<ProtoWallet> for AckSends {
             .to_string();
         let ack = json!({ "status": "success", "messageId": event.data["message"]["messageId"] });
         let _ = self.sends.send(event.data);
-        let (event, answer) = match &self.refusal {
-            Some(refusal) => ("messageFailed".to_string(), refusal),
-            None => (format!("sendMessageAck-{room}"), &ack),
+        let (event, answer) = match &self.answer {
+            Answer::Ack => (format!("sendMessageAck-{room}"), &ack),
+            Answer::Refuse(refusal) => ("messageFailed".to_string(), refusal),
+            Answer::Silent => return,
         };
         emit_signed_to_socket(socket, server, &event, answer).await;
     }
@@ -128,12 +137,11 @@ struct Relay {
 impl Relay {
     /// Serve `core` on an ephemeral loopback port, proving `SERVER_KEY`.
     async fn boot(core: AuthSocketServer<ProtoWallet>) -> Self {
-        Self::boot_answering(core, None).await
+        Self::boot_answering(core, Answer::Ack).await
     }
 
-    /// [`boot`](Self::boot), answering every send with the `messageFailed`
-    /// body `refusal` when given.
-    async fn boot_answering(core: AuthSocketServer<ProtoWallet>, refusal: Option<Value>) -> Self {
+    /// [`boot`](Self::boot), answering every send as `answer` says.
+    async fn boot_answering(core: AuthSocketServer<ProtoWallet>, answer: Answer) -> Self {
         let core = Arc::new(core);
         let (layer, io) = SocketIo::new_layer();
         let (sends_tx, sends) = mpsc::unbounded_channel();
@@ -147,7 +155,7 @@ impl Relay {
             },
             Arc::new(AckSends {
                 sends: sends_tx,
-                refusal,
+                answer,
             }),
         );
         let app = axum::Router::new().layer(layer);
@@ -362,7 +370,7 @@ async fn ws_send_emits_nothing_while_the_relay_is_held() {
 async fn a_live_send_and_its_fallback_share_one_rate_deadline() {
     let mut relay = Relay::boot_answering(
         AuthSocketServer::new(),
-        Some(json!({ "reason": "rate_limited", "retry_after": 1 })),
+        Answer::Refuse(json!({ "reason": "rate_limited", "retry_after": 1 })),
     )
     .await;
     let http = ScriptedTransport::new();
@@ -404,7 +412,7 @@ async fn a_live_send_and_its_fallback_share_one_rate_deadline() {
 async fn a_live_send_spends_the_budget_of_the_relay_its_socket_serves() {
     let mut relay = Relay::boot_answering(
         AuthSocketServer::new(),
-        Some(json!({ "reason": "rate_limited", "retry_after": 30 })),
+        Answer::Refuse(json!({ "reason": "rate_limited", "retry_after": 30 })),
     )
     .await;
     let other = "http://127.0.0.1:9";
@@ -459,6 +467,52 @@ async fn a_live_send_spends_the_budget_of_the_relay_its_socket_serves() {
     );
     assert!(relay.settled_send().await.is_none(), "sent to a held relay");
     assert_eq!(http.sent().len(), 1, "{:?}", http.sent());
+    sender.disconnect_web_socket().await.expect("disconnect");
+}
+
+/// A reconnect that replaces the socket fails the sends still waiting on the
+/// old one at once: no answer can reach them there, and each should take its
+/// HTTP fallback now, not after its ack timeout.
+#[tokio::test]
+async fn a_reconnect_fails_the_sends_waiting_on_the_old_socket() {
+    let mut relay = Relay::boot_answering(AuthSocketServer::new(), Answer::Silent).await;
+    let sender = client(&relay.url);
+    within(sender.initialize_connection(None))
+        .await
+        .expect("socket");
+    let recipient = identity_of(OTHER_KEY).await;
+    let data = WsSendMessageData {
+        room_id: format!("{recipient}-inbox"),
+        message: WsSendMessagePayload {
+            message_id: "id-a".to_string(),
+            recipient,
+            body: "hello".to_string(),
+        },
+    };
+    let pending = {
+        let guard = sender.ws_state.lock().await;
+        let ws = guard.as_ref().expect("socket");
+        within(ws.emit_send_message(&data)).await.expect("emitted")
+    };
+    assert!(
+        relay.settled_send().await.is_some(),
+        "the relay got the send"
+    );
+
+    let dial = sender.ws_dial(None).await.expect("dial");
+    within(reconnect_ws(
+        &sender.ws_state,
+        &sender.subscriptions,
+        &sender.ws_connections,
+        &dial,
+    ))
+    .await
+    .expect("reconnect");
+    let outcome = pending.wait(Duration::from_secs(2)).await;
+    assert!(
+        matches!(&outcome, Err(MessageBoxError::WebSocket(why)) if why.contains("replaced")),
+        "{outcome:?}"
+    );
     sender.disconnect_web_socket().await.expect("disconnect");
 }
 

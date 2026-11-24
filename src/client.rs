@@ -134,7 +134,13 @@ where
         }
     }
 
-    *ws_state.lock().await = Some(ws);
+    // No answer reaches a send still waiting on the replaced socket, so it
+    // fails now and takes its HTTP fallback instead of waiting out its ack
+    // timeout.
+    let replaced = ws_state.lock().await.replace(ws);
+    if let Some(old) = replaced {
+        old.fail_pending_sends("the socket was replaced before the relay answered");
+    }
     connections.fetch_add(1, Ordering::AcqRel);
     Ok(())
 }

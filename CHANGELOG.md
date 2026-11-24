@@ -29,8 +29,9 @@ behaviour" section describes the result.
   `remove_pending_ack` is removed. The relay's ack names the message (the
   earlier note that it does not was wrong), and its refusal, `messageFailed`,
   names none, so a refusal fails every pending live send on the socket. A
-  refused, unanswered or failed emit falls back to HTTP with the same message
-  id. The WebSocket room and recipient are sent lowercase, as the relay joins
+  reconnect that replaces the socket fails the sends still waiting on the old
+  one at once. A refused, unanswered or failed emit falls back to HTTP with
+  the same message id. The WebSocket room and recipient are sent lowercase, as the relay joins
   rooms lowercase and compares them exactly.
 - **Sends and lists honour the relay's rate budget** (`src/transport.rs`,
   `src/http_ops.rs`). After a refusal the client holds every send and list to

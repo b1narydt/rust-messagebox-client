@@ -198,9 +198,10 @@ host the call names when an earlier call opened the socket. The wait before
 the emit and the fallback's waits share one `with_rate_limit_wait`, counted
 from the start of the call; the 10 s ack wait and network time are on top. A
 refusal (`messageFailed`) names no message, so it fails every pending live
-send on that socket. The relay is not
-exactly-once: it keeps one row per id only until the recipient acknowledges
-it, so receivers dedup by message id.
+send on that socket. A reconnect that replaces the socket fails the sends
+still waiting on the old one at once, and each falls back to HTTP. The relay
+is not exactly-once: it keeps one row per id only until the recipient
+acknowledges it, so receivers dedup by message id.
 
 **Acknowledgements.** The relay pushes a live message before it stores it. An
 ack that arrives first is answered `ERR_INVALID_ACKNOWLEDGMENT`; the client
@@ -412,7 +413,7 @@ Offline tests use `ProtoWallet` instances — no live server required. Coverage 
 - Payment token shape and derivation encoding
 - Relay answers driven through a scripted HTTP transport: error codes, rate-limit waits and resends, the ack retry, the identity pin
 - Live-send ack matching and the poll backstop's cadence
-- WebSocket guards against authsocket's own server on a loopback port: the identity pin, the lowercase recipient, the rate-limit hold before a live send, kept on the socket's relay, and the one rate deadline it shares with its fallback, the certificate provider
+- WebSocket guards against authsocket's own server on a loopback port: the identity pin, the lowercase recipient, the rate-limit hold before a live send, kept on the socket's relay, and the one rate deadline it shares with its fallback, the sends a reconnect strands, the certificate provider
 - Critical pitfall guards (snake_case params, header extraction, recipient population)
 
 Live server tests validate 30+ operations against the production Babbage MessageBox service, including messaging, encryption, permissions, payments, overlay queries, host resolution, and device registration.

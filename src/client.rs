@@ -398,6 +398,14 @@ impl<W: WalletInterface + Clone + 'static + Send + Sync> MessageBoxClient<W> {
     // Public getters (needed by http_ops)
     // -----------------------------------------------------------------------
 
+    /// Where `message_id` stands with this client's `acknowledge_message`
+    /// calls. A consumer that lists the box itself uses it to treat copies
+    /// the way a live listener does: deliver an `Unacked` one, drop an
+    /// `InFlight` one, and acknowledge an `Acked` one again.
+    pub fn acknowledgement(&self, message_id: &str) -> AckState {
+        lock_ids(&self.acked_ids).state(message_id)
+    }
+
     /// Return the trimmed host URL.
     pub fn host(&self) -> &str {
         &self.host
@@ -1499,11 +1507,6 @@ impl PollCadence {
 // Bounded dedup set
 // ---------------------------------------------------------------------------
 
-/// A bounded set with FIFO eviction for deduplicating message IDs.
-///
-/// Prevents unbounded memory growth in the HTTP polling fallback task.
-/// When the set reaches `capacity`, the oldest entry is evicted before
-/// inserting the new one.
 /// What a client has acknowledged, and what it is acknowledging now.
 pub(crate) struct AckLedger {
     acked: BoundedIdSet,
@@ -1511,14 +1514,18 @@ pub(crate) struct AckLedger {
     in_flight: HashMap<String, usize>,
 }
 
-/// Where an id stands in an [`AckLedger`].
+/// Where a message id stands with this client's acknowledgements
+/// ([`MessageBoxClient::acknowledgement`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AckState {
+pub enum AckState {
+    /// No `acknowledge_message` call for it, or not among the last 10,000.
     Unacked,
-    /// An `acknowledge_message` call for it has not finished.
+    /// An `acknowledge_message` call for it has not finished. A copy of the
+    /// message seen now is dropped: that call is deleting the row.
     InFlight,
     /// An `acknowledge_message` call for it has answered, failed or been
-    /// cancelled.
+    /// cancelled. A copy of the message seen now is a row the relay still
+    /// holds, and should be acknowledged again.
     Acked,
 }
 
@@ -1559,14 +1566,15 @@ impl AckLedger {
 pub(crate) struct AckInFlight {
     ledger: Arc<std::sync::Mutex<AckLedger>>,
     ids: Vec<String>,
-    /// Every id was already acknowledged when the call began.
+    /// Every id was already acknowledged, or held by another call, when this
+    /// call began.
     pub(crate) repeat: bool,
 }
 
 impl AckInFlight {
     pub(crate) fn begin(ledger: &Arc<std::sync::Mutex<AckLedger>>, ids: &[String]) -> Self {
         let mut guard = lock_ids(ledger);
-        let repeat = !ids.is_empty() && ids.iter().all(|id| guard.acked.contains(id));
+        let repeat = !ids.is_empty() && ids.iter().all(|id| guard.state(id) != AckState::Unacked);
         for id in ids {
             *guard.in_flight.entry(id.clone()).or_default() += 1;
         }
@@ -1585,6 +1593,11 @@ impl Drop for AckInFlight {
     }
 }
 
+/// A bounded set with FIFO eviction for deduplicating message IDs.
+///
+/// Prevents unbounded memory growth in the HTTP polling fallback task.
+/// When the set reaches `capacity`, the oldest entry is evicted before
+/// inserting the new one.
 pub(crate) struct BoundedIdSet {
     set: HashSet<String>,
     order: VecDeque<String>,
@@ -2298,9 +2311,13 @@ mod tests {
 
         deduped(peer_msg("held"));
         deduped(peer_msg("done"));
-        let flying = super::AckInFlight::begin(&acked, &["done".to_string()]);
-        deduped(peer_msg("done"));
+        // Acked from a list, never delivered here: dropped while in flight.
+        let flying = super::AckInFlight::begin(&acked, &["listed".to_string()]);
+        deduped(peer_msg("listed"));
+        // A second ack of a held id is a repeat: one attempt, no grace.
+        assert!(super::AckInFlight::begin(&acked, &["listed".to_string()]).repeat);
         drop(flying);
+        drop(super::AckInFlight::begin(&acked, &["done".to_string()]));
         deduped(peer_msg("held"));
         deduped(peer_msg("done"));
 

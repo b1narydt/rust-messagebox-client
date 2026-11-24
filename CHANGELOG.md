@@ -21,10 +21,17 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     listener drops a copy, and neither delivers nor re-acks it.
   - The ids are recorded as acknowledged when the call ends, whether it
     answered, failed or was cancelled.
-  - An ack of ids that were all acknowledged before makes one attempt: the
-    listener may have deleted the row since, so not found is not retried.
+  - An ack of ids that were all acknowledged before, or are held by another
+    call, makes one attempt: the row may be gone already, so not found is not
+    retried.
   - The listener's re-ack of a copy is one request. Not found means the row
     is gone or not stored yet, and the poll lists a stored row again.
+
+### Added
+
+- `MessageBoxClient::acknowledgement(id)` returns the id's `AckState`
+  (`Unacked`, `InFlight` or `Acked`), so a caller that lists the box itself can
+  treat copies the way the listener does.
 
 ---
 

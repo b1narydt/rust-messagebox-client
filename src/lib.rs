@@ -14,7 +14,7 @@ pub mod types;
 pub mod websocket;
 
 pub use adapter::RemittanceAdapter;
-pub use client::MessageBoxClient;
+pub use client::{AckState, MessageBoxClient};
 pub use delivery::DeliveryMode;
 pub use error::MessageBoxError;
 pub use types::*;

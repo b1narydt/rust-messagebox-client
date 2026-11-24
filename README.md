@@ -203,7 +203,11 @@ a cold client share one socket. A reconnect replaces only a dead socket; it
 closes that socket and fails the sends still waiting on it at once, and each
 falls back to HTTP. The relay
 is not exactly-once: it keeps one row per id only until the recipient
-acknowledges it, so receivers dedup by message id.
+acknowledges it, and a resend after that is a new row. A live listener
+delivers each id once (it remembers the last 10,000 per subscription). A copy
+of an id this client already acknowledged is acknowledged again on the
+listener's host and not delivered, so it does not sit on the relay. Callers of
+`list_messages` dedup by message id themselves.
 
 **Acknowledgements.** The relay pushes a live message before it stores it. An
 ack that arrives first is answered `ERR_INVALID_ACKNOWLEDGMENT`; the client
